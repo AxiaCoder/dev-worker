@@ -1,20 +1,51 @@
 """Reading and validation of the front matter of a `WORKER.md` file."""
 
+from collections.abc import Hashable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Self
+from types import MappingProxyType
+from typing import Annotated, Any, Self
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
+from yaml.constructor import ConstructorError
+from yaml.nodes import MappingNode
 
 FENCE = "---"
 
 StatusKey = Annotated[str, Field(min_length=1)]
+CeilingName = Annotated[str, Field(min_length=1)]
 Ceiling = Annotated[int, Field(strict=True, gt=0)]
 
 
 class HeaderError(ValueError):
     """Raised when a `WORKER.md` file has no valid header."""
+
+
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """A safe YAML loader that refuses a key repeated within one mapping."""
+
+    def construct_mapping(
+        self, node: MappingNode, deep: bool = False
+    ) -> dict[Hashable, Any]:
+        """Build the mapping of `node`; raise `ConstructorError` on a repeated key."""
+        seen: set[Hashable] = set()
+        for key_node, _ in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if isinstance(key, Hashable):
+                if key in seen:
+                    raise ConstructorError(
+                        None, None, f"duplicate key {key!r}", key_node.start_mark
+                    )
+                seen.add(key)
+        return super().construct_mapping(node, deep=deep)
 
 
 class Outcomes(BaseModel):
@@ -32,14 +63,20 @@ class Header(BaseModel):
     """The validated front matter of a `WORKER.md` file.
 
     `ceilings` maps a limit name to its absolute ceiling, a positive integer; a lower value
-    is always tighter.
+    is always tighter. It holds at least one entry and is read-only.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     status_keys: tuple[StatusKey, ...] = Field(min_length=1)
     outcomes: Outcomes
-    ceilings: dict[str, Ceiling]
+    ceilings: Mapping[CeilingName, Ceiling] = Field(min_length=1)
+
+    @field_validator("ceilings", mode="after")
+    @classmethod
+    def _freeze_ceilings(cls, value: Mapping[str, int]) -> Mapping[str, int]:
+        """Return `value` as a read-only mapping."""
+        return MappingProxyType(dict(value))
 
     @model_validator(mode="after")
     def _check_status_keys(self) -> Self:
@@ -79,23 +116,28 @@ def _split(text: str) -> tuple[str, str]:
 
 
 def _describe(error: ValidationError) -> str:
-    """Return one line per validation failure, naming its location and offending value."""
+    """Return one line per validation failure, naming its location and offending value.
+
+    The value is left out when it is the whole header mapping."""
     parts: list[str] = []
     for detail in error.errors():
         location = ".".join(str(item) for item in detail["loc"]) or "header"
-        parts.append(f"{location}: {detail['msg']} (got {detail['input']!r})")
+        message = f"{location}: {detail['msg']}"
+        if detail["loc"] or not isinstance(detail["input"], dict):
+            message += f" (got {detail['input']!r})"
+        parts.append(message)
     return "; ".join(parts)
 
 
 def load_worker_file(path: Path) -> WorkerFile:
-    """Read the `WORKER.md` file at `path`, UTF-8, and validate its header.
+    """Read the `WORKER.md` file at `path`, UTF-8 with an optional BOM, and validate its header.
 
-    Raises `HeaderError` when the front matter is missing, unterminated, not valid YAML,
-    or does not match `Header`.
+    Raises `HeaderError` when the front matter is missing, unterminated, not valid YAML
+    (a key repeated within one mapping included), or does not match `Header`.
     """
-    front_matter, body = _split(path.read_text(encoding="utf-8"))
+    front_matter, body = _split(path.read_text(encoding="utf-8-sig"))
     try:
-        data = yaml.safe_load(front_matter)
+        data = yaml.load(front_matter, Loader=_UniqueKeyLoader)
     except yaml.YAMLError as error:
         raise HeaderError(f"front matter is not valid YAML: {error}") from error
     try:

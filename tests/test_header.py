@@ -21,12 +21,14 @@ ceilings:
 
 
 def write(tmp_path: Path, text: str) -> Path:
+    """Write `text` as `WORKER.md` under `tmp_path`, UTF-8, and return its path."""
     path = tmp_path / "WORKER.md"
     path.write_text(text, encoding="utf-8")
     return path
 
 
 def with_header(front_matter: str, body: str = "Body.\n") -> str:
+    """Return `front_matter` between fence lines, followed by `body`."""
     return f"---\n{front_matter}---\n{body}"
 
 
@@ -123,11 +125,23 @@ def test_extra_key_is_refused(tmp_path: Path) -> None:
         load_worker_file(write(tmp_path, with_header(VALID + "owner: someone\n")))
 
 
-def test_front_matter_not_a_mapping_is_refused_naming_the_value(tmp_path: Path) -> None:
+def test_front_matter_not_a_mapping_is_refused_naming_the_value(
+    tmp_path: Path,
+) -> None:
     with pytest.raises(
-        HeaderError, match=r"invalid header: header: .*\(got \['ready'\]\)"
+        HeaderError, match=r"invalid header: header: .*dictionary.*\(got \['ready'\]\)"
     ):
         load_worker_file(write(tmp_path, with_header("- ready\n")))
+
+
+def test_header_wide_error_does_not_dump_the_header(tmp_path: Path) -> None:
+    text = with_header(VALID.replace("in_review,", "ready,"))
+
+    with pytest.raises(HeaderError) as caught:
+        load_worker_file(write(tmp_path, text))
+
+    assert "(got" not in str(caught.value)
+    assert "ceilings" not in str(caught.value)
 
 
 def test_empty_status_key_list_is_refused(tmp_path: Path) -> None:
@@ -151,3 +165,47 @@ def test_loaded_header_is_immutable(tmp_path: Path) -> None:
 
     with pytest.raises(ValidationError, match="frozen"):
         header.ceilings = {}  # pyright: ignore[reportAttributeAccessIssue]
+    with pytest.raises(TypeError):
+        header.ceilings["max_turns"] = 10**9  # pyright: ignore[reportIndexIssue]
+    assert header.ceilings == {"run_timeout_seconds": 1800, "max_turns": 60}
+
+
+def test_empty_ceilings_are_refused(tmp_path: Path) -> None:
+    text = with_header(VALID.split("ceilings:")[0] + "ceilings: {}\n")
+
+    with pytest.raises(HeaderError, match="invalid header: ceilings: "):
+        load_worker_file(write(tmp_path, text))
+
+
+def test_empty_ceiling_name_is_refused(tmp_path: Path) -> None:
+    text = with_header(VALID.replace("max_turns: 60", "'': 60"))
+
+    with pytest.raises(HeaderError, match="invalid header: ceilings"):
+        load_worker_file(write(tmp_path, text))
+
+
+@pytest.mark.parametrize(
+    ("front_matter", "key"),
+    [
+        (VALID + "  max_turns: 10\n", "max_turns"),
+        (VALID.replace("outcomes:\n", "outcomes:\n  done: done\n"), "done"),
+        (VALID + "status_keys: [done]\n", "status_keys"),
+    ],
+)
+def test_duplicate_yaml_key_is_refused(
+    tmp_path: Path, front_matter: str, key: str
+) -> None:
+    with pytest.raises(HeaderError, match=f"duplicate key '{key}'"):
+        load_worker_file(write(tmp_path, with_header(front_matter)))
+
+
+def test_unhashable_yaml_key_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(HeaderError, match="not valid YAML"):
+        load_worker_file(write(tmp_path, with_header(VALID + "? [a]\n: 1\n")))
+
+
+def test_byte_order_mark_is_skipped(tmp_path: Path) -> None:
+    path = tmp_path / "WORKER.md"
+    path.write_bytes(with_header(VALID).encode("utf-8-sig"))
+
+    assert load_worker_file(path).header.ceilings["max_turns"] == 60
