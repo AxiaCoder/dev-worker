@@ -118,6 +118,19 @@ def test_set_aside_does_not_copy_again_a_tail_left_by_a_failed_truncation(
     assert (tmp_path / TORN_FILE).read_bytes() == b'{"task_id": "b", "sta\n'
 
 
+def test_set_aside_copies_a_tail_that_only_ends_the_last_torn_line(
+    tmp_path: Path,
+) -> None:
+    journal = tmp_path / JOURNAL_FILE
+    (tmp_path / TORN_FILE).write_bytes(b'xx{"a\n')
+    journal.write_bytes(b'{"a')
+
+    set_aside_torn_tail(tmp_path)
+
+    assert journal.read_bytes() == b""
+    assert (tmp_path / TORN_FILE).read_bytes() == b'xx{"a\n{"a\n'
+
+
 def test_set_aside_retried_after_a_failed_truncation_keeps_one_copy_of_the_tail(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
