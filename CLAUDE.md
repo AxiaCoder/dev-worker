@@ -16,6 +16,15 @@ Every tooling choice must work the same on Windows and on the Mac, where Axia de
 - no shell scripts for the project's own commands;
 - line endings are LF everywhere (`.gitattributes`).
 
+## Checks
+
+`uv run poe check` runs the four checks and fails if any of them fails:
+
+- lint: `ruff check`;
+- format: `ruff format --check`;
+- types: `pyright`;
+- tests: `pytest --cov`, which fails below 100 % line and branch coverage (a plain `uv run pytest` skips the measure, for running a single test).
+
 ## Language
 
 English for everything in this repository: code, comments, docs, issues, commits.
