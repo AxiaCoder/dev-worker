@@ -9,8 +9,8 @@ import json
 import re
 import sys
 import time
-from collections.abc import Callable, Sequence
-from datetime import UTC, datetime
+from collections.abc import Callable, Mapping, Sequence
+from datetime import UTC, date, datetime
 from importlib.resources import as_file, files
 from pathlib import Path
 
@@ -30,12 +30,15 @@ from dev_worker.run_journal import (
     append_entry,
     instance_directory,
     journal_holds,
+    read_entries,
+    read_lock,
     release_lock,
     take_lock,
 )
 from dev_worker.validation import describe_validation_error
 
 TICKET_KEY = re.compile(r"(.+)-([1-9][0-9]*)")
+RECENT_RUNS = 10
 
 
 def failed(task_id: str | None, *errors: str) -> MandateOutput:
@@ -294,6 +297,80 @@ def run_mandate(
     return run_journaled(handler, mandate, instance, instance_path)
 
 
+def run_day(entry: Mapping[str, object]) -> date | None:
+    """Return the UTC day the journaled run started, `None` when `start` is unusable."""
+    start = entry.get("start")
+    if not isinstance(start, str):
+        return None
+    try:
+        moment = datetime.fromisoformat(start)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        return None
+    return moment.astimezone(UTC).date()
+
+
+def run_tokens(entry: Mapping[str, object]) -> int:
+    """Return the tokens the journaled run spent, 0 when `tokens` is not an integer."""
+    tokens = entry.get("tokens")
+    return tokens if isinstance(tokens, int) and not isinstance(tokens, bool) else 0
+
+
+def answerable(record: Mapping[str, object]) -> bool:
+    """Tell whether `record`, placed in the state, can be validated and written as JSON.
+
+    False when a string in it holds a lone surrogate or it is nested deeper than the
+    state model validates or serializes.
+    """
+    try:
+        State.model_validate({"common": {"recent": [record]}}).model_dump_json()
+    except ValueError:
+        return False
+    return True
+
+
+def read_state(instance_path: Path) -> State:
+    """Build the state of the instance read from `instance_path`, writing nothing.
+
+    `current` holds the lock record of the run in progress (`{}` when its details are
+    unknown), `recent` the last `RECENT_RUNS` journal entries, most recent first, and
+    `cost` the number of runs and the tokens they spent on the current UTC day. The
+    instance file itself is not read; an instance path without a suffix gives an empty
+    state. A journal entry that `answerable` refuses is skipped, a lock record it
+    refuses gives `{}`. Never raises.
+    """
+    try:
+        directory = instance_directory(instance_path)
+    except ValueError:
+        directory = None
+    lock = read_lock(directory) if directory else None
+    if lock is not None and not answerable(lock):
+        lock = {}
+    entries = (
+        [entry for entry in read_entries(directory) if answerable(entry)]
+        if directory
+        else []
+    )
+    today = datetime.now(UTC).date()
+    todays = [entry for entry in entries if run_day(entry) == today]
+    tokens = sum(run_tokens(entry) for entry in todays)
+    return State.model_validate(
+        {
+            "common": {
+                "current": [] if lock is None else [lock],
+                "recent": entries[::-1][:RECENT_RUNS],
+                "pending": [],
+                "cost": {
+                    "day": today.isoformat(),
+                    "runs": len(todays),
+                    "tokens": tokens,
+                },
+            }
+        }
+    )
+
+
 def add_instance_argument(command: argparse.ArgumentParser) -> None:
     """Add the required `--instance` option naming the YAML instance file."""
     command.add_argument(
@@ -325,15 +402,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Parse the command line, write the JSON answer on stdout and return the exit code.
 
     The `run` input is read from stdin as raw bytes and the answer is written as UTF-8
-    bytes, whatever the encoding of the system. `state` and `health` do not read the
-    instance file yet. Returns 0 whenever a JSON document is written, even for a failed
-    mandate; argparse exits with 2 on incorrect usage.
+    bytes, whatever the encoding of the system. `state` reads the journal and lock of the
+    instance directory; `health` does not read the instance yet. Returns 0 whenever a
+    JSON document is written, even for a failed mandate; argparse exits with 2 on
+    incorrect usage.
     """
     args = build_parser().parse_args(argv)
     if args.command == "run":
         answer = run_mandate(args.mandate, sys.stdin.buffer.read(), args.instance)
     elif args.command == "state":
-        answer = State()
+        answer = read_state(args.instance)
     else:
         answer = Health(status="ok", reason=None, active=True)
     sys.stdout.flush()

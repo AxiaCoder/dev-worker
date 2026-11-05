@@ -6,9 +6,10 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Iterator
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from importlib.metadata import entry_points
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -610,15 +611,246 @@ def test_instance_path_with_a_lone_surrogate_fails_naming_it_escaped(
     assert_failed(answer, "task-1", "caf\\udce9.yaml")
 
 
-def test_state_is_empty(
-    monkeypatch: pytest.MonkeyPatch, capsysbinary: pytest.CaptureFixture[bytes]
-) -> None:
-    answer = run(monkeypatch, capsysbinary, ["state", "--instance", str(INSTANCE)])
+NOW = datetime(2026, 11, 5, 12, 0, tzinfo=UTC)
+EMPTY_TODAY = {
+    "common": {
+        "current": [],
+        "recent": [],
+        "pending": [],
+        "cost": {"day": "2026-11-05", "runs": 0, "tokens": 0},
+    },
+    "domain": {},
+}
 
-    assert answer == {
-        "common": {"current": [], "recent": [], "pending": [], "cost": {}},
-        "domain": {},
+
+@pytest.fixture
+def frozen_now(monkeypatch: pytest.MonkeyPatch) -> datetime:
+    """Freeze the clock the command line reads at `NOW`."""
+    clock = SimpleNamespace(
+        now=lambda tz=None: NOW.astimezone(tz), fromisoformat=datetime.fromisoformat
+    )
+    monkeypatch.setattr(cli, "datetime", clock)
+    return NOW
+
+
+def state(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> dict[str, object]:
+    """Run `state --instance <instance>` and return the parsed answer."""
+    return run(monkeypatch, capsysbinary, ["state", "--instance", str(instance)])
+
+
+def common(answer: dict[str, object]) -> dict[str, object]:
+    """Return the `common` part of a state answer."""
+    part = answer["common"]
+    assert isinstance(part, dict)
+    return part
+
+
+def write_journal(instance: Path, *entries: object) -> Path:
+    """Write `entries` as the JSON lines of the journal of `instance`; return its directory."""
+    directory = instance.with_suffix("")
+    directory.mkdir(exist_ok=True)
+    (directory / run_journal.JOURNAL_FILE).write_bytes(
+        b"".join(json.dumps(entry).encode("utf-8") + b"\n" for entry in entries)
+    )
+    return directory
+
+
+def snapshot(root: Path) -> dict[Path, bytes | None]:
+    """Return every path under `root` with its content, `None` for a directory."""
+    return {
+        path: None if path.is_dir() else path.read_bytes()
+        for path in sorted(root.rglob("*"))
     }
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_state_of_an_instance_never_run_is_empty_with_today_at_zero(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    assert state(monkeypatch, capsysbinary, instance) == EMPTY_TODAY
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_state_of_an_instance_path_without_a_suffix_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "acme").mkdir()
+    (tmp_path / "acme" / run_journal.LOCK_FILE).write_bytes(b"{}")
+
+    assert state(monkeypatch, capsysbinary, tmp_path / "acme") == EMPTY_TODAY
+
+
+def test_state_day_is_the_current_utc_day(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    before = datetime.now(UTC).date().isoformat()
+    cost = common(state(monkeypatch, capsysbinary, instance))["cost"]
+    after = datetime.now(UTC).date().isoformat()
+
+    assert isinstance(cost, dict)
+    assert cost["day"] in {before, after}
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_state_reports_the_run_holding_the_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    directory = instance.with_suffix("")
+    record = {"task_id": "t", "ticket_key": "DEMO-1", "start": NOW.isoformat()}
+    directory.mkdir()
+    run_journal.take_lock(directory, record)
+
+    assert common(state(monkeypatch, capsysbinary, instance))["current"] == [record]
+
+
+@pytest.mark.parametrize("content", [b"", b"held by another run", b"[1]"])
+def test_state_reports_a_run_of_unknown_details_for_a_lock_that_is_not_an_object(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    content: bytes,
+) -> None:
+    directory = instance.with_suffix("")
+    directory.mkdir()
+    (directory / run_journal.LOCK_FILE).write_bytes(content)
+
+    assert common(state(monkeypatch, capsysbinary, instance))["current"] == [{}]
+
+
+def test_state_lists_the_last_ten_runs_most_recent_first(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    entries = [{"task_id": f"task-{n}", "status": "completed"} for n in range(12)]
+    write_journal(instance, *entries)
+
+    recent = common(state(monkeypatch, capsysbinary, instance))["recent"]
+
+    assert recent == entries[:1:-1]
+
+
+def test_state_skips_journal_lines_that_are_not_objects(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    directory = write_journal(instance, {"task_id": "t"})
+    with (directory / run_journal.JOURNAL_FILE).open("ab") as journal:
+        journal.write(b"{\n\xff\n[1]\n")
+
+    assert common(state(monkeypatch, capsysbinary, instance))["recent"] == [
+        {"task_id": "t"}
+    ]
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_state_cost_counts_the_runs_started_on_the_current_utc_day(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    todays = [
+        {"start": "2026-11-05T00:00:00+00:00", "tokens": 5},
+        {"start": "2026-11-04T23:30:00-02:00", "tokens": 3},
+        {"start": "2026-11-05T23:59:59+00:00", "tokens": True},
+        {"start": "2026-11-05T09:00:00+00:00", "tokens": "7"},
+        {"start": "2026-11-05T10:00:00+00:00", "tokens": 1.5},
+        {"start": "2026-11-05T11:00:00+00:00"},
+    ]
+    others = [
+        {"start": "2026-11-05T01:00:00+02:00", "tokens": 100},
+        {"start": "2026-11-06T00:00:00+00:00", "tokens": 100},
+        {"start": "2026-11-04T23:59:59+00:00", "tokens": 100},
+        {"start": "2026-11-05T10:00:00", "tokens": 100},
+        {"start": "today", "tokens": 100},
+        {"start": 20261105, "tokens": 100},
+        {"tokens": 100},
+    ]
+    write_journal(instance, *todays, *others)
+
+    cost = common(state(monkeypatch, capsysbinary, instance))["cost"]
+
+    assert cost == {"day": "2026-11-05", "runs": 6, "tokens": 8}
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_state_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    directory = write_journal(instance, {"task_id": "t", "start": NOW.isoformat()})
+    (directory / run_journal.LOCK_FILE).write_bytes(b"")
+    before = snapshot(instance.parent)
+
+    state(monkeypatch, capsysbinary, instance)
+
+    assert snapshot(instance.parent) == before
+
+
+def test_state_of_an_instance_never_run_creates_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    before = snapshot(instance.parent)
+
+    state(monkeypatch, capsysbinary, instance)
+
+    assert snapshot(instance.parent) == before
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_state_after_a_run_lists_it_and_counts_it_today(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    answer = common(state(monkeypatch, capsysbinary, instance))
+
+    (entry,) = journal_lines(instance)
+    assert entry["status"] == "completed"
+    assert answer["current"] == []
+    assert answer["recent"] == [entry]
+    assert answer["cost"] == {"day": "2026-11-05", "runs": 1, "tokens": 0}
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_state_answers_while_a_run_holds_the_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    seen: list[dict[str, object]] = []
+
+    def peek(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+        seen.append(cli.read_state(instance).model_dump(mode="json"))
+        return cli.deliver_ticket(mandate, resolved)
+
+    monkeypatch.setitem(cli.MANDATES, "deliver_ticket", peek)
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    (during,) = seen
+    assert common(during)["current"] == [
+        {"task_id": "task-1", "ticket_key": "DEMO-1", "start": NOW.isoformat()}
+    ]
+    assert common(during)["recent"] == []
 
 
 def test_health_is_ok(
@@ -681,3 +913,45 @@ def test_run_reads_and_writes_utf8_whatever_the_system_encoding(
 
     assert task_id.encode("utf-8") in completed.stdout
     assert json.loads(completed.stdout.decode("utf-8"))["task_id"] == task_id
+
+
+def nested_object(depth: int) -> bytes:
+    """Return a JSON object holding `depth` nested arrays."""
+    return b'{"task_id": "deep", "x": ' + b"[" * depth + b"]" * depth + b"}"
+
+
+UNREADABLE_RECORDS = [
+    pytest.param(b"[" * 100_000 + b"]" * 100_000, id="too-deep-for-json"),
+    pytest.param(nested_object(300), id="too-deep-to-validate"),
+    pytest.param(b'{"task_id": "\\ud800", "status": "completed"}', id="lone-surrogate"),
+]
+
+
+@pytest.mark.parametrize("line", UNREADABLE_RECORDS)
+def test_state_skips_a_journal_line_it_cannot_answer_in_json(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    line: bytes,
+) -> None:
+    directory = write_journal(instance, {"task_id": "t"})
+    with (directory / run_journal.JOURNAL_FILE).open("ab") as journal:
+        journal.write(line + b"\n")
+
+    assert common(state(monkeypatch, capsysbinary, instance))["recent"] == [
+        {"task_id": "t"}
+    ]
+
+
+@pytest.mark.parametrize("content", UNREADABLE_RECORDS)
+def test_state_reports_a_run_of_unknown_details_for_a_lock_it_cannot_answer_in_json(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    content: bytes,
+) -> None:
+    directory = instance.with_suffix("")
+    directory.mkdir()
+    (directory / run_journal.LOCK_FILE).write_bytes(content)
+
+    assert common(state(monkeypatch, capsysbinary, instance))["current"] == [{}]

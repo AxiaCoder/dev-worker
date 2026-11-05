@@ -12,6 +12,8 @@ from dev_worker.run_journal import (
     append_entry,
     instance_directory,
     journal_holds,
+    read_entries,
+    read_lock,
     release_lock,
     take_lock,
 )
@@ -130,3 +132,87 @@ def test_concurrent_take_lock_lets_exactly_one_run_hold_it(tmp_path: Path) -> No
         thread.join()
 
     assert sorted(outcomes) == ["held"] + ["refused"] * (contenders - 1)
+
+
+def test_read_lock_gives_none_when_no_run_holds_it(tmp_path: Path) -> None:
+    assert read_lock(tmp_path) is None
+
+
+def test_read_lock_gives_the_record_of_the_run_in_progress(tmp_path: Path) -> None:
+    take_lock(tmp_path, {"task_id": "t", "ticket_key": "DEMO-1"})
+
+    assert read_lock(tmp_path) == {"task_id": "t", "ticket_key": "DEMO-1"}
+
+
+@pytest.mark.parametrize("content", [b"", b"{", b"\xff", b"[1]", b'"held"', b"null"])
+def test_read_lock_gives_unknown_details_for_a_lock_that_is_not_an_object(
+    tmp_path: Path, content: bytes
+) -> None:
+    (tmp_path / LOCK_FILE).write_bytes(content)
+
+    assert read_lock(tmp_path) == {}
+
+
+def test_read_lock_gives_unknown_details_for_a_lock_that_cannot_be_read(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / LOCK_FILE).mkdir()
+
+    assert read_lock(tmp_path) == {}
+
+
+def test_read_lock_leaves_the_lock_in_place(tmp_path: Path) -> None:
+    lock = take_lock(tmp_path, {"task_id": "t"})
+    before = lock.read_bytes()
+
+    read_lock(tmp_path)
+
+    assert lock.read_bytes() == before
+
+
+def test_read_entries_gives_nothing_when_the_journal_is_absent(tmp_path: Path) -> None:
+    assert read_entries(tmp_path) == []
+
+
+def test_read_entries_gives_nothing_when_the_journal_cannot_be_read(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / JOURNAL_FILE).mkdir()
+
+    assert read_entries(tmp_path) == []
+
+
+def test_read_entries_gives_the_appended_entries_oldest_first(tmp_path: Path) -> None:
+    append_entry(tmp_path, {"task_id": "t"})
+    append_entry(tmp_path, {"task_id": "u"})
+
+    assert read_entries(tmp_path) == [{"task_id": "t"}, {"task_id": "u"}]
+
+
+def test_read_entries_skips_lines_that_are_not_utf8_json_objects(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / JOURNAL_FILE).write_bytes(
+        b'{"task_id": "t"}\n\n{\n\xff\n[1]\n"u"\n{"task_id": "v"}'
+    )
+
+    assert read_entries(tmp_path) == [{"task_id": "t"}, {"task_id": "v"}]
+
+
+TOO_DEEP_FOR_JSON = b"[" * 100_000 + b"]" * 100_000
+
+
+def test_read_lock_gives_unknown_details_for_a_lock_nested_too_deeply(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / LOCK_FILE).write_bytes(TOO_DEEP_FOR_JSON)
+
+    assert read_lock(tmp_path) == {}
+
+
+def test_read_entries_skips_a_line_nested_too_deeply(tmp_path: Path) -> None:
+    (tmp_path / JOURNAL_FILE).write_bytes(
+        b'{"task_id": "t"}\n' + TOO_DEEP_FOR_JSON + b'\n{"task_id": "v"}'
+    )
+
+    assert read_entries(tmp_path) == [{"task_id": "t"}, {"task_id": "v"}]
