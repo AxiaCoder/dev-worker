@@ -80,6 +80,47 @@ def journal_holds(directory: Path, task_id: str) -> bool:
     return False
 
 
+def read_lock(directory: Path) -> dict[str, object] | None:
+    """Return the record of the lock of `directory`, or `None` when no run holds it.
+
+    The lock is read in one call, never through a handle kept open. A lock that is
+    empty, unreadable or not a JSON object gives `{}`: a run is in progress, details
+    unknown. Never raises.
+    """
+    try:
+        content = (directory / LOCK_FILE).read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return {}
+    try:
+        record = json.loads(content.decode("utf-8"))
+    except ValueError:
+        return {}
+    return record if isinstance(record, dict) else {}
+
+
+def read_entries(directory: Path) -> list[dict[str, object]]:
+    """Return the journal entries of `directory`, oldest first.
+
+    Lines that are not UTF-8 JSON objects are skipped; a missing or unreadable journal
+    gives `[]`. Never raises.
+    """
+    try:
+        content = (directory / JOURNAL_FILE).read_bytes()
+    except OSError:
+        return []
+    entries: list[dict[str, object]] = []
+    for line in content.splitlines():
+        try:
+            entry = json.loads(line.decode("utf-8"))
+        except ValueError:
+            continue
+        if isinstance(entry, dict):
+            entries.append(entry)
+    return entries
+
+
 def append_entry(directory: Path, entry: Mapping[str, object]) -> None:
     """Append `entry` as one JSON line to the journal of `directory`.
 
