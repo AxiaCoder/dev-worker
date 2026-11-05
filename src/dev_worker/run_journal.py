@@ -141,7 +141,8 @@ def torn_tail(content: bytes) -> bytes | None:
 def set_aside_torn_tail(directory: Path) -> None:
     """Cut the torn last line off the journal of `directory` into its torn file.
 
-    The torn line is appended, with a final newline, to `journal.torn`; a last line that
+    The torn line is appended, with a final newline, to `journal.torn`, unless that file
+    already ends with it, as a cut-off that failed to truncate leaves it; a last line that
     lacks only its final newline gets it instead. The journal is left as is when the
     torn file cannot be written. Raises `OSError` when a file cannot be read or written.
     """
@@ -157,8 +158,14 @@ def set_aside_torn_tail(directory: Path) -> None:
         with path.open("ab") as journal:
             journal.write(b"\n")
         return
-    with (directory / TORN_FILE).open("ab") as torn:
-        torn.write(tail + b"\n")
+    torn_path = directory / TORN_FILE
+    try:
+        set_aside = torn_path.read_bytes()
+    except FileNotFoundError:
+        set_aside = b""
+    if not set_aside.endswith(tail + b"\n"):
+        with torn_path.open("ab") as torn:
+            torn.write(tail + b"\n")
     os.truncate(path, len(content) - len(tail))
 
 

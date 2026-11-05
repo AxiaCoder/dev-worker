@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -102,3 +103,37 @@ def test_set_aside_moves_a_tail_that_is_json_but_not_an_object(
 
     assert journal.read_bytes() == b'{"task_id": "a"}\n'
     assert (tmp_path / TORN_FILE).read_bytes() == b"[1]\n"
+
+
+def test_set_aside_does_not_copy_again_a_tail_left_by_a_failed_truncation(
+    tmp_path: Path,
+) -> None:
+    journal = tmp_path / JOURNAL_FILE
+    (tmp_path / TORN_FILE).write_bytes(b'{"task_id": "b", "sta\n')
+    journal.write_bytes(b'{"task_id": "a"}\n{"task_id": "b", "sta')
+
+    set_aside_torn_tail(tmp_path)
+
+    assert journal.read_bytes() == b'{"task_id": "a"}\n'
+    assert (tmp_path / TORN_FILE).read_bytes() == b'{"task_id": "b", "sta\n'
+
+
+def test_set_aside_retried_after_a_failed_truncation_keeps_one_copy_of_the_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal = tmp_path / JOURNAL_FILE
+    journal.write_bytes(b'{"task_id": "a"}\n{"task_id": "b", "sta')
+    real_truncate = os.truncate
+
+    def failing_truncate(path: object, length: int) -> None:
+        raise OSError("truncate failed")
+
+    monkeypatch.setattr(os, "truncate", failing_truncate)
+    with pytest.raises(OSError):
+        set_aside_torn_tail(tmp_path)
+    monkeypatch.setattr(os, "truncate", real_truncate)
+
+    set_aside_torn_tail(tmp_path)
+
+    assert journal.read_bytes() == b'{"task_id": "a"}\n'
+    assert (tmp_path / TORN_FILE).read_bytes() == b'{"task_id": "b", "sta\n'
