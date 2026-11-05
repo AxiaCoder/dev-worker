@@ -1,0 +1,25 @@
+# A fictional instance of the worker, checked against the WORKER.md header of this repository.
+# Copy it outside the repository and replace every value with your own.
+
+tracker:
+  type: jira
+  project: DEMO
+  # The name of the environment variable that holds the token, never the token itself.
+  token_env: JIRA_TOKEN
+
+repository:
+  type: github
+  name: example-org/example-app
+  token_env: GITHUB_TOKEN
+
+# Every status key of the header, mapped to the status name your tracker really uses.
+statuses:
+  ready: To Do
+  in_progress: In Progress
+  in_review: In Review
+  blocked: Blocked
+  done: Done
+
+# Optional. Each limit may only tighten the header ceiling of the same name.
+limits:
+  max_turns: 40
