@@ -88,7 +88,12 @@ class Instance:
 
 
 def _status_problems(statuses: Mapping[str, str], header: Header) -> list[str]:
-    """Return one sentence per status key of `statuses` unknown to `header`, or missing."""
+    """Return one sentence per status key of `statuses` unknown to `header`, or missing.
+
+    Adds one sentence per real status name shared by several header keys, which it quotes
+    and follows with those keys in header order. Names are compared exactly, case and
+    whitespace included.
+    """
     declared = ", ".join(header.status_keys)
     problems = [
         f"statuses.{key}: unknown status key, the header declares {declared}"
@@ -99,6 +104,16 @@ def _status_problems(statuses: Mapping[str, str], header: Header) -> list[str]:
         f"statuses.{key}: missing, every status key of the header needs a real status name"
         for key in header.status_keys
         if key not in statuses
+    ]
+    keys_by_name: dict[str, list[str]] = {}
+    for key in header.status_keys:
+        if key in statuses:
+            keys_by_name.setdefault(statuses[key], []).append(key)
+    problems += [
+        f"statuses: {', '.join(keys)} share the real status {name!r},"
+        " each status key needs its own"
+        for name, keys in keys_by_name.items()
+        if len(keys) > 1
     ]
     return problems
 
@@ -142,9 +157,10 @@ def load_instance(path: Path, header: Header) -> Instance:
 
     Raises `InstanceError` when the file is not valid YAML (a key repeated within one mapping
     included), does not match the instance shape, maps a status key the header does not
-    declare or leaves one unmapped, sets a limit the header has no ceiling for, or sets a
-    limit above its ceiling. The message names key paths, lines and columns, never a value
-    written in the file.
+    declare or leaves one unmapped, maps two status keys to the same real status name, sets
+    a limit the header has no ceiling for, or sets a limit above its ceiling. The message
+    names key paths, lines and columns, and quotes no value written in the file but a
+    shared real status name.
     """
     try:
         raw = yaml.load(path.read_text(encoding="utf-8-sig"), Loader=_UniqueKeyLoader)

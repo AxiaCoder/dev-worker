@@ -119,6 +119,81 @@ def test_missing_status_key_is_refused(tmp_path: Path) -> None:
         load(tmp_path, VALID.replace("  blocked: Blocked\n", ""))
 
 
+def test_status_name_shared_by_two_keys_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(
+        InstanceError,
+        match="statuses: ready, blocked share the real status 'To Do', "
+        "each status key needs its own",
+    ):
+        load(tmp_path, VALID.replace("blocked: Blocked", "blocked: To Do"))
+
+
+def test_status_name_shared_by_three_keys_is_refused(tmp_path: Path) -> None:
+    text = VALID.replace("blocked: Blocked", "blocked: Done").replace(
+        "in_progress: In Progress", "in_progress: Done"
+    )
+
+    with pytest.raises(
+        InstanceError,
+        match="statuses: in_progress, blocked, done share the real status 'Done'",
+    ):
+        load(tmp_path, text)
+
+
+def test_each_shared_status_name_is_reported(tmp_path: Path) -> None:
+    text = VALID.replace("blocked: Blocked", "blocked: To Do").replace(
+        "in_progress: In Progress", "in_progress: Done"
+    )
+
+    with pytest.raises(InstanceError) as caught:
+        load(tmp_path, text)
+
+    message = str(caught.value)
+    assert "statuses: ready, blocked share the real status 'To Do'" in message
+    assert "statuses: in_progress, done share the real status 'Done'" in message
+
+
+def test_keys_sharing_a_status_name_are_listed_in_header_order(tmp_path: Path) -> None:
+    statuses = (
+        "statuses:\n"
+        "  done: Done\n"
+        "  blocked: To Do\n"
+        "  in_progress: In Progress\n"
+        "  ready: To Do\n"
+    )
+    text = VALID.replace(
+        VALID[VALID.index("statuses:") : VALID.index("limits:")], statuses
+    )
+
+    with pytest.raises(
+        InstanceError, match="statuses: ready, blocked share the real status 'To Do'"
+    ):
+        load(tmp_path, text)
+
+
+def test_unknown_status_key_does_not_share_a_status_name(tmp_path: Path) -> None:
+    text = VALID.replace("  done: Done\n", "  done: Done\n  shelved: To Do\n")
+
+    with pytest.raises(InstanceError, match="statuses.shelved: unknown") as caught:
+        load(tmp_path, text)
+
+    assert "share the real status" not in str(caught.value)
+
+
+def test_status_names_differing_in_case_or_spacing_are_distinct(
+    tmp_path: Path,
+) -> None:
+    text = VALID.replace("blocked: Blocked", "blocked: to do").replace(
+        "done: Done", 'done: "To Do "'
+    )
+
+    instance = load(tmp_path, text)
+
+    assert instance.statuses["ready"] == "To Do"
+    assert instance.statuses["blocked"] == "to do"
+    assert instance.statuses["done"] == "To Do "
+
+
 def test_empty_status_name_is_refused(tmp_path: Path) -> None:
     with pytest.raises(InstanceError, match="statuses.blocked"):
         load(tmp_path, VALID.replace("blocked: Blocked", "blocked: ''"))
