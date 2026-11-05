@@ -167,12 +167,12 @@ def load_instance(path: Path, header: Header) -> Instance:
     except yaml.YAMLError as error:
         raise InstanceError(
             f"instance file is not valid YAML{_yaml_reasons(error)}"
-        ) from error
+        ) from None
     try:
         data = _InstanceData.model_validate(raw)
     except ValidationError as error:
         description = _describe(error, root="instance", echo=False)
-        raise InstanceError(f"invalid instance file: {description}") from error
+        raise InstanceError(f"invalid instance file: {description}") from None
     problems = _status_problems(data.statuses, header) + _limit_problems(
         data.limits, header
     )

@@ -1,3 +1,4 @@
+import traceback
 from pathlib import Path
 
 import pytest
@@ -319,6 +320,28 @@ def test_invalid_yaml_is_refused_without_echo(tmp_path: Path) -> None:
 
     assert SECRET not in str(caught.value)
     assert "ghp_" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param(f'tracker:\n  token_env: "{SECRET}\n', id="malformed-yaml"),
+        pytest.param(
+            VALID.replace("  token_env: JIRA_TOKEN\n", f"  token: {SECRET}\n"),
+            id="extra-field",
+        ),
+        pytest.param(VALID.replace("type: jira", f"type: {SECRET}"), id="bad-literal"),
+    ],
+)
+def test_refusal_traceback_does_not_carry_the_pasted_value(
+    tmp_path: Path, text: str
+) -> None:
+    with pytest.raises(InstanceError) as caught:
+        load(tmp_path, text)
+
+    error = caught.value
+    assert error.__cause__ is None
+    assert SECRET not in "".join(traceback.format_exception(error))
 
 
 def test_invalid_yaml_reports_each_reason_with_line_and_column(tmp_path: Path) -> None:
