@@ -10,6 +10,17 @@ One main mandate — "take this ticket to a pull request" — in which the AI ch
 
 Out of V1: a framing mandate, narrow mandates, connectors beyond Jira and GitHub.
 
+## Development
+
+Requires [uv](https://docs.astral.sh/uv/). From the repository root:
+
+```
+uv sync
+uv run poe check
+```
+
+`poe check` runs lint, format check, types, and tests with a 100 % line and branch coverage floor.
+
 ## License
 
 [MIT](LICENSE).
