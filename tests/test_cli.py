@@ -275,6 +275,20 @@ def test_instance_nested_too_deeply_fails_naming_the_file(
     assert_failed(answer, "task-1", f"Instance file '{instance}': ")
 
 
+def test_instance_path_with_a_lone_surrogate_fails_naming_it_escaped(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    tmp_path: Path,
+) -> None:
+    instance = tmp_path / "caf\udce9.yaml"
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", "caf\\udce9.yaml")
+
+
 def test_state_is_empty(
     monkeypatch: pytest.MonkeyPatch, capsysbinary: pytest.CaptureFixture[bytes]
 ) -> None:

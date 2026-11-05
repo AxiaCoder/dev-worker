@@ -26,12 +26,20 @@ from dev_worker.validation import describe_validation_error
 
 
 def failed(task_id: str | None, *errors: str) -> MandateOutput:
-    """Build a failed mandate output carrying the given error messages."""
+    """Build a failed mandate output carrying the given error messages.
+
+    A character that cannot be encoded as UTF-8, such as a lone surrogate from an
+    undecodable path, is written as its backslash escape (`\\udce9`), so the output
+    can always be serialized.
+    """
     return MandateOutput(
         task_id=task_id,
         status="failed",
         summary="The mandate could not be run.",
-        errors=list(errors),
+        errors=[
+            error.encode("utf-8", "backslashreplace").decode("utf-8")
+            for error in errors
+        ],
     )
 
 
