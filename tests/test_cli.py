@@ -1041,6 +1041,45 @@ def test_health_is_down_when_the_instance_directory_is_a_file(
     assert_down(answer, f"Instance directory '{instance.with_suffix('')}'")
 
 
+def refuse_journal(monkeypatch: pytest.MonkeyPatch, instance: Path) -> Path:
+    """Make `os.access` refuse the journal of `instance` only; return the journal path."""
+    journal = instance.with_suffix("") / run_journal.JOURNAL_FILE
+    allowed = os.access
+
+    def access(path: Path, mode: int) -> bool:
+        return Path(path) != journal and allowed(path, mode)
+
+    monkeypatch.setattr(cli.os, "access", access)
+    return journal
+
+
+def test_health_is_down_when_the_journal_cannot_be_written(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    write_journal(instance, {"task_id": "t"})
+    journal = refuse_journal(monkeypatch, instance)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert_down(answer, "")
+    assert str(journal) in str(answer["reason"])
+
+
+def test_health_is_ok_when_the_journal_does_not_exist_yet(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    instance.with_suffix("").mkdir()
+    refuse_journal(monkeypatch, instance)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert answer == {"status": "ok", "reason": None, "active": True}
+
+
 @pytest.mark.usefixtures("frozen_now")
 def test_health_is_degraded_when_the_run_holding_the_lock_outlives_the_timeout(
     monkeypatch: pytest.MonkeyPatch,

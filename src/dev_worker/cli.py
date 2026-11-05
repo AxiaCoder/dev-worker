@@ -27,6 +27,7 @@ from dev_worker.contract import (
 from dev_worker.header import Header, HeaderError, load_worker_file
 from dev_worker.instance import Instance, InstanceError, load_instance
 from dev_worker.run_journal import (
+    JOURNAL_FILE,
     LOCK_FILE,
     JournalError,
     append_entry,
@@ -397,17 +398,20 @@ def unwritable_directory(directory: Path) -> str | None:
 
     Checks, without writing, the directory when it exists, else its nearest existing
     parent, in which a run would create it: it must be a directory the process may
-    write in and enter.
+    write in and enter. The journal, when it exists, must be writable too.
     """
     nearest = directory
     while not nearest.exists() and nearest.parent != nearest:
         nearest = nearest.parent
-    if nearest.is_dir() and os.access(nearest, os.W_OK | os.X_OK):
-        return None
-    return (
-        f"Instance directory '{directory}' cannot be written: "
-        f"'{nearest}' is not a writable directory."
-    )
+    if not (nearest.is_dir() and os.access(nearest, os.W_OK | os.X_OK)):
+        return (
+            f"Instance directory '{directory}' cannot be written: "
+            f"'{nearest}' is not a writable directory."
+        )
+    journal = directory / JOURNAL_FILE
+    if journal.exists() and not os.access(journal, os.W_OK):
+        return f"Journal '{journal}' cannot be written."
+    return None
 
 
 def lock_age(directory: Path, lock: Mapping[str, object]) -> float | None:
