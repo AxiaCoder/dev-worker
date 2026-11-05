@@ -313,6 +313,21 @@ def test_instance_directory_that_cannot_be_created_fails_naming_it(
     )
 
 
+def test_instance_file_without_a_suffix_fails_creating_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    tmp_path: Path,
+) -> None:
+    instance = Path(shutil.copy(INSTANCE, tmp_path / "acme"))
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", "has no suffix")
+    assert list(tmp_path.iterdir()) == [instance]
+
+
 def test_lock_that_cannot_be_written_fails_naming_the_reason(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],

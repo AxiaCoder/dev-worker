@@ -21,6 +21,11 @@ def test_instance_directory_drops_the_suffix(tmp_path: Path) -> None:
     assert instance_directory(tmp_path / "acme.yaml") == tmp_path / "acme"
 
 
+def test_instance_file_without_a_suffix_has_no_directory(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="has no suffix"):
+        instance_directory(tmp_path / "acme")
+
+
 def test_take_lock_writes_the_record(tmp_path: Path) -> None:
     lock = take_lock(tmp_path, {"task_id": "t"})
 

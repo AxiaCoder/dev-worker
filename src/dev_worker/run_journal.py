@@ -19,7 +19,13 @@ class JournalError(ValueError):
 
 
 def instance_directory(instance_path: Path) -> Path:
-    """Return the directory of the instance read from `instance_path`."""
+    """Return the directory of the instance read from `instance_path`.
+
+    Raises `ValueError` when `instance_path` has no suffix, since the directory would
+    then be the instance file itself.
+    """
+    if not instance_path.suffix:
+        raise ValueError(f"Instance file '{instance_path}' has no suffix.")
     return instance_path.with_suffix("")
 
 

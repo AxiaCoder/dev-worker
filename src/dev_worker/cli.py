@@ -33,9 +33,9 @@ from dev_worker.run_journal import (
     release_lock,
     take_lock,
 )
+from dev_worker.validation import describe_validation_error
 
 TICKET_KEY = re.compile(r"(.+)-([1-9][0-9]*)")
-from dev_worker.validation import describe_validation_error
 
 
 def failed(task_id: str | None, *errors: str) -> MandateOutput:
@@ -128,7 +128,10 @@ def run_journaled(
     if refusal is not None:
         return failed(task_id, refusal)
     ticket_key = mandate.params["ticket_key"]
-    directory = instance_directory(instance_path)
+    try:
+        directory = instance_directory(instance_path)
+    except ValueError as error:
+        return failed(task_id, str(error))
     try:
         directory.mkdir(parents=True, exist_ok=True)
     except OSError as error:
