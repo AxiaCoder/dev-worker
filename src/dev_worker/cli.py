@@ -6,8 +6,11 @@ on stdin against that instance and the `WORKER.md` shipped with the package.
 
 import argparse
 import json
+import re
 import sys
+import time
 from collections.abc import Callable, Sequence
+from datetime import UTC, datetime
 from importlib.resources import as_file, files
 from pathlib import Path
 
@@ -22,6 +25,16 @@ from dev_worker.contract import (
 )
 from dev_worker.header import Header, HeaderError, load_worker_file
 from dev_worker.instance import Instance, InstanceError, load_instance
+from dev_worker.run_journal import (
+    JournalError,
+    append_entry,
+    instance_directory,
+    journal_holds,
+    release_lock,
+    take_lock,
+)
+
+TICKET_KEY = re.compile(r"(.+)-([1-9][0-9]*)")
 from dev_worker.validation import describe_validation_error
 
 
@@ -44,8 +57,12 @@ def failed(task_id: str | None, *errors: str) -> MandateOutput:
 
 
 def deliver_ticket(mandate: MandateInput, instance: Instance) -> MandateOutput:
-    """Run the `deliver_ticket` mandate; not built yet, it always fails."""
-    return failed(mandate.task_id, "The deliver_ticket mandate is not built yet.")
+    """Run the `deliver_ticket` mandate; its body is not built yet, it does nothing."""
+    return MandateOutput(
+        task_id=mandate.task_id,
+        status="completed",
+        summary="Nothing was done: the deliver_ticket mandate has no body yet.",
+    )
 
 
 MANDATES: dict[str, Callable[[MandateInput, Instance], MandateOutput]] = {
@@ -73,6 +90,122 @@ def os_reason(error: OSError) -> str:
     return error.strerror or str(error)
 
 
+def check_ticket_key(mandate: MandateInput, instance: Instance) -> str | None:
+    """Return why `params.ticket_key` of `mandate` is refused, or None when it is valid.
+
+    A valid key is a string `<PROJECT>-<n>`, where `<PROJECT>` is the tracker project
+    of `instance` and `<n>` a positive integer written without a leading zero.
+    """
+    key = mandate.params.get("ticket_key")
+    project = instance.tracker.project
+    if key is None:
+        return "params.ticket_key is missing."
+    if not isinstance(key, str):
+        return "params.ticket_key must be a string."
+    match = TICKET_KEY.fullmatch(key)
+    if match is None:
+        return f"params.ticket_key {key!r} is not of the form {project}-<number>."
+    if match.group(1) != project:
+        return f"Ticket {key!r} is not in the tracker project {project!r}."
+    return None
+
+
+def run_journaled(
+    handler: Callable[[MandateInput, Instance], MandateOutput],
+    mandate: MandateInput,
+    instance: Instance,
+    instance_path: Path,
+) -> MandateOutput:
+    """Run `handler` under the lock of the instance directory and journal the run.
+
+    The ticket key is checked first, then the lock is taken; a task_id already in the
+    journal is refused. A refused run is not journaled. Every file error becomes a
+    failed output naming the reason; an exception raised by `handler` propagates once
+    the lock is released.
+    """
+    task_id = mandate.task_id
+    refusal = check_ticket_key(mandate, instance)
+    if refusal is not None:
+        return failed(task_id, refusal)
+    ticket_key = mandate.params["ticket_key"]
+    directory = instance_directory(instance_path)
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        return failed(
+            task_id,
+            f"Instance directory '{directory}' cannot be created: {os_reason(error)}",
+        )
+    start = datetime.now(UTC).isoformat()
+    try:
+        lock = take_lock(
+            directory, {"task_id": task_id, "ticket_key": ticket_key, "start": start}
+        )
+    except FileExistsError:
+        return failed(
+            task_id,
+            f"A run is already in progress in instance directory '{directory}'.",
+        )
+    except OSError as error:
+        return failed(
+            task_id,
+            f"Lock file in '{directory}' cannot be written: {os_reason(error)}",
+        )
+    try:
+        output = run_under_lock(handler, mandate, instance, directory, start)
+    finally:
+        try:
+            release_lock(lock)
+        except OSError as error:
+            release_error = f"Lock file '{lock}' cannot be removed: {os_reason(error)}"
+        else:
+            release_error = None
+    if release_error is not None:
+        return output.model_copy(update={"errors": [*output.errors, release_error]})
+    return output
+
+
+def run_under_lock(
+    handler: Callable[[MandateInput, Instance], MandateOutput],
+    mandate: MandateInput,
+    instance: Instance,
+    directory: Path,
+    start: str,
+) -> MandateOutput:
+    """Run `handler` unless its task_id is already journaled, then journal the run.
+
+    `start` is the ISO 8601 UTC start of the run, written as is in the journal line.
+    """
+    task_id = mandate.task_id
+    try:
+        repeated = journal_holds(directory, task_id)
+    except OSError as error:
+        return failed(
+            task_id, f"Journal in '{directory}' cannot be read: {os_reason(error)}"
+        )
+    except JournalError as error:
+        return failed(task_id, f"Journal in '{directory}': {error}")
+    if repeated:
+        return failed(task_id, f"Task {task_id!r} has already been run.")
+    began = time.monotonic()
+    output = handler(mandate, instance)
+    entry = {
+        "task_id": task_id,
+        "ticket_key": mandate.params["ticket_key"],
+        "status": output.status,
+        "start": start,
+        "duration": time.monotonic() - began,
+        "tokens": 0,
+    }
+    try:
+        append_entry(directory, entry)
+    except OSError as error:
+        return failed(
+            task_id, f"Journal in '{directory}' cannot be written: {os_reason(error)}"
+        )
+    return output
+
+
 def load_header() -> Header:
     """Read and validate the header of the `WORKER.md` shipped with the package.
 
@@ -88,7 +221,8 @@ def run_mandate(
     """Run the mandate named on the command line against the UTF-8 JSON input.
 
     The mandate gets the instance read from `instance_path` and checked against the
-    header of the packaged `WORKER.md`. Never raises on bad input: bytes that are not
+    header of the packaged `WORKER.md`, and runs under the lock of the instance
+    directory, journaled there (see `run_journaled`). Never raises on bad input: bytes that are not
     UTF-8, JSON that cannot be parsed or written back as UTF-8, input that breaks the
     contract, an unknown mandate, and a `WORKER.md` or instance file that cannot be
     read or is invalid all become a failed output naming the reason.
@@ -153,7 +287,7 @@ def run_mandate(
             task_id,
             f"Instance file '{instance_path}' cannot be read: {os_reason(error)}",
         )
-    return handler(mandate, instance)
+    return run_journaled(handler, mandate, instance, instance_path)
 
 
 def add_instance_argument(command: argparse.ArgumentParser) -> None:
