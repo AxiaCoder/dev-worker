@@ -84,7 +84,7 @@ def read_lock(directory: Path) -> dict[str, object] | None:
     """Return the record of the lock of `directory`, or `None` when no run holds it.
 
     The lock is read in one call, never through a handle kept open. A lock that is
-    empty, unreadable or not a JSON object gives `{}`: a run is in progress, details
+    empty, unreadable, nested too deeply or not a JSON object gives `{}`: a run is in progress, details
     unknown. Never raises.
     """
     try:
@@ -95,7 +95,7 @@ def read_lock(directory: Path) -> dict[str, object] | None:
         return {}
     try:
         record = json.loads(content.decode("utf-8"))
-    except ValueError:
+    except (ValueError, RecursionError):
         return {}
     return record if isinstance(record, dict) else {}
 
@@ -103,7 +103,7 @@ def read_lock(directory: Path) -> dict[str, object] | None:
 def read_entries(directory: Path) -> list[dict[str, object]]:
     """Return the journal entries of `directory`, oldest first.
 
-    Lines that are not UTF-8 JSON objects are skipped; a missing or unreadable journal
+    Lines that are not UTF-8 JSON objects, or are nested too deeply, are skipped; a missing or unreadable journal
     gives `[]`. Never raises.
     """
     try:
@@ -114,7 +114,7 @@ def read_entries(directory: Path) -> list[dict[str, object]]:
     for line in content.splitlines():
         try:
             entry = json.loads(line.decode("utf-8"))
-        except ValueError:
+        except (ValueError, RecursionError):
             continue
         if isinstance(entry, dict):
             entries.append(entry)

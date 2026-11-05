@@ -913,3 +913,46 @@ def test_run_reads_and_writes_utf8_whatever_the_system_encoding(
 
     assert task_id.encode("utf-8") in completed.stdout
     assert json.loads(completed.stdout.decode("utf-8"))["task_id"] == task_id
+
+
+def nested_object(depth: int) -> bytes:
+    """Return a JSON object holding `depth` nested arrays."""
+    return b'{"task_id": "deep", "x": ' + b"[" * depth + b"]" * depth + b"}"
+
+
+UNREADABLE_RECORDS = [
+    pytest.param(b"[" * 100_000 + b"]" * 100_000, id="too-deep-for-json"),
+    pytest.param(nested_object(300), id="too-deep-to-validate"),
+    pytest.param(nested_object(98), id="too-deep-to-serialize"),
+    pytest.param(b'{"task_id": "\\ud800", "status": "completed"}', id="lone-surrogate"),
+]
+
+
+@pytest.mark.parametrize("line", UNREADABLE_RECORDS)
+def test_state_skips_a_journal_line_it_cannot_answer_in_json(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    line: bytes,
+) -> None:
+    directory = write_journal(instance, {"task_id": "t"})
+    with (directory / run_journal.JOURNAL_FILE).open("ab") as journal:
+        journal.write(line + b"\n")
+
+    assert common(state(monkeypatch, capsysbinary, instance))["recent"] == [
+        {"task_id": "t"}
+    ]
+
+
+@pytest.mark.parametrize("content", UNREADABLE_RECORDS)
+def test_state_reports_a_run_of_unknown_details_for_a_lock_it_cannot_answer_in_json(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    content: bytes,
+) -> None:
+    directory = instance.with_suffix("")
+    directory.mkdir()
+    (directory / run_journal.LOCK_FILE).write_bytes(content)
+
+    assert common(state(monkeypatch, capsysbinary, instance))["current"] == [{}]

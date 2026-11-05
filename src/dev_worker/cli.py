@@ -317,6 +317,19 @@ def run_tokens(entry: Mapping[str, object]) -> int:
     return tokens if isinstance(tokens, int) and not isinstance(tokens, bool) else 0
 
 
+def answerable(record: Mapping[str, object]) -> bool:
+    """Tell whether `record`, placed in the state, can be validated and written as JSON.
+
+    False when a string in it holds a lone surrogate or it is nested deeper than the
+    state model validates or serializes.
+    """
+    try:
+        State.model_validate({"common": {"recent": [record]}}).model_dump_json()
+    except ValueError:
+        return False
+    return True
+
+
 def read_state(instance_path: Path) -> State:
     """Build the state of the instance read from `instance_path`, writing nothing.
 
@@ -324,14 +337,21 @@ def read_state(instance_path: Path) -> State:
     unknown), `recent` the last `RECENT_RUNS` journal entries, most recent first, and
     `cost` the number of runs and the tokens they spent on the current UTC day. The
     instance file itself is not read; an instance path without a suffix gives an empty
-    state. Never raises.
+    state. A journal entry that `answerable` refuses is skipped, a lock record it
+    refuses gives `{}`. Never raises.
     """
     try:
         directory = instance_directory(instance_path)
     except ValueError:
         directory = None
     lock = read_lock(directory) if directory else None
-    entries = read_entries(directory) if directory else []
+    if lock is not None and not answerable(lock):
+        lock = {}
+    entries = (
+        [entry for entry in read_entries(directory) if answerable(entry)]
+        if directory
+        else []
+    )
     today = datetime.now(UTC).date()
     todays = [entry for entry in entries if run_day(entry) == today]
     tokens = sum(run_tokens(entry) for entry in todays)

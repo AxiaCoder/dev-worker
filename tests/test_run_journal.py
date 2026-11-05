@@ -197,3 +197,22 @@ def test_read_entries_skips_lines_that_are_not_utf8_json_objects(
     )
 
     assert read_entries(tmp_path) == [{"task_id": "t"}, {"task_id": "v"}]
+
+
+TOO_DEEP_FOR_JSON = b"[" * 100_000 + b"]" * 100_000
+
+
+def test_read_lock_gives_unknown_details_for_a_lock_nested_too_deeply(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / LOCK_FILE).write_bytes(TOO_DEEP_FOR_JSON)
+
+    assert read_lock(tmp_path) == {}
+
+
+def test_read_entries_skips_a_line_nested_too_deeply(tmp_path: Path) -> None:
+    (tmp_path / JOURNAL_FILE).write_bytes(
+        b'{"task_id": "t"}\n' + TOO_DEEP_FOR_JSON + b'\n{"task_id": "v"}'
+    )
+
+    assert read_entries(tmp_path) == [{"task_id": "t"}, {"task_id": "v"}]
