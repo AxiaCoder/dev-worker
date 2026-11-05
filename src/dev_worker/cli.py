@@ -393,7 +393,7 @@ def read_state(instance_path: Path) -> State:
     )
 
 
-def unwritable_directory(directory: Path) -> str | None:
+def unwritable_instance_directory(directory: Path) -> str | None:
     """Return why a run could not write in `directory`, or `None` when it could.
 
     Checks, without writing, the directory when it exists, else its nearest existing
@@ -435,7 +435,8 @@ def read_health(instance_path: Path) -> Health:
     """Tell whether the worker can run against the instance read from `instance_path`.
 
     `down` when `WORKER.md` or the instance file does not load, the instance path has
-    no suffix, or the instance directory cannot be written; `degraded` when a run has
+    no suffix, or the instance directory or its existing journal cannot be written;
+    `degraded` when a run has
     held the lock longer than the instance's `run_timeout_seconds`; `ok` otherwise.
     Writes nothing and never raises.
     """
@@ -446,7 +447,7 @@ def read_health(instance_path: Path) -> Health:
         directory = instance_directory(instance_path)
     except ValueError as error:
         return Health(status="down", reason=writable_text(str(error)), active=True)
-    unwritable = unwritable_directory(directory)
+    unwritable = unwritable_instance_directory(directory)
     if unwritable is not None:
         return Health(status="down", reason=writable_text(unwritable), active=True)
     lock = read_lock(directory)
