@@ -12,7 +12,7 @@ Out of V1: a framing mandate, narrow mandates, connectors beyond Jira and GitHub
 
 ## Adding an instance
 
-An instance is one YAML file that points the worker at a tracker project and a repository. It is read against the header of [`WORKER.md`](WORKER.md) and refused if it loosens it.
+An instance is one YAML file that points the worker at a tracker project and a repository. It is read against the header of [`WORKER.md`](src/dev_worker/WORKER.md) and refused if it loosens it.
 
 1. Copy [`examples/instance.yaml`](examples/instance.yaml) to a place **outside this repository**.
 2. Set the tracker project and the repository name.

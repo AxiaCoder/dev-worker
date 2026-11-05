@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def test_example_instance_loads_against_the_worker_header() -> None:
-    header = load_worker_file(ROOT / "WORKER.md").header
+    header = load_worker_file(ROOT / "src" / "dev_worker" / "WORKER.md").header
 
     instance = load_instance(ROOT / "examples" / "instance.yaml", header)
 
