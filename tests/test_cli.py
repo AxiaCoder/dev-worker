@@ -4,6 +4,7 @@ import os
 import runpy
 import subprocess
 import sys
+from importlib.metadata import entry_points
 from pathlib import Path
 
 import pytest
@@ -269,6 +270,19 @@ def test_instance_is_required(command: str) -> None:
         cli.main([command])
 
     assert raised.value.code == 2
+
+
+def test_run_requires_the_instance() -> None:
+    with pytest.raises(SystemExit) as raised:
+        cli.main(["run", "deliver_ticket"])
+
+    assert raised.value.code == 2
+
+
+def test_dev_worker_script_points_at_main() -> None:
+    (script,) = entry_points(group="console_scripts", name="dev-worker")
+
+    assert script.load() is cli.main
 
 
 def test_python_m_runs_the_command_line(
