@@ -5,6 +5,7 @@ import runpy
 import shutil
 import subprocess
 import sys
+from collections.abc import Iterator
 from datetime import datetime, timedelta
 from importlib.metadata import entry_points
 from pathlib import Path
@@ -37,6 +38,14 @@ def valid_input(**overrides: object) -> dict[str, object]:
 def instance(tmp_path: Path) -> Path:
     """Return a copy of the example instance file in a temporary directory."""
     return Path(shutil.copy(INSTANCE, tmp_path / "instance.yaml"))
+
+
+@pytest.fixture(autouse=True)
+def examples_stay_clean() -> Iterator[None]:
+    """Fail a test that leaves a file in `examples/` it did not find there."""
+    before = sorted(INSTANCE.parent.rglob("*"))
+    yield
+    assert sorted(INSTANCE.parent.rglob("*")) == before
 
 
 def journal_lines(instance: Path) -> list[dict[str, object]]:
@@ -138,7 +147,11 @@ def test_valid_ticket_key_completes_and_journals_the_run(
         ({"ticket_key": "DEMO-0"}, "is not of the form DEMO-<number>."),
         ({"ticket_key": "DEMO"}, "is not of the form DEMO-<number>."),
         ({"ticket_key": "DEMO-1\n"}, "is not of the form DEMO-<number>."),
+        ({"ticket_key": "DEMO-1٣"}, "is not of the form DEMO-<number>."),
         ({"ticket_key": "OTHER-1"}, "is not in the tracker project 'DEMO'."),
+        ({"ticket_key": "demo-1"}, "is not in the tracker project 'DEMO'."),
+        ({"ticket_key": "DEMO-1-2"}, "is not in the tracker project 'DEMO'."),
+        ({"ticket_key": "XDEMO-1"}, "is not in the tracker project 'DEMO'."),
     ],
 )
 def test_refused_ticket_key_fails_without_journaling(
@@ -189,6 +202,39 @@ def test_other_task_id_after_a_run_is_journaled(
         "task-1",
         "task-2",
     ]
+
+
+def test_journal_records_the_status_the_mandate_returns(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    def refuse(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+        return cli.failed(mandate.task_id, "The ticket cannot be delivered.")
+
+    monkeypatch.setitem(cli.MANDATES, "deliver_ticket", refuse)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", "The ticket cannot be delivered.")
+    (line,) = journal_lines(instance)
+    assert line["status"] == "failed"
+
+
+def test_journal_records_the_duration_of_the_mandate_in_seconds(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    clock = [100.0, 102.5]
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock.pop(0))
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    (line,) = journal_lines(instance)
+    assert line["duration"] == 2.5
 
 
 def test_held_lock_fails_leaving_it_untouched(
