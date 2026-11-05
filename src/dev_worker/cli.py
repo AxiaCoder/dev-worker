@@ -29,6 +29,7 @@ from dev_worker.instance import Instance, InstanceError, load_instance
 from dev_worker.run_journal import (
     JOURNAL_FILE,
     LOCK_FILE,
+    TORN_FILE,
     JournalError,
     append_entry,
     instance_directory,
@@ -36,7 +37,9 @@ from dev_worker.run_journal import (
     read_entries,
     read_lock,
     release_lock,
+    set_aside_torn_tail,
     take_lock,
+    torn_tail,
 )
 from dev_worker.validation import describe_validation_error
 
@@ -186,14 +189,17 @@ def run_under_lock(
 ) -> MandateOutput:
     """Run `handler` unless its task_id is already journaled, then journal the run.
 
-    `start` is the ISO 8601 UTC start of the run, written as is in the journal line.
+    `start` is the ISO 8601 UTC start of the run, written as is in the journal line. A
+    torn last journal line is first set aside in the torn file.
     """
     task_id = mandate.task_id
     try:
+        set_aside_torn_tail(directory)
         repeated = journal_holds(directory, task_id)
     except OSError as error:
         return failed(
-            task_id, f"Journal in '{directory}' cannot be read: {os_reason(error)}"
+            task_id,
+            f"Journal in '{directory}' cannot be read or repaired: {os_reason(error)}",
         )
     except JournalError as error:
         return failed(task_id, f"Journal in '{directory}': {error}")
@@ -437,7 +443,8 @@ def read_health(instance_path: Path) -> Health:
     `down` when `WORKER.md` or the instance file does not load, the instance path has
     no suffix, or the instance directory or its existing journal cannot be written;
     `degraded` when a run has
-    held the lock longer than the instance's `run_timeout_seconds`; `ok` otherwise.
+    held the lock longer than the instance's `run_timeout_seconds`, or the journal holds a
+    torn line (see `torn_journal_line`); `ok` otherwise.
     Writes nothing and never raises.
     """
     instance = load_checked_instance(instance_path)
@@ -463,7 +470,29 @@ def read_health(instance_path: Path) -> Health:
             ),
             active=True,
         )
+    torn = torn_journal_line(directory)
+    if torn is not None:
+        return Health(status="degraded", reason=writable_text(torn), active=True)
     return Health(status="ok", reason=None, active=True)
+
+
+def torn_journal_line(directory: Path) -> str | None:
+    """Return why the journal of `directory` holds a torn line, `None` when it does not.
+
+    A torn line is one in the torn file, or a torn last line of the journal that no run
+    has set aside yet. A journal that cannot be read is taken as whole. Never raises.
+    """
+    torn = directory / TORN_FILE
+    if torn.exists():
+        return f"Torn journal lines are set aside in '{torn}'."
+    journal = directory / JOURNAL_FILE
+    try:
+        content = journal.read_bytes()
+    except OSError:
+        return None
+    if torn_tail(content) is not None:
+        return f"Journal '{journal}' ends with a torn line."
+    return None
 
 
 def add_instance_argument(command: argparse.ArgumentParser) -> None:

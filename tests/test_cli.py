@@ -20,6 +20,7 @@ from dev_worker.instance import Instance
 
 ROOT = Path(__file__).resolve().parent.parent
 INSTANCE = ROOT / "examples" / "instance.yaml"
+TORN_FILE = "journal.torn"
 
 
 def valid_input(**overrides: object) -> dict[str, object]:
@@ -358,7 +359,9 @@ def test_journal_that_cannot_be_read_fails_and_releases_the_lock(
         monkeypatch, capsysbinary, encode(valid_input()), instance=instance
     )
 
-    assert_failed(answer, "task-1", f"Journal in '{directory}' cannot be read: ")
+    assert_failed(
+        answer, "task-1", f"Journal in '{directory}' cannot be read or repaired: "
+    )
     assert not (directory / run_journal.LOCK_FILE).exists()
 
 
@@ -376,6 +379,178 @@ def test_journal_with_a_line_that_is_not_an_object_fails(
     )
 
     assert_failed(answer, "task-1", "line 1 is not a JSON object.")
+
+
+def test_journal_with_a_terminated_line_that_is_not_json_fails_wherever_it_is(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    directory = instance.with_suffix("")
+    directory.mkdir()
+    journal = directory / run_journal.JOURNAL_FILE
+    journal.write_bytes(b'{"task_id": "a"}\n{"task_id": "b", "sta\n{"task_id": "c"}\n')
+    before = journal.read_bytes()
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", "line 2 is not valid JSON")
+    assert journal.read_bytes() == before
+    assert not (directory / TORN_FILE).exists()
+
+
+TORN_TAILS = [
+    pytest.param(b'{"task_id": "t1", "sta', id="cut-json"),
+    pytest.param(b'{"task_id": "t\xc3', id="cut-utf8"),
+    pytest.param(b"\xff\xfe", id="not-utf8"),
+    pytest.param(b"[1]", id="json-not-an-object"),
+]
+
+
+def write_torn_journal(instance: Path, tail: bytes, *entries: object) -> Path:
+    """Write `entries` as complete journal lines followed by `tail` unterminated."""
+    directory = write_journal(instance, *entries)
+    with (directory / run_journal.JOURNAL_FILE).open("ab") as journal:
+        journal.write(tail)
+    return directory
+
+
+@pytest.mark.parametrize("tail", TORN_TAILS)
+def test_run_after_a_torn_journal_line_completes_and_journals_after_the_whole_lines(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    tail: bytes,
+) -> None:
+    directory = write_torn_journal(instance, tail, {"task_id": "a"}, {"task_id": "b"})
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed"
+    content = (directory / run_journal.JOURNAL_FILE).read_bytes()
+    assert content.startswith(b'{"task_id": "a"}\n{"task_id": "b"}\n')
+    assert tail not in content
+    assert all(line.endswith(b"\n") for line in content.splitlines(keepends=True))
+    assert [line["task_id"] for line in journal_lines(instance)] == [
+        "a",
+        "b",
+        "task-1",
+    ]
+
+
+def test_run_after_a_journal_holding_only_a_torn_line_journals_the_run_alone(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    write_torn_journal(instance, b'{"task_id": "t1", "sta')
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed"
+    assert [line["task_id"] for line in journal_lines(instance)] == ["task-1"]
+
+
+@pytest.mark.parametrize("tail", TORN_TAILS)
+def test_run_sets_the_torn_journal_line_aside_byte_for_byte(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    tail: bytes,
+) -> None:
+    directory = write_torn_journal(instance, tail, {"task_id": "a"})
+    torn = directory / TORN_FILE
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert torn.is_file()
+    assert torn.read_bytes() == tail + b"\n"
+
+
+def test_two_torn_journal_lines_are_set_aside_one_after_the_other(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    directory = write_torn_journal(instance, b'{"task_id": "x", "st', {"task_id": "a"})
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+    with (directory / run_journal.JOURNAL_FILE).open("ab") as journal:
+        journal.write(b'{"task_id": "y"')
+
+    answer = run_mandate(
+        monkeypatch,
+        capsysbinary,
+        encode(valid_input(task_id="task-2")),
+        instance=instance,
+    )
+
+    assert answer["status"] == "completed"
+    assert (directory / TORN_FILE).read_bytes() == (
+        b'{"task_id": "x", "st\n{"task_id": "y"\n'
+    )
+    assert [line["task_id"] for line in journal_lines(instance)] == [
+        "a",
+        "task-1",
+        "task-2",
+    ]
+
+
+def test_run_after_a_whole_unterminated_journal_line_keeps_it_and_terminates_it(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    directory = write_torn_journal(instance, b'{"task_id": "b"}', {"task_id": "a"})
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed"
+    content = (directory / run_journal.JOURNAL_FILE).read_bytes()
+    assert content.startswith(b'{"task_id": "a"}\n{"task_id": "b"}\n')
+    assert [line["task_id"] for line in journal_lines(instance)] == [
+        "a",
+        "b",
+        "task-1",
+    ]
+    assert not (directory / TORN_FILE).exists()
+
+
+def test_task_of_a_whole_unterminated_journal_line_is_not_run_again(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    directory = write_torn_journal(instance, b'{"task_id": "task-1"}')
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", "Task 'task-1' has already been run.")
+    assert (directory / run_journal.JOURNAL_FILE).read_bytes() == (
+        b'{"task_id": "task-1"}\n'
+    )
+    assert not (directory / TORN_FILE).exists()
+
+
+def test_run_after_a_whole_journal_sets_nothing_aside(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    directory = write_journal(instance, {"task_id": "a"})
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert not (directory / TORN_FILE).exists()
 
 
 def test_journal_that_cannot_be_written_fails_naming_the_reason(
@@ -1078,6 +1253,104 @@ def test_health_is_ok_when_the_journal_does_not_exist_yet(
     answer = health(monkeypatch, capsysbinary, instance)
 
     assert answer == {"status": "ok", "reason": None, "active": True}
+
+
+def assert_degraded_naming(answer: dict[str, object], path: Path) -> None:
+    """Check that `answer` is degraded, active, with a reason naming `path`."""
+    assert answer["status"] == "degraded"
+    assert answer["active"] is True
+    assert str(path) in str(answer["reason"])
+
+
+def test_health_is_degraded_while_torn_journal_lines_are_set_aside(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    directory = write_journal(instance, {"task_id": "t"})
+    torn = directory / TORN_FILE
+    torn.write_bytes(b'{"task_id": "x", "st\n')
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert_degraded_naming(answer, torn)
+
+
+def test_health_is_degraded_when_the_journal_ends_with_a_torn_line(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    directory = write_torn_journal(instance, b'{"task_id": "x", "st', {"task_id": "t"})
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert_degraded_naming(answer, directory / run_journal.JOURNAL_FILE)
+
+
+def test_health_sets_no_torn_journal_line_aside(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    write_torn_journal(instance, b'{"task_id": "x", "st', {"task_id": "t"})
+    before = snapshot(instance.parent)
+
+    health(monkeypatch, capsysbinary, instance)
+
+    assert snapshot(instance.parent) == before
+
+
+def test_health_is_degraded_after_a_run_set_a_torn_journal_line_aside(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    directory = write_torn_journal(instance, b'{"task_id": "x", "st')
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert_degraded_naming(answer, directory / TORN_FILE)
+
+
+def test_health_is_ok_when_the_last_journal_line_lacks_only_its_newline(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    write_torn_journal(instance, b'{"task_id": "b"}', {"task_id": "a"})
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert answer == {"status": "ok", "reason": None, "active": True}
+
+
+def test_health_is_ok_when_the_journal_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    write_journal(instance)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert answer == {"status": "ok", "reason": None, "active": True}
+
+
+def test_health_is_down_rather_than_degraded_when_the_journal_cannot_be_written(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    directory = write_torn_journal(instance, b'{"task_id": "x", "st', {"task_id": "t"})
+    (directory / TORN_FILE).write_bytes(b'{"task_id": "y"\n')
+    journal = refuse_journal(monkeypatch, instance)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert_down(answer, "")
+    assert str(journal) in str(answer["reason"])
 
 
 @pytest.mark.usefixtures("frozen_now")
