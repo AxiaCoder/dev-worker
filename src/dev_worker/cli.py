@@ -6,6 +6,7 @@ on stdin against that instance and the `WORKER.md` shipped with the package.
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -26,6 +27,8 @@ from dev_worker.contract import (
 from dev_worker.header import Header, HeaderError, load_worker_file
 from dev_worker.instance import Instance, InstanceError, load_instance
 from dev_worker.run_journal import (
+    JOURNAL_FILE,
+    LOCK_FILE,
     JournalError,
     append_entry,
     instance_directory,
@@ -52,11 +55,13 @@ def failed(task_id: str | None, *errors: str) -> MandateOutput:
         task_id=task_id,
         status="failed",
         summary="The mandate could not be run.",
-        errors=[
-            error.encode("utf-8", "backslashreplace").decode("utf-8")
-            for error in errors
-        ],
+        errors=[writable_text(error) for error in errors],
     )
+
+
+def writable_text(text: str) -> str:
+    """Return `text` with every character UTF-8 cannot encode written as its backslash escape."""
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")
 
 
 def deliver_ticket(mandate: MandateInput, instance: Instance) -> MandateOutput:
@@ -279,27 +284,38 @@ def run_mandate(
     if handler is None:
         return failed(task_id, f"Unknown mandate {mandate_name!r}.")
 
-    try:
-        header = load_header()
-    except HeaderError as error:
-        return failed(task_id, f"WORKER.md does not load: {error}")
-    except OSError as error:
-        return failed(task_id, f"WORKER.md cannot be read: {os_reason(error)}")
-    try:
-        instance = load_instance(instance_path, header)
-    except InstanceError as error:
-        return failed(task_id, f"Instance file '{instance_path}': {error}")
-    except OSError as error:
-        return failed(
-            task_id,
-            f"Instance file '{instance_path}' cannot be read: {os_reason(error)}",
-        )
+    instance = load_checked_instance(instance_path)
+    if isinstance(instance, str):
+        return failed(task_id, instance)
     return run_journaled(handler, mandate, instance, instance_path)
 
 
-def run_day(entry: Mapping[str, object]) -> date | None:
-    """Return the UTC day the journaled run started, `None` when `start` is unusable."""
-    start = entry.get("start")
+def load_checked_instance(instance_path: Path) -> Instance | str:
+    """Read the instance from `instance_path`, checked against the packaged `WORKER.md`.
+
+    Returns the reason as a sentence instead when `WORKER.md` or the instance file
+    cannot be read or is invalid. Never raises on a file error.
+    """
+    try:
+        header = load_header()
+    except HeaderError as error:
+        return f"WORKER.md does not load: {error}"
+    except OSError as error:
+        return f"WORKER.md cannot be read: {os_reason(error)}"
+    try:
+        return load_instance(instance_path, header)
+    except InstanceError as error:
+        return f"Instance file '{instance_path}': {error}"
+    except OSError as error:
+        return f"Instance file '{instance_path}' cannot be read: {os_reason(error)}"
+
+
+def run_start(record: Mapping[str, object]) -> datetime | None:
+    """Return the `start` of a journal entry or lock record as an aware datetime.
+
+    `None` when `start` is missing, not an ISO 8601 string, or has no time zone.
+    """
+    start = record.get("start")
     if not isinstance(start, str):
         return None
     try:
@@ -308,7 +324,13 @@ def run_day(entry: Mapping[str, object]) -> date | None:
         return None
     if moment.tzinfo is None:
         return None
-    return moment.astimezone(UTC).date()
+    return moment
+
+
+def run_day(entry: Mapping[str, object]) -> date | None:
+    """Return the UTC day the journaled run started, `None` when `start` is unusable."""
+    moment = run_start(entry)
+    return None if moment is None else moment.astimezone(UTC).date()
 
 
 def run_tokens(entry: Mapping[str, object]) -> int:
@@ -371,6 +393,79 @@ def read_state(instance_path: Path) -> State:
     )
 
 
+def unwritable_instance_directory(directory: Path) -> str | None:
+    """Return why a run could not write in `directory`, or `None` when it could.
+
+    Checks, without writing, the directory when it exists, else its nearest existing
+    parent, in which a run would create it: it must be a directory the process may
+    write in and enter. The journal, when it exists, must be writable too.
+    """
+    nearest = directory
+    while not nearest.exists() and nearest.parent != nearest:
+        nearest = nearest.parent
+    if not (nearest.is_dir() and os.access(nearest, os.W_OK | os.X_OK)):
+        return (
+            f"Instance directory '{directory}' cannot be written: "
+            f"'{nearest}' is not a writable directory."
+        )
+    journal = directory / JOURNAL_FILE
+    if journal.exists() and not os.access(journal, os.W_OK):
+        return f"Journal '{journal}' cannot be written."
+    return None
+
+
+def lock_age(directory: Path, lock: Mapping[str, object]) -> float | None:
+    """Return for how many seconds the run holding the lock of `directory` has run.
+
+    The age is counted from the `start` of the lock record, else from the time the
+    lock file was last modified. `None` when the lock file is gone or cannot be read.
+    """
+    now = datetime.now(UTC)
+    start = run_start(lock)
+    if start is not None:
+        return (now - start).total_seconds()
+    try:
+        modified = (directory / LOCK_FILE).stat().st_mtime
+    except OSError:
+        return None
+    return now.timestamp() - modified
+
+
+def read_health(instance_path: Path) -> Health:
+    """Tell whether the worker can run against the instance read from `instance_path`.
+
+    `down` when `WORKER.md` or the instance file does not load, the instance path has
+    no suffix, or the instance directory or its existing journal cannot be written;
+    `degraded` when a run has
+    held the lock longer than the instance's `run_timeout_seconds`; `ok` otherwise.
+    Writes nothing and never raises.
+    """
+    instance = load_checked_instance(instance_path)
+    if isinstance(instance, str):
+        return Health(status="down", reason=writable_text(instance), active=True)
+    try:
+        directory = instance_directory(instance_path)
+    except ValueError as error:
+        return Health(status="down", reason=writable_text(str(error)), active=True)
+    unwritable = unwritable_instance_directory(directory)
+    if unwritable is not None:
+        return Health(status="down", reason=writable_text(unwritable), active=True)
+    lock = read_lock(directory)
+    age = None if lock is None else lock_age(directory, lock)
+    timeout = instance.limits["run_timeout_seconds"]
+    if age is not None and age > timeout:
+        return Health(
+            status="degraded",
+            reason=writable_text(
+                f"The run holding the lock of instance directory '{directory}' "
+                f"started {age:.0f} seconds ago, beyond the run timeout of "
+                f"{timeout} seconds."
+            ),
+            active=True,
+        )
+    return Health(status="ok", reason=None, active=True)
+
+
 def add_instance_argument(command: argparse.ArgumentParser) -> None:
     """Add the required `--instance` option naming the YAML instance file."""
     command.add_argument(
@@ -403,7 +498,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     The `run` input is read from stdin as raw bytes and the answer is written as UTF-8
     bytes, whatever the encoding of the system. `state` reads the journal and lock of the
-    instance directory; `health` does not read the instance yet. Returns 0 whenever a
+    instance directory; `health` reads the instance and its directory (see `read_health`). Returns 0 whenever a
     JSON document is written, even for a failed mandate; argparse exits with 2 on
     incorrect usage.
     """
@@ -413,7 +508,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.command == "state":
         answer = read_state(args.instance)
     else:
-        answer = Health(status="ok", reason=None, active=True)
+        answer = read_health(args.instance)
     sys.stdout.flush()
     sys.stdout.buffer.write(answer.model_dump_json().encode("utf-8") + b"\n")
     sys.stdout.buffer.flush()

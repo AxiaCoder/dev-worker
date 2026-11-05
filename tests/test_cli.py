@@ -861,6 +861,362 @@ def test_health_is_ok(
     assert answer == {"status": "ok", "reason": None, "active": True}
 
 
+def health(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> dict[str, object]:
+    """Run `health --instance <instance>` and return the parsed answer."""
+    return run(monkeypatch, capsysbinary, ["health", "--instance", str(instance)])
+
+
+def assert_down(answer: dict[str, object], reason_start: str) -> None:
+    """Check that `answer` is down, active, with a reason starting with `reason_start`."""
+    assert answer["status"] == "down"
+    assert answer["active"] is True
+    reason = answer["reason"]
+    assert isinstance(reason, str)
+    assert reason.startswith(reason_start)
+
+
+def hold_lock(instance: Path, content: bytes) -> Path:
+    """Write `content` as the lock of the directory of `instance`; return the lock path."""
+    directory = instance.with_suffix("")
+    directory.mkdir(exist_ok=True)
+    lock = directory / run_journal.LOCK_FILE
+    lock.write_bytes(content)
+    return lock
+
+
+def lock_started(seconds_ago: float) -> bytes:
+    """Return a lock record whose run started `seconds_ago` seconds before `NOW`."""
+    start = (NOW - timedelta(seconds=seconds_ago)).isoformat()
+    return json.dumps({"task_id": "t", "ticket_key": "DEMO-1", "start": start}).encode()
+
+
+def test_health_of_an_instance_run_before_is_ok(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    write_journal(instance, {"task_id": "t"})
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert answer == {"status": "ok", "reason": None, "active": True}
+
+
+def test_health_of_a_relative_instance_path_is_ok(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    monkeypatch.chdir(instance.parent)
+
+    answer = health(monkeypatch, capsysbinary, Path(instance.name))
+
+    assert answer["status"] == "ok"
+
+
+def test_health_is_down_when_the_worker_file_does_not_load(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    def broken(path: Path) -> object:
+        raise HeaderError("front matter is not valid YAML")
+
+    monkeypatch.setattr(cli, "load_worker_file", broken)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert answer == {
+        "status": "down",
+        "reason": "WORKER.md does not load: front matter is not valid YAML",
+        "active": True,
+    }
+
+
+def test_health_is_down_when_the_worker_file_cannot_be_read(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    def missing(path: Path) -> object:
+        raise FileNotFoundError(2, "No such file or directory", str(path))
+
+    monkeypatch.setattr(cli, "load_worker_file", missing)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert_down(answer, "WORKER.md cannot be read: No such file or directory")
+
+
+def test_health_is_down_when_the_instance_is_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    instance.write_text("tracker: [\n", encoding="utf-8")
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert_down(answer, f"Instance file '{instance}': ")
+
+
+def test_health_is_down_when_the_instance_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    tmp_path: Path,
+) -> None:
+    instance = tmp_path / "missing.yaml"
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert_down(answer, f"Instance file '{instance}' cannot be read")
+
+
+def test_health_names_an_instance_path_with_a_lone_surrogate_escaped(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    tmp_path: Path,
+) -> None:
+    answer = health(monkeypatch, capsysbinary, tmp_path / "caf\udce9.yaml")
+
+    assert_down(answer, "Instance file '")
+    assert "caf\\udce9.yaml" in str(answer["reason"])
+
+
+def test_health_is_down_when_the_instance_path_has_no_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    bare = instance.rename(instance.with_suffix(""))
+
+    answer = health(monkeypatch, capsysbinary, bare)
+
+    assert answer["reason"] == f"Instance file '{bare}' has no suffix."
+    assert_down(answer, "Instance file")
+
+
+@pytest.mark.parametrize("exists", [True, False])
+def test_health_is_down_when_the_instance_directory_cannot_be_written(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    exists: bool,
+) -> None:
+    directory = instance.with_suffix("")
+    if exists:
+        directory.mkdir()
+    checked: list[tuple[Path, int]] = []
+
+    def refused(path: Path, mode: int) -> bool:
+        checked.append((path, mode))
+        return False
+
+    monkeypatch.setattr(cli.os, "access", refused)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    nearest = directory if exists else instance.parent
+    assert checked == [(nearest, os.W_OK | os.X_OK)]
+    assert answer["reason"] == (
+        f"Instance directory '{directory}' cannot be written: "
+        f"'{nearest}' is not a writable directory."
+    )
+    assert_down(answer, "Instance directory")
+
+
+def test_health_is_down_when_the_instance_directory_is_a_file(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    instance.with_suffix("").write_bytes(b"")
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert_down(answer, f"Instance directory '{instance.with_suffix('')}'")
+
+
+def refuse_journal(monkeypatch: pytest.MonkeyPatch, instance: Path) -> Path:
+    """Make `os.access` refuse the journal of `instance` only; return the journal path."""
+    journal = instance.with_suffix("") / run_journal.JOURNAL_FILE
+    allowed = os.access
+
+    def access(path: Path, mode: int) -> bool:
+        return Path(path) != journal and allowed(path, mode)
+
+    monkeypatch.setattr(cli.os, "access", access)
+    return journal
+
+
+def test_health_is_down_when_the_journal_cannot_be_written(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    write_journal(instance, {"task_id": "t"})
+    journal = refuse_journal(monkeypatch, instance)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert_down(answer, "")
+    assert str(journal) in str(answer["reason"])
+
+
+def test_health_is_ok_when_the_journal_does_not_exist_yet(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    instance.with_suffix("").mkdir()
+    refuse_journal(monkeypatch, instance)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert answer == {"status": "ok", "reason": None, "active": True}
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_health_is_degraded_when_the_run_holding_the_lock_outlives_the_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    hold_lock(instance, lock_started(1801))
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert answer == {
+        "status": "degraded",
+        "reason": (
+            f"The run holding the lock of instance directory "
+            f"'{instance.with_suffix('')}' started 1801 seconds ago, beyond the "
+            f"run timeout of 1800 seconds."
+        ),
+        "active": True,
+    }
+
+
+@pytest.mark.usefixtures("frozen_now")
+@pytest.mark.parametrize("seconds_ago", [1800, 0])
+def test_health_is_ok_while_the_run_holding_the_lock_is_within_the_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    seconds_ago: int,
+) -> None:
+    hold_lock(instance, lock_started(seconds_ago))
+
+    assert health(monkeypatch, capsysbinary, instance)["status"] == "ok"
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_health_uses_the_run_timeout_of_the_instance(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    with instance.open("a", encoding="utf-8") as file:
+        file.write("  run_timeout_seconds: 60\n")
+    hold_lock(instance, lock_started(61))
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert answer["status"] == "degraded"
+    assert "run timeout of 60 seconds" in str(answer["reason"])
+
+
+@pytest.mark.usefixtures("frozen_now")
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"",
+        b"held by another run",
+        b'{"task_id": "t"}',
+        b'{"start": 20261105}',
+        b'{"start": "yesterday"}',
+        b'{"start": "2026-11-05T10:00:00"}',
+    ],
+)
+@pytest.mark.parametrize(("seconds_ago", "status"), [(1801, "degraded"), (60, "ok")])
+def test_health_ages_a_lock_without_a_usable_start_by_its_modification_time(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    content: bytes,
+    seconds_ago: int,
+    status: str,
+) -> None:
+    lock = hold_lock(instance, content)
+    modified = NOW.timestamp() - seconds_ago
+    os.utime(lock, (modified, modified))
+
+    assert health(monkeypatch, capsysbinary, instance)["status"] == status
+
+
+def test_health_is_ok_when_the_lock_vanishes_before_its_age_is_read(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    instance.with_suffix("").mkdir()
+    monkeypatch.setattr(cli, "read_lock", lambda directory: {})
+
+    assert health(monkeypatch, capsysbinary, instance)["status"] == "ok"
+
+
+@pytest.mark.usefixtures("frozen_now")
+@pytest.mark.parametrize("seconds_ago", [1801, 0])
+def test_health_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    seconds_ago: int,
+) -> None:
+    write_journal(instance, {"task_id": "t"})
+    hold_lock(instance, lock_started(seconds_ago))
+    before = snapshot(instance.parent)
+
+    health(monkeypatch, capsysbinary, instance)
+
+    assert snapshot(instance.parent) == before
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_health_touches_no_modification_time(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    write_journal(instance, {"task_id": "t"})
+    hold_lock(instance, lock_started(1801))
+    directory = instance.with_suffix("")
+    paths = [instance, directory, *sorted(directory.rglob("*"))]
+    past = NOW.timestamp() - 3600
+    for path in paths:
+        os.utime(path, (past, past))
+    before = {path: path.stat().st_mtime_ns for path in paths}
+
+    health(monkeypatch, capsysbinary, instance)
+
+    assert {path: path.stat().st_mtime_ns for path in paths} == before
+
+
+def test_health_of_an_instance_never_run_creates_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    before = snapshot(instance.parent)
+
+    assert health(monkeypatch, capsysbinary, instance)["status"] == "ok"
+    assert snapshot(instance.parent) == before
+
+
 @pytest.mark.parametrize("command", ["state", "health"])
 def test_instance_is_required(command: str) -> None:
     with pytest.raises(SystemExit) as raised:
@@ -885,7 +1241,9 @@ def test_dev_worker_script_points_at_main() -> None:
 def test_python_m_runs_the_command_line(
     monkeypatch: pytest.MonkeyPatch, capsysbinary: pytest.CaptureFixture[bytes]
 ) -> None:
-    monkeypatch.setattr(sys, "argv", ["dev-worker", "health", "--instance", "x"])
+    monkeypatch.setattr(
+        sys, "argv", ["dev-worker", "health", "--instance", str(INSTANCE)]
+    )
 
     with pytest.raises(SystemExit) as raised:
         runpy.run_module("dev_worker", run_name="__main__")
