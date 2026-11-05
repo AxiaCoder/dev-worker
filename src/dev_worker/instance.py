@@ -155,19 +155,25 @@ def _yaml_reasons(error: yaml.YAMLError) -> str:
 def load_instance(path: Path, header: Header) -> Instance:
     """Read the YAML instance file at `path`, UTF-8 with an optional BOM, against `header`.
 
-    Raises `InstanceError` when the file is not valid YAML (a key repeated within one mapping
-    included), does not match the instance shape, maps a status key the header does not
+    Raises `InstanceError` when the file is not valid UTF-8, is not valid YAML (a key repeated
+    within one mapping included), nests too deeply to be read, does not match the instance shape, maps a status key the header does not
     declare or leaves one unmapped, maps two status keys to the same real status name, sets
     a limit the header has no ceiling for, or sets a limit above its ceiling. The message
     names key paths, lines and columns, and quotes no value written in the file but a
     shared real status name.
     """
     try:
-        raw = yaml.load(path.read_text(encoding="utf-8-sig"), Loader=_UniqueKeyLoader)
+        text = path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        raise InstanceError("instance file is not valid UTF-8") from None
+    try:
+        raw = yaml.load(text, Loader=_UniqueKeyLoader)
     except yaml.YAMLError as error:
         raise InstanceError(
             f"instance file is not valid YAML{_yaml_reasons(error)}"
         ) from None
+    except RecursionError:
+        raise InstanceError("instance file nests too deeply to be read") from None
     try:
         data = _InstanceData.model_validate(raw)
     except ValidationError as error:

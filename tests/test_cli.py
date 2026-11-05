@@ -228,7 +228,7 @@ def test_invalid_instance_fails_naming_the_file(
         monkeypatch, capsysbinary, encode(valid_input()), instance=instance
     )
 
-    assert_failed(answer, "task-1", f"Instance file {str(instance)!r}: ")
+    assert_failed(answer, "task-1", f"Instance file '{instance}': ")
 
 
 def test_missing_instance_fails_naming_the_file(
@@ -242,7 +242,37 @@ def test_missing_instance_fails_naming_the_file(
         monkeypatch, capsysbinary, encode(valid_input()), instance=instance
     )
 
-    assert_failed(answer, "task-1", f"Instance file {str(instance)!r} cannot be read")
+    assert_failed(answer, "task-1", f"Instance file '{instance}' cannot be read")
+
+
+def test_instance_not_in_utf8_fails_naming_the_file(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    tmp_path: Path,
+) -> None:
+    instance = tmp_path / "instance.yaml"
+    instance.write_bytes("tracker:\n  project: Café\n".encode("latin-1"))
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", f"Instance file '{instance}': ")
+
+
+def test_instance_nested_too_deeply_fails_naming_the_file(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    tmp_path: Path,
+) -> None:
+    instance = tmp_path / "instance.yaml"
+    instance.write_text("tracker: " + "[" * 5000 + "\n", encoding="utf-8")
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", f"Instance file '{instance}': ")
 
 
 def test_state_is_empty(

@@ -388,3 +388,16 @@ def test_loaded_instance_is_immutable(tmp_path: Path) -> None:
         instance.limits["max_turns"] = 10**9  # pyright: ignore[reportIndexIssue]
     with pytest.raises(TypeError):
         instance.statuses["done"] = "X"  # pyright: ignore[reportIndexIssue]
+
+
+def test_instance_not_in_utf8_is_refused(tmp_path: Path) -> None:
+    path = tmp_path / "instance.yaml"
+    path.write_bytes(VALID.replace("ABC", "Café").encode("latin-1"))
+
+    with pytest.raises(InstanceError):
+        load_instance(path, HEADER)
+
+
+def test_instance_nested_too_deeply_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(InstanceError):
+        load(tmp_path, "tracker: " + "[" * 5000 + "\n")

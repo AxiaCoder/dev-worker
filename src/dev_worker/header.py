@@ -137,14 +137,21 @@ def _describe(
 def load_worker_file(path: Path) -> WorkerFile:
     """Read the `WORKER.md` file at `path`, UTF-8 with an optional BOM, and validate its header.
 
-    Raises `HeaderError` when the front matter is missing, unterminated, not valid YAML
-    (a key repeated within one mapping included), or does not match `Header`.
+    Raises `HeaderError` when the file is not valid UTF-8, or when the front matter is
+    missing, unterminated, not valid YAML (a key repeated within one mapping included), nests
+    too deeply to be read, or does not match `Header`.
     """
-    front_matter, body = _split(path.read_text(encoding="utf-8-sig"))
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        raise HeaderError("WORKER.md is not valid UTF-8") from None
+    front_matter, body = _split(text)
     try:
         data = yaml.load(front_matter, Loader=_UniqueKeyLoader)
     except yaml.YAMLError as error:
         raise HeaderError(f"front matter is not valid YAML: {error}") from error
+    except RecursionError:
+        raise HeaderError("front matter nests too deeply to be read") from None
     try:
         header = Header.model_validate(data)
     except ValidationError as error:

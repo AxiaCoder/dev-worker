@@ -209,3 +209,16 @@ def test_byte_order_mark_is_skipped(tmp_path: Path) -> None:
     path.write_bytes(with_header(VALID).encode("utf-8-sig"))
 
     assert load_worker_file(path).header.ceilings["max_turns"] == 60
+
+
+def test_worker_file_not_in_utf8_is_refused(tmp_path: Path) -> None:
+    path = tmp_path / "WORKER.md"
+    path.write_bytes(with_header(VALID, "Café.\n").encode("latin-1"))
+
+    with pytest.raises(HeaderError):
+        load_worker_file(path)
+
+
+def test_header_nested_too_deeply_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(HeaderError):
+        load_worker_file(write(tmp_path, with_header("outcomes: " + "[" * 5000 + "\n")))

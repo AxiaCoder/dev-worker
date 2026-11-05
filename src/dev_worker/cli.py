@@ -57,6 +57,14 @@ def is_utf8_encodable(value: object) -> bool:
     return True
 
 
+def os_reason(error: OSError) -> str:
+    """Return the reason of `error` as written in a message: its strerror, or its text.
+
+    Copied from the Broker worker, with the error's text instead of its type as fallback.
+    """
+    return error.strerror or str(error)
+
+
 def load_header() -> Header:
     """Read and validate the header of the `WORKER.md` shipped with the package.
 
@@ -127,14 +135,15 @@ def run_mandate(
     except HeaderError as error:
         return failed(task_id, f"WORKER.md does not load: {error}")
     except OSError as error:
-        return failed(task_id, f"WORKER.md cannot be read: {error}")
+        return failed(task_id, f"WORKER.md cannot be read: {os_reason(error)}")
     try:
         instance = load_instance(instance_path, header)
     except InstanceError as error:
-        return failed(task_id, f"Instance file {str(instance_path)!r}: {error}")
+        return failed(task_id, f"Instance file '{instance_path}': {error}")
     except OSError as error:
         return failed(
-            task_id, f"Instance file {str(instance_path)!r} cannot be read: {error}"
+            task_id,
+            f"Instance file '{instance_path}' cannot be read: {os_reason(error)}",
         )
     return handler(mandate, instance)
 
