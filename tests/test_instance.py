@@ -188,16 +188,85 @@ def test_extra_or_missing_key_is_refused(
         load(tmp_path, text)
 
 
-def test_instance_not_a_mapping_is_refused(tmp_path: Path) -> None:
+def test_instance_not_a_mapping_is_refused_without_echo(tmp_path: Path) -> None:
     with pytest.raises(
-        InstanceError, match=r"invalid instance file: instance: .*\(got \['jira'\]\)"
-    ):
-        load(tmp_path, "- jira\n")
+        InstanceError, match=r"invalid instance file: instance: "
+    ) as caught:
+        load(tmp_path, f"- {SECRET}\n")
+
+    assert SECRET not in str(caught.value)
+    assert "(got" not in str(caught.value)
 
 
 def test_invalid_yaml_is_refused(tmp_path: Path) -> None:
     with pytest.raises(InstanceError, match="not valid YAML"):
         load(tmp_path, "tracker: [jira\n")
+
+
+SECRET = "ghp_secret0123456789"
+
+
+@pytest.mark.parametrize(
+    ("text", "location"),
+    [
+        (
+            VALID.replace("  token_env: JIRA_TOKEN\n", f"  token: {SECRET}\n"),
+            "tracker.token",
+        ),
+        (
+            VALID.replace("  token_env: GITHUB_TOKEN\n", f"  token: {SECRET}\n"),
+            "repository.token",
+        ),
+        (VALID + f"token: {SECRET}\n", "token"),
+        (VALID.replace("type: jira", f"type: {SECRET}"), "tracker.type"),
+        (VALID.replace("type: github", f"type: {SECRET}"), "repository.type"),
+        (VALID.replace("max_turns: 40", f"max_turns: {SECRET}"), "limits.max_turns"),
+        (VALID.replace("blocked: Blocked", f"blocked: [{SECRET}]"), "statuses.blocked"),
+    ],
+)
+def test_invalid_value_is_refused_without_echo(
+    tmp_path: Path, text: str, location: str
+) -> None:
+    with pytest.raises(
+        InstanceError, match=f"invalid instance file: .*{location}"
+    ) as caught:
+        load(tmp_path, text)
+
+    assert SECRET not in str(caught.value)
+    assert "(got" not in str(caught.value)
+
+
+def test_invalid_yaml_is_refused_without_echo(tmp_path: Path) -> None:
+    text = f'tracker:\n  token_env: "{SECRET}\n'
+
+    with pytest.raises(InstanceError, match="not valid YAML") as caught:
+        load(tmp_path, text)
+
+    assert SECRET not in str(caught.value)
+    assert "ghp_" not in str(caught.value)
+
+
+def test_invalid_yaml_reports_each_reason_with_line_and_column(tmp_path: Path) -> None:
+    text = f'tracker:\n  token_env: "{SECRET}\n'
+
+    with pytest.raises(InstanceError) as caught:
+        load(tmp_path, text)
+
+    assert str(caught.value) == (
+        "instance file is not valid YAML"
+        ": while scanning a quoted scalar (line 2, column 14)"
+        ": found unexpected end of stream (line 3, column 1)"
+    )
+
+
+def test_unreadable_character_is_refused_without_echo(tmp_path: Path) -> None:
+    with pytest.raises(InstanceError, match="not valid YAML") as caught:
+        load(tmp_path, "a: \x07\n")
+
+    message = str(caught.value)
+    assert message == "instance file is not valid YAML"
+    assert "x07" not in message
+    assert "#x0007" not in message
 
 
 def test_duplicate_yaml_key_is_refused(tmp_path: Path) -> None:

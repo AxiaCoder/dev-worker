@@ -118,22 +118,44 @@ def _limit_problems(limits: Mapping[str, int], header: Header) -> list[str]:
     return problems
 
 
+def _yaml_reasons(error: yaml.YAMLError) -> str:
+    """Return the reasons of a YAML failure, each led by `": "`, without the failing text.
+
+    A reason is followed by its line and column, both counted from 1. The result is empty
+    for an error that carries no reason, such as an unreadable character.
+    """
+    reasons = (
+        (getattr(error, "context", None), getattr(error, "context_mark", None)),
+        (getattr(error, "problem", None), getattr(error, "problem_mark", None)),
+    )
+    return "".join(
+        f": {reason} (line {mark.line + 1}, column {mark.column + 1})"
+        if mark
+        else f": {reason}"
+        for reason, mark in reasons
+        if reason
+    )
+
+
 def load_instance(path: Path, header: Header) -> Instance:
     """Read the YAML instance file at `path`, UTF-8 with an optional BOM, against `header`.
 
     Raises `InstanceError` when the file is not valid YAML (a key repeated within one mapping
     included), does not match the instance shape, maps a status key the header does not
     declare or leaves one unmapped, sets a limit the header has no ceiling for, or sets a
-    limit above its ceiling. A `token_env` value is never echoed in the message.
+    limit above its ceiling. The message names key paths, lines and columns, never a value
+    written in the file.
     """
     try:
         raw = yaml.load(path.read_text(encoding="utf-8-sig"), Loader=_UniqueKeyLoader)
     except yaml.YAMLError as error:
-        raise InstanceError(f"instance file is not valid YAML: {error}") from error
+        raise InstanceError(
+            f"instance file is not valid YAML{_yaml_reasons(error)}"
+        ) from error
     try:
         data = _InstanceData.model_validate(raw)
     except ValidationError as error:
-        description = _describe(error, root="instance", hidden=frozenset({"token_env"}))
+        description = _describe(error, root="instance", echo=False)
         raise InstanceError(f"invalid instance file: {description}") from error
     problems = _status_problems(data.statuses, header) + _limit_problems(
         data.limits, header

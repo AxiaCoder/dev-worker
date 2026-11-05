@@ -118,18 +118,17 @@ def _split(text: str) -> tuple[str, str]:
 def _describe(
     error: ValidationError,
     root: str = "header",
-    hidden: frozenset[str] = frozenset(),
+    echo: bool = True,
 ) -> str:
-    """Return one line per validation failure, naming its location and offending value.
+    """Return one line per validation failure, naming its location and, if `echo`, its value.
 
-    A failure on the whole document is located at `root`. The value is left out when it is
-    the whole document mapping, or when the last part of its location is in `hidden`."""
+    A failure on the whole document is located at `root`. The value is left out when `echo`
+    is false, or when it is the whole document mapping."""
     parts: list[str] = []
     for detail in error.errors():
         location = ".".join(str(item) for item in detail["loc"]) or root
         message = f"{location}: {detail['msg']}"
-        is_hidden = bool(detail["loc"]) and str(detail["loc"][-1]) in hidden
-        if not is_hidden and (detail["loc"] or not isinstance(detail["input"], dict)):
+        if echo and (detail["loc"] or not isinstance(detail["input"], dict)):
             message += f" (got {detail['input']!r})"
         parts.append(message)
     return "; ".join(parts)
