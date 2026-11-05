@@ -8,7 +8,10 @@ authors = [
     { name = "Benoît G", email = "18719082+AxiaCoder@users.noreply.github.com" }
 ]
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "pydantic>=2.14.3",
+    "pyyaml>=6.0.3",
+]
 
 [build-system]
 requires = ["uv_build>=0.10.9,<0.11.0"]
