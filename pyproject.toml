@@ -13,6 +13,9 @@ dependencies = [
     "pyyaml>=6.0.3",
 ]
 
+[project.scripts]
+dev-worker = "dev_worker.cli:main"
+
 [build-system]
 requires = ["uv_build>=0.10.9,<0.11.0"]
 build-backend = "uv_build"

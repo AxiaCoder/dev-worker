@@ -5,7 +5,7 @@ from pydantic import ValidationError
 
 from dev_worker.header import HeaderError, load_worker_file
 
-SHIPPED = Path(__file__).resolve().parent.parent / "WORKER.md"
+SHIPPED = Path(__file__).resolve().parent.parent / "src" / "dev_worker" / "WORKER.md"
 
 VALID = """\
 status_keys: [ready, in_progress, in_review, blocked, done]
