@@ -120,8 +120,9 @@ def run_journaled(
 
     The ticket key is checked first, then the lock is taken; a task_id already in the
     journal is refused. A refused run is not journaled. Every file error becomes a
-    failed output naming the reason; an exception raised by `handler` propagates once
-    the lock is released.
+    failed output naming the reason, except a lock that cannot be removed: the run
+    keeps its status and the reason is added to `errors`. An exception raised by
+    `handler` propagates once the lock is released.
     """
     task_id = mandate.task_id
     refusal = check_ticket_key(mandate, instance)
