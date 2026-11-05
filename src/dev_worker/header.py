@@ -115,15 +115,21 @@ def _split(text: str) -> tuple[str, str]:
     raise HeaderError(f"front matter unterminated: no closing {FENCE!r} line")
 
 
-def _describe(error: ValidationError) -> str:
+def _describe(
+    error: ValidationError,
+    root: str = "header",
+    hidden: frozenset[str] = frozenset(),
+) -> str:
     """Return one line per validation failure, naming its location and offending value.
 
-    The value is left out when it is the whole header mapping."""
+    A failure on the whole document is located at `root`. The value is left out when it is
+    the whole document mapping, or when the last part of its location is in `hidden`."""
     parts: list[str] = []
     for detail in error.errors():
-        location = ".".join(str(item) for item in detail["loc"]) or "header"
+        location = ".".join(str(item) for item in detail["loc"]) or root
         message = f"{location}: {detail['msg']}"
-        if detail["loc"] or not isinstance(detail["input"], dict):
+        is_hidden = bool(detail["loc"]) and str(detail["loc"][-1]) in hidden
+        if not is_hidden and (detail["loc"] or not isinstance(detail["input"], dict)):
             message += f" (got {detail['input']!r})"
         parts.append(message)
     return "; ".join(parts)
