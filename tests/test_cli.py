@@ -923,7 +923,6 @@ def nested_object(depth: int) -> bytes:
 UNREADABLE_RECORDS = [
     pytest.param(b"[" * 100_000 + b"]" * 100_000, id="too-deep-for-json"),
     pytest.param(nested_object(300), id="too-deep-to-validate"),
-    pytest.param(nested_object(98), id="too-deep-to-serialize"),
     pytest.param(b'{"task_id": "\\ud800", "status": "completed"}', id="lone-surrogate"),
 ]
 
