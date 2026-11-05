@@ -1147,6 +1147,26 @@ def test_health_writes_nothing(
     assert snapshot(instance.parent) == before
 
 
+@pytest.mark.usefixtures("frozen_now")
+def test_health_touches_no_modification_time(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    write_journal(instance, {"task_id": "t"})
+    hold_lock(instance, lock_started(1801))
+    directory = instance.with_suffix("")
+    paths = [instance, directory, *sorted(directory.rglob("*"))]
+    past = NOW.timestamp() - 3600
+    for path in paths:
+        os.utime(path, (past, past))
+    before = {path: path.stat().st_mtime_ns for path in paths}
+
+    health(monkeypatch, capsysbinary, instance)
+
+    assert {path: path.stat().st_mtime_ns for path in paths} == before
+
+
 def test_health_of_an_instance_never_run_creates_nothing(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
