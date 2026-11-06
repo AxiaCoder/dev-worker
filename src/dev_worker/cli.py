@@ -392,9 +392,10 @@ def task_entries(
 
     Tasks are ordered by their first line; a line whose `task_id` is not a string is a
     task of its own. `locks` are the lock records read before and after `entries`,
-    `None` when no run held the lock. A task whose last line is `running` is shown as
-    `failed`, interrupted, unless one of `locks` is held by that task or by a run
-    whose task is unknown.
+    `None` when no run held the lock. A task whose last line is the one written before
+    its mandate body ran (`running` without a `duration`) is shown as `failed`,
+    interrupted, unless one of `locks` is held by that task or by a run whose task is
+    unknown; a last line written once the body returned keeps the status it returned.
     """
     tasks: dict[object, Mapping[str, object]] = {}
     for entry in entries:
@@ -403,6 +404,7 @@ def task_entries(
     return [
         interrupted(entry)
         if entry.get("status") == "running"
+        and entry.get("duration") is None
         and not any(held_by(lock, entry) for lock in locks)
         else entry
         for entry in tasks.values()
@@ -420,7 +422,8 @@ def held_by(lock: Mapping[str, object] | None, entry: Mapping[str, object]) -> b
 
 
 def interrupted(entry: Mapping[str, object]) -> dict[str, object]:
-    """Return the `running` journal entry `entry` as the failed run it became."""
+    """Return the journal entry `entry`, written before its mandate body ran, as the
+    failed run it became."""
     return {
         **entry,
         "status": "failed",

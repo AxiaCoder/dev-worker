@@ -1282,6 +1282,26 @@ def test_state_shows_a_task_left_running_without_the_lock_as_interrupted(
     ]
 
 
+def test_state_shows_the_line_a_run_left_before_its_body_returned_as_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    left = {
+        "task_id": "a",
+        "ticket_key": "DEMO-1",
+        "status": "running",
+        "start": NOW.isoformat(),
+        "duration": None,
+        "tokens": 0,
+    }
+    write_journal(instance, left)
+
+    assert common(state(monkeypatch, capsysbinary, instance))["recent"] == [
+        left | {"status": "failed", "errors": [INTERRUPTED]}
+    ]
+
+
 @pytest.mark.parametrize(
     "lock",
     [
@@ -1308,6 +1328,28 @@ def test_state_keeps_a_task_running_while_the_lock_may_be_its_own(
         {"task_id": "b", "status": "completed"},
         {"task_id": "a", "status": "running"},
     ]
+
+
+@pytest.mark.usefixtures("frozen_now")
+@pytest.mark.parametrize("status", ["running", "waiting"])
+def test_state_keeps_the_status_a_finished_run_returned_while_the_lock_is_free(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    status: str,
+) -> None:
+    def still_going(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+        output = cli.deliver_ticket(mandate, resolved)
+        return output.model_copy(update={"status": status})
+
+    monkeypatch.setitem(cli.MANDATES, "deliver_ticket", still_going)
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    answer = common(state(monkeypatch, capsysbinary, instance))
+
+    _, entry = journal_lines(instance)
+    assert entry["status"] == status
+    assert answer["recent"] == [entry]
 
 
 def test_state_shows_a_task_left_running_as_interrupted_while_another_holds_the_lock(
