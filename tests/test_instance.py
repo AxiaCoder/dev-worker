@@ -23,12 +23,15 @@ HEADER = Header.model_validate(
 VALID = """\
 tracker:
   type: jira
+  site: example.atlassian.net
+  user: bot@example.com
   project: ABC
   token_env: JIRA_TOKEN
 repository:
   type: github
   name: example/project
   token_env: GITHUB_TOKEN
+hold_merge_label: hold-merge
 statuses:
   ready: To Do
   in_progress: In Progress
@@ -252,7 +255,7 @@ def test_invalid_field_is_refused(
     ("text", "location"),
     [
         (VALID + "owner: someone\n", "owner: Extra inputs"),
-        (VALID.replace("  project: ABC\n", "  project: ABC\n  site: x\n"), "site"),
+        (VALID.replace("  project: ABC\n", "  project: ABC\n  region: x\n"), "region"),
         (VALID.replace("  project: ABC\n", ""), "tracker.project: Field required"),
         (VALID.split("statuses:")[0], "statuses: Field required"),
     ],

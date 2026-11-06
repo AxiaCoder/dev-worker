@@ -42,11 +42,16 @@ EnvName = Annotated[str, AfterValidator(_check_env_name)]
 
 
 class Tracker(BaseModel):
-    """The ticket tracker of an instance and the environment variable holding its token."""
+    """The ticket tracker of an instance, its account and the variable holding its token.
+
+    `site` is the Jira site address and `user` the email of the account the token belongs to.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     type: Literal["jira"]
+    site: Name
+    user: Name
     project: Name
     token_env: EnvName
 
@@ -69,6 +74,7 @@ class _InstanceData(BaseModel):
     tracker: Tracker
     repository: Repository
     statuses: Mapping[StatusKey, Name]
+    hold_merge_label: Name
     limits: Mapping[CeilingName, Ceiling] = Field(default_factory=dict)
 
 
@@ -77,6 +83,7 @@ class Instance:
     """A validated instance, resolved against its header.
 
     `statuses` maps every status key of the header to the tracker's real status name.
+    `hold_merge_label` is the ticket label that holds a merge back.
     `limits` maps every ceiling name of the header to its effective value: the instance's
     own when it sets one, the header ceiling otherwise. Both mappings are read-only.
     """
@@ -84,6 +91,7 @@ class Instance:
     tracker: Tracker
     repository: Repository
     statuses: Mapping[str, str]
+    hold_merge_label: str
     limits: Mapping[str, int]
 
 
@@ -190,5 +198,6 @@ def load_instance(path: Path, header: Header) -> Instance:
         statuses=MappingProxyType(
             {key: data.statuses[key] for key in header.status_keys}
         ),
+        hold_merge_label=data.hold_merge_label,
         limits=MappingProxyType({**header.ceilings, **data.limits}),
     )
