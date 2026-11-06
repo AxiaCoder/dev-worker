@@ -2,7 +2,8 @@
 
 The instance directory is the instance file path without its suffix
 (`instances/acme.yaml` gives `instances/acme/`). It holds `journal.jsonl`, one JSON
-line per run, and `run.lock`, present while a run is in progress.
+line per run, `run.lock`, present while a run is in progress, and `journal.torn`, the
+journal lines a run cut off while writing them, once a later run has set them aside.
 """
 
 import json
@@ -12,6 +13,7 @@ from pathlib import Path
 
 JOURNAL_FILE = "journal.jsonl"
 LOCK_FILE = "run.lock"
+TORN_FILE = "journal.torn"
 
 
 class JournalError(ValueError):
@@ -119,6 +121,52 @@ def read_entries(directory: Path) -> list[dict[str, object]]:
         if isinstance(entry, dict):
             entries.append(entry)
     return entries
+
+
+def torn_tail(content: bytes) -> bytes | None:
+    """Return the unterminated last line of the journal `content`, `None` when it has none.
+
+    A last line that lacks only its final newline, being a whole JSON object, is not torn.
+    """
+    if not content or content.endswith(b"\n"):
+        return None
+    tail = content[content.rfind(b"\n") + 1 :]
+    try:
+        entry = json.loads(tail.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return tail
+    return None if isinstance(entry, dict) else tail
+
+
+def set_aside_torn_tail(directory: Path) -> None:
+    """Cut the torn last line off the journal of `directory` into its torn file.
+
+    The torn line is appended, with a final newline, to `journal.torn`, unless that file
+    already ends with it as a whole line, as a cut-off that failed to truncate leaves it; a last line that
+    lacks only its final newline gets it instead. The journal is left as is when the
+    torn file cannot be written. Raises `OSError` when a file cannot be read or written.
+    """
+    path = directory / JOURNAL_FILE
+    try:
+        content = path.read_bytes()
+    except FileNotFoundError:
+        return
+    if not content or content.endswith(b"\n"):
+        return
+    tail = torn_tail(content)
+    if tail is None:
+        with path.open("ab") as journal:
+            journal.write(b"\n")
+        return
+    torn_path = directory / TORN_FILE
+    try:
+        set_aside = torn_path.read_bytes()
+    except FileNotFoundError:
+        set_aside = b""
+    if not (b"\n" + set_aside).endswith(b"\n" + tail + b"\n"):
+        with torn_path.open("ab") as torn:
+            torn.write(tail + b"\n")
+    os.truncate(path, len(content) - len(tail))
 
 
 def append_entry(directory: Path, entry: Mapping[str, object]) -> None:
