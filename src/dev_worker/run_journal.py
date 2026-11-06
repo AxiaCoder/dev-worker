@@ -79,7 +79,8 @@ def journal_holds(directory: Path, task_id: str) -> bool:
     """Tell whether the journal of `directory` has a line for `task_id`.
 
     False when there is no journal yet. Raises `OSError` when it cannot be read,
-    `JournalError` when a line is not UTF-8 JSON or not an object.
+    `JournalError` when a line is not UTF-8 JSON, is nested too deeply to parse, or
+    is not an object.
     """
     path = directory / JOURNAL_FILE
     if not path.exists():
