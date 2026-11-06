@@ -577,7 +577,7 @@ def test_lock_that_cannot_be_removed_is_reported_with_the_output(
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
 ) -> None:
-    def stuck(path: Path) -> None:
+    def stuck(path: Path, *record: object) -> None:
         raise PermissionError(13, "Permission denied")
 
     monkeypatch.setattr(cli, "release_lock", stuck)
@@ -591,6 +591,33 @@ def test_lock_that_cannot_be_removed_is_reported_with_the_output(
     assert answer["errors"] == [
         f"Lock file '{lock}' cannot be removed: Permission denied"
     ]
+
+
+def test_run_leaves_the_lock_of_the_run_that_took_it_over_meanwhile(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    successor = encode({"task_id": "successor", "ticket_key": "DEMO-2"})
+    lock = instance.with_suffix("") / run_journal.LOCK_FILE
+
+    def taken_over_while_running(
+        mandate: MandateInput, resolved: Instance
+    ) -> MandateOutput:
+        lock.write_bytes(successor)
+        return cli.deliver_ticket(mandate, resolved)
+
+    monkeypatch.setitem(cli.MANDATES, "deliver_ticket", taken_over_while_running)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed"
+    assert run_journal.read_lock(lock.parent) == {
+        "task_id": "successor",
+        "ticket_key": "DEMO-2",
+    }
 
 
 def test_input_that_is_not_utf8_fails(

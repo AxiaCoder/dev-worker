@@ -46,7 +46,7 @@ def take_lock(directory: Path, record: Mapping[str, object]) -> Path:
     descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     try:
         try:
-            os.write(descriptor, json.dumps(record).encode("utf-8"))
+            os.write(descriptor, lock_content(record))
         finally:
             os.close(descriptor)
     except OSError:
@@ -55,9 +55,23 @@ def take_lock(directory: Path, record: Mapping[str, object]) -> Path:
     return path
 
 
-def release_lock(path: Path) -> None:
-    """Remove the lock file at `path`; raises `OSError` when it cannot be removed."""
-    path.unlink(missing_ok=True)
+def lock_content(record: Mapping[str, object]) -> bytes:
+    """Return the bytes a lock file holding `record` is written with."""
+    return json.dumps(record).encode("utf-8")
+
+
+def release_lock(path: Path, record: Mapping[str, object]) -> None:
+    """Remove the lock file at `path` if it still holds `record`; leave it otherwise.
+
+    A lock already gone, or taken over by another run, is left as it is. Raises
+    `OSError` when the lock cannot be read or removed.
+    """
+    try:
+        content = path.read_bytes()
+    except FileNotFoundError:
+        return
+    if content == lock_content(record):
+        path.unlink(missing_ok=True)
 
 
 def journal_holds(directory: Path, task_id: str) -> bool:
@@ -103,7 +117,7 @@ def read_lock(directory: Path) -> dict[str, object] | None:
 
 
 def parse_lock(content: bytes) -> dict[str, object]:
-    """Return the lock record held in `content`, `{}` when it is not a UTF-8 JSON object.
+    """Return the lock record in `content`, `{}` when it is not a UTF-8 JSON object.
 
     A record nested too deeply gives `{}` too. Never raises.
     """
@@ -137,9 +151,10 @@ def set_aside_lock(directory: Path, seen: bytes) -> bool:
     The lock is first renamed to a name of its own, so that of several runs removing
     the same lock only one succeeds, on Linux and macOS; on Windows, where a rename is
     not atomic, none may. A rename or read refused for lack of rights counts as another
-    run moving the lock. A lock found to hold anything but `seen` is put back, unless a new
-    lock was taken meanwhile; one that cannot be put back is left under its new name.
-    Raises `OSError` when the lock cannot be moved, read or put back.
+    run moving the lock. A lock found to hold anything but `seen` is put back, unless
+    a new lock was taken meanwhile, in which case it is lost; one that cannot be put
+    back is left under its new name. Raises `OSError` when the lock cannot be moved,
+    read or put back.
     """
     path = directory / LOCK_FILE
     aside = directory / f"{LOCK_FILE}.{uuid.uuid4().hex}"

@@ -134,9 +134,11 @@ def run_journaled(
 
     The ticket key is checked first, then the lock is taken, or taken over from a run
     that is gone (see `take_over_lock`); a task_id already in the journal is refused.
-    A refused run is not journaled. Every file error becomes a failed output naming the reason, except a lock that cannot be removed: the run
-    keeps its status and the reason is added to `errors`. An exception raised by
-    `handler` propagates once the lock is released.
+    A refused run is not journaled. The lock is released only if no other run has
+    taken it over meanwhile. Every file error becomes a failed output naming the
+    reason, except a lock that cannot be removed: the run keeps its status and the
+    reason is added to `errors`. An exception raised by `handler` propagates once the
+    lock is released.
     """
     task_id = mandate.task_id
     refusal = check_ticket_key(mandate, instance)
@@ -176,7 +178,7 @@ def run_journaled(
         output = run_under_lock(handler, mandate, instance, directory, start)
     finally:
         try:
-            release_lock(lock)
+            release_lock(lock, record)
         except OSError as error:
             release_error = f"Lock file '{lock}' cannot be removed: {os_reason(error)}"
         else:

@@ -67,9 +67,41 @@ def test_lock_that_cannot_be_written_is_removed(
 def test_release_lock_removes_it(tmp_path: Path) -> None:
     lock = take_lock(tmp_path, {"task_id": "t"})
 
-    release_lock(lock)
+    release_lock(lock, {"task_id": "t"})
 
     assert not lock.exists()
+
+
+def test_release_lock_leaves_a_lock_taken_over_by_another_run(tmp_path: Path) -> None:
+    lock = take_lock(tmp_path, {"task_id": "t"})
+    lock.write_bytes(json.dumps({"task_id": "successor"}).encode("utf-8"))
+
+    release_lock(lock, {"task_id": "t"})
+
+    assert read_lock(tmp_path) == {"task_id": "successor"}
+
+
+def test_release_lock_of_a_lock_already_gone_does_nothing(tmp_path: Path) -> None:
+    release_lock(tmp_path / LOCK_FILE, {"task_id": "t"})
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_release_lock_raises_when_its_own_lock_cannot_be_removed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lock = take_lock(tmp_path, {"task_id": "t"})
+
+    def refuse(path: Path, missing_ok: bool = False) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+
+    with pytest.raises(PermissionError):
+        release_lock(lock, {"task_id": "t"})
+
+    monkeypatch.undo()
+    assert read_lock(tmp_path) == {"task_id": "t"}
 
 
 def test_journal_holds_nothing_when_absent(tmp_path: Path) -> None:
