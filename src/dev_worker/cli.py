@@ -28,6 +28,7 @@ from dev_worker.contract import (
 from dev_worker.header import Header, HeaderError, load_worker_file
 from dev_worker.instance import Instance, InstanceError, load_instance
 from dev_worker.run_journal import (
+    GUARD_FILE,
     JOURNAL_FILE,
     LOCK_FILE,
     TORN_FILE,
@@ -42,7 +43,7 @@ from dev_worker.run_journal import (
     read_entries,
     read_lock,
     release_lock,
-    set_aside_lock,
+    remove_lock_if_unchanged,
     set_aside_torn_tail,
     take_lock,
     torn_tail,
@@ -477,7 +478,8 @@ def unwritable_instance_directory(directory: Path) -> str | None:
 
     Checks, without writing, the directory when it exists, else its nearest existing
     parent, in which a run would create it: it must be a directory the process may
-    write in and enter. The journal, when it exists, must be writable too.
+    write in and enter. The journal and the guard file, when they exist, must be
+    writable too.
     """
     nearest = directory
     while not nearest.exists() and nearest.parent != nearest:
@@ -490,6 +492,9 @@ def unwritable_instance_directory(directory: Path) -> str | None:
     journal = directory / JOURNAL_FILE
     if journal.exists() and not os.access(journal, os.W_OK):
         return f"Journal '{journal}' cannot be written."
+    guard = directory / GUARD_FILE
+    if guard.exists() and not os.access(guard, os.W_OK):
+        return f"Guard file '{guard}' cannot be written."
     return None
 
 
@@ -559,7 +564,7 @@ def take_over_lock(
         seen = (directory / LOCK_FILE).read_bytes()
         held = parse_lock(seen)
         reason = gone_reason(directory, held, timeout)
-        if reason is None or not set_aside_lock(directory, seen):
+        if reason is None or not remove_lock_if_unchanged(directory, seen):
             return in_progress
     except FileNotFoundError:
         return in_progress
@@ -596,7 +601,8 @@ def read_health(instance_path: Path) -> Health:
     """Tell whether the worker can run against the instance read from `instance_path`.
 
     `down` when `WORKER.md` or the instance file does not load, the instance path has
-    no suffix, the instance directory or its existing journal cannot be written, or
+    no suffix, the instance directory or its existing journal or guard file cannot be
+    written (see `unwritable_instance_directory`), or
     the journal cannot be read the way a run reads it (see `unreadable_journal`), or
     its torn last line cannot be set aside (see `unsettable_torn_line`); `degraded`
     when the run holding the lock is gone (see `gone_reason`), which the next run mends

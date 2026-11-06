@@ -24,6 +24,7 @@ GUARD_FILE = "run.guard"
 TORN_FILE = "journal.torn"
 CREATE_TIME_SLACK = 1.0
 GUARD_POLL_SECONDS = 0.001
+LOCK_REMOVAL_SECONDS = 1.0
 
 if sys.platform == "win32":  # pragma: not on posix
     import msvcrt
@@ -45,6 +46,24 @@ if sys.platform == "win32":  # pragma: not on posix
         """Unlock the first byte of the open guard file."""
         msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
 
+    def remove_lock_file(path: Path) -> None:
+        """Remove the lock file at `path`, if present.
+
+        While another process holds the file open, removal is retried every
+        `GUARD_POLL_SECONDS` seconds for up to `LOCK_REMOVAL_SECONDS` seconds, then the
+        `PermissionError` is raised. Raises another `OSError` at once.
+        """
+        deadline = time.perf_counter() + LOCK_REMOVAL_SECONDS
+        while True:
+            try:
+                path.unlink(missing_ok=True)
+            except PermissionError:
+                if time.perf_counter() >= deadline:
+                    raise
+                time.sleep(GUARD_POLL_SECONDS)
+            else:
+                return
+
 else:  # pragma: not on Windows_NT
     import fcntl
 
@@ -58,6 +77,13 @@ else:  # pragma: not on Windows_NT
     def unlock_guard(descriptor: int) -> None:
         """Unlock the open guard file."""
         fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+    def remove_lock_file(path: Path) -> None:
+        """Remove the lock file at `path`, if present.
+
+        Raises `OSError` when it cannot be removed.
+        """
+        path.unlink(missing_ok=True)
 
 
 class JournalError(ValueError):
@@ -116,7 +142,7 @@ def release_lock(path: Path, record: Mapping[str, object]) -> None:
         except FileNotFoundError:
             return
         if content == lock_content(record):
-            path.unlink(missing_ok=True)
+            remove_lock_file(path)
 
 
 @contextmanager
@@ -217,7 +243,7 @@ def process_runs_since(pid: int, moment: float) -> bool:
     return created <= moment + CREATE_TIME_SLACK
 
 
-def set_aside_lock(directory: Path, seen: bytes) -> bool:
+def remove_lock_if_unchanged(directory: Path, seen: bytes) -> bool:
     """Remove the lock of `directory` if it still holds `seen`; tell whether it did.
 
     The lock is read and removed while holding the guard of `directory` (see
@@ -235,7 +261,7 @@ def set_aside_lock(directory: Path, seen: bytes) -> bool:
             return False
         if content != seen:
             return False
-        path.unlink(missing_ok=True)
+        remove_lock_file(path)
     return True
 
 

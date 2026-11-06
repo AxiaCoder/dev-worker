@@ -1599,6 +1599,27 @@ def test_health_is_down_when_the_journal_cannot_be_written(
     assert str(journal) in str(answer["reason"])
 
 
+def test_health_is_down_when_the_guard_cannot_be_written(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    write_journal(instance, {"task_id": "t"})
+    guard = instance.with_suffix("") / run_journal.GUARD_FILE
+    guard.touch()
+    allowed = os.access
+
+    def access(path: Path, mode: int) -> bool:
+        return Path(path) != guard and allowed(path, mode)
+
+    monkeypatch.setattr(cli.os, "access", access)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert_down(answer, "")
+    assert str(guard) in str(answer["reason"])
+
+
 def test_health_is_ok_when_the_journal_does_not_exist_yet(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
