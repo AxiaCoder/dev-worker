@@ -3,6 +3,9 @@
 
 tracker:
   type: jira
+  # The Jira site address and the email of the account the token belongs to.
+  site: example.atlassian.net
+  user: worker@example.com
   project: DEMO
   # The name of the environment variable that holds the token, never the token itself.
   token_env: JIRA_TOKEN
@@ -19,6 +22,9 @@ statuses:
   in_review: In Review
   blocked: Blocked
   done: Done
+
+# The ticket label that holds a merge back: with it, the pull request stays open.
+hold_merge_label: hold-merge
 
 # Optional. Each limit may only tighten the header ceiling of the same name.
 limits:

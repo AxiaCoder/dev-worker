@@ -15,10 +15,11 @@ Out of V1: a framing mandate, narrow mandates, connectors beyond Jira and GitHub
 An instance is one YAML file that points the worker at a tracker project and a repository. It is read against the header of [`WORKER.md`](src/dev_worker/WORKER.md) and refused if it loosens it.
 
 1. Copy [`examples/instance.yaml`](examples/instance.yaml) to a place **outside this repository**.
-2. Set the tracker project and the repository name.
+2. Set the tracker site address (`site`), the email of its account (`user`), the tracker project and the repository name.
 3. Map every status key of the header to the status name your tracker really uses; two keys cannot share one status.
-4. Under `token_env`, write the name of the environment variable that holds each token, and set that variable in the worker's environment. The file never holds a token.
-5. Optionally, tighten a limit under `limits`; a value above the header ceiling is refused.
+4. Under `hold_merge_label`, name the ticket label that holds a merge back: a ticket carrying it keeps its pull request open.
+5. Under `token_env`, write the name of the environment variable that holds each token, and set that variable in the worker's environment. The file never holds a token.
+6. Optionally, tighten a limit under `limits`; a value above the header ceiling is refused.
 
 Real instances and secrets stay outside the repository: the file under `examples/` is fictional and is the only instance committed here.
 

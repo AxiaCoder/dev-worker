@@ -21,11 +21,19 @@ from dev_worker.header import (
 
 ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]*")
 
-Name = Annotated[str, Field(min_length=1)]
-
 
 class InstanceError(ValueError):
     """Raised when an instance file is invalid or loosens its header."""
+
+
+def _check_not_blank(value: str) -> str:
+    """Return `value` unchanged when it holds a non-blank character; raise `ValueError` otherwise."""
+    if not value.strip():
+        raise ValueError("must not be blank")
+    return value
+
+
+Name = Annotated[str, AfterValidator(_check_not_blank)]
 
 
 def _check_env_name(value: str) -> str:
@@ -42,11 +50,16 @@ EnvName = Annotated[str, AfterValidator(_check_env_name)]
 
 
 class Tracker(BaseModel):
-    """The ticket tracker of an instance and the environment variable holding its token."""
+    """The ticket tracker of an instance, its account and the variable holding its token.
+
+    `site` is the Jira site address and `user` the email of the account the token belongs to.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     type: Literal["jira"]
+    site: Name
+    user: Name
     project: Name
     token_env: EnvName
 
@@ -69,6 +82,7 @@ class _InstanceData(BaseModel):
     tracker: Tracker
     repository: Repository
     statuses: Mapping[StatusKey, Name]
+    hold_merge_label: Name
     limits: Mapping[CeilingName, Ceiling] = Field(default_factory=dict)
 
 
@@ -77,6 +91,7 @@ class Instance:
     """A validated instance, resolved against its header.
 
     `statuses` maps every status key of the header to the tracker's real status name.
+    `hold_merge_label` is the ticket label that holds a merge back.
     `limits` maps every ceiling name of the header to its effective value: the instance's
     own when it sets one, the header ceiling otherwise. Both mappings are read-only.
     """
@@ -84,6 +99,7 @@ class Instance:
     tracker: Tracker
     repository: Repository
     statuses: Mapping[str, str]
+    hold_merge_label: str
     limits: Mapping[str, int]
 
 
@@ -190,5 +206,6 @@ def load_instance(path: Path, header: Header) -> Instance:
         statuses=MappingProxyType(
             {key: data.statuses[key] for key in header.status_keys}
         ),
+        hold_merge_label=data.hold_merge_label,
         limits=MappingProxyType({**header.ceilings, **data.limits}),
     )

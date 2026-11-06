@@ -23,12 +23,15 @@ HEADER = Header.model_validate(
 VALID = """\
 tracker:
   type: jira
+  site: example.atlassian.net
+  user: bot@example.com
   project: ABC
   token_env: JIRA_TOKEN
 repository:
   type: github
   name: example/project
   token_env: GITHUB_TOKEN
+hold_merge_label: hold-merge
 statuses:
   ready: To Do
   in_progress: In Progress
@@ -54,6 +57,8 @@ def load(tmp_path: Path, text: str) -> Instance:
 def test_valid_instance_loads(tmp_path: Path) -> None:
     instance = load(tmp_path, VALID)
 
+    assert instance.tracker.site == "example.atlassian.net"
+    assert instance.tracker.user == "bot@example.com"
     assert instance.tracker.project == "ABC"
     assert instance.tracker.token_env == "JIRA_TOKEN"
     assert instance.repository.name == "example/project"
@@ -64,6 +69,7 @@ def test_valid_instance_loads(tmp_path: Path) -> None:
         "blocked": "Blocked",
         "done": "Done",
     }
+    assert instance.hold_merge_label == "hold-merge"
 
 
 def test_unset_limit_comes_from_the_header(tmp_path: Path) -> None:
@@ -238,6 +244,17 @@ def test_token_env_not_a_variable_name_is_refused_without_echo(
         ("type: jira", "type: linear", "tracker.type"),
         ("type: github", "type: gitlab", "repository.type"),
         ("project: ABC", "project: ''", "tracker.project"),
+        (
+            "site: example.atlassian.net",
+            "site: ''",
+            "tracker.site: .*must not be blank",
+        ),
+        ("user: bot@example.com", "user: ''", "tracker.user: .*must not be blank"),
+        (
+            "hold_merge_label: hold-merge",
+            "hold_merge_label: ''",
+            "hold_merge_label: .*must not be blank",
+        ),
         ("name: example/project", "name: ''", "repository.name"),
     ],
 )
@@ -249,11 +266,58 @@ def test_invalid_field_is_refused(
 
 
 @pytest.mark.parametrize(
+    ("old", "location"),
+    [
+        ("site: example.atlassian.net", "tracker.site"),
+        ("user: bot@example.com", "tracker.user"),
+        ("project: ABC", "tracker.project"),
+        ("hold_merge_label: hold-merge", "hold_merge_label"),
+        ("name: example/project", "repository.name"),
+        ("blocked: Blocked", "statuses.blocked"),
+    ],
+)
+@pytest.mark.parametrize("blank", ['" "', '"   "', '"\\t"', '" \\t "'])
+def test_blank_name_is_refused(
+    tmp_path: Path, old: str, location: str, blank: str
+) -> None:
+    key = old.split(":")[0]
+    text = VALID.replace(old, f"{key}: {blank}")
+
+    with pytest.raises(
+        InstanceError, match=f"invalid instance file: {location}: .*blank"
+    ) as caught:
+        load(tmp_path, text)
+
+    assert "(got" not in str(caught.value)
+    assert "input_value" not in str(caught.value)
+
+
+def test_status_name_with_surrounding_blanks_is_kept_as_written(
+    tmp_path: Path,
+) -> None:
+    instance = load(tmp_path, VALID.replace("ready: To Do", 'ready: "  To Do "'))
+
+    assert instance.statuses["ready"] == "  To Do "
+
+
+@pytest.mark.parametrize(
     ("text", "location"),
     [
         (VALID + "owner: someone\n", "owner: Extra inputs"),
-        (VALID.replace("  project: ABC\n", "  project: ABC\n  site: x\n"), "site"),
+        (VALID.replace("  project: ABC\n", "  project: ABC\n  region: x\n"), "region"),
         (VALID.replace("  project: ABC\n", ""), "tracker.project: Field required"),
+        (
+            VALID.replace("  site: example.atlassian.net\n", ""),
+            "tracker.site: Field required",
+        ),
+        (
+            VALID.replace("  user: bot@example.com\n", ""),
+            "tracker.user: Field required",
+        ),
+        (
+            VALID.replace("hold_merge_label: hold-merge\n", ""),
+            "hold_merge_label: Field required",
+        ),
         (VALID.split("statuses:")[0], "statuses: Field required"),
     ],
 )
