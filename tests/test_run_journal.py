@@ -123,7 +123,14 @@ def test_journal_skips_blank_lines(tmp_path: Path) -> None:
     assert journal_holds(tmp_path, "t") is True
 
 
-@pytest.mark.parametrize("line", [b"{", b"\xff"])
+@pytest.mark.parametrize(
+    "line",
+    [
+        pytest.param(b"{", id="cut-json"),
+        pytest.param(b"\xff", id="not-utf8"),
+        pytest.param(b"[" * 100_000 + b"]" * 100_000, id="too-deeply-nested"),
+    ],
+)
 def test_journal_line_that_is_not_json_raises(tmp_path: Path, line: bytes) -> None:
     (tmp_path / JOURNAL_FILE).write_bytes(line + b"\n")
 

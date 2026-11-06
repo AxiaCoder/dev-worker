@@ -418,6 +418,26 @@ def test_journal_with_a_terminated_line_that_is_not_json_fails_wherever_it_is(
     assert not (directory / TORN_FILE).exists()
 
 
+def test_journal_with_a_line_nested_too_deeply_to_parse_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    directory = instance.with_suffix("")
+    directory.mkdir()
+    journal = directory / run_journal.JOURNAL_FILE
+    journal.write_bytes(b'{"task_id": "a"}\n' + b"[" * 100_000 + b"]" * 100_000 + b"\n")
+    before = journal.read_bytes()
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", "line 2 is not valid JSON")
+    assert journal.read_bytes() == before
+    assert not (directory / run_journal.LOCK_FILE).exists()
+
+
 TORN_TAILS = [
     pytest.param(b'{"task_id": "t1", "sta', id="cut-json"),
     pytest.param(b'{"task_id": "t\xc3', id="cut-utf8"),
