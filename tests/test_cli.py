@@ -1765,6 +1765,24 @@ def test_health_writes_nothing_when_a_torn_journal_line_cannot_be_set_aside(
     assert snapshot(instance.parent) == before
 
 
+@UNSETTABLE_TORN_FILES
+def test_health_is_degraded_when_an_unsettable_torn_file_sits_beside_a_whole_journal(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    make: Any,
+    refuse: Any,
+) -> None:
+    directory = write_journal(instance, {"task_id": "t"})
+    torn = directory / TORN_FILE
+    make(torn)
+    refuse(monkeypatch, torn)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert_degraded_naming(answer, torn)
+
+
 def test_health_is_degraded_after_a_run_set_a_torn_journal_line_aside(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
