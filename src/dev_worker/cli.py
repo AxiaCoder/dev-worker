@@ -195,10 +195,14 @@ def run_under_lock(
     directory: Path,
     start: str,
 ) -> MandateOutput:
-    """Run `handler` unless its task_id is already journaled, then journal the run.
+    """Run `handler` unless its task_id is already journaled, journaling the run twice.
 
-    `start` is the ISO 8601 UTC start of the run, written as is in the journal line. A
-    torn last journal line is first set aside in the torn file.
+    A `running` line is appended before `handler` runs, so that the task is never run
+    again even if its final line, appended once `handler` returns, cannot be written;
+    the output is then kept, with the journal error added to `errors`. A run whose
+    `running` line cannot be written fails without running `handler`. `start` is the
+    ISO 8601 UTC start of the run, written as is in both lines. A torn last journal
+    line is first set aside in the torn file.
     """
     task_id = mandate.task_id
     try:
@@ -213,14 +217,12 @@ def run_under_lock(
         return failed(task_id, f"Journal in '{directory}': {error}")
     if repeated:
         return failed(task_id, f"Task {task_id!r} has already been run.")
-    began = time.monotonic()
-    output = handler(mandate, instance)
-    entry = {
+    entry: dict[str, object] = {
         "task_id": task_id,
         "ticket_key": mandate.params["ticket_key"],
-        "status": output.status,
+        "status": "running",
         "start": start,
-        "duration": time.monotonic() - began,
+        "duration": None,
         "tokens": 0,
     }
     try:
@@ -228,6 +230,18 @@ def run_under_lock(
     except OSError as error:
         return failed(
             task_id, f"Journal in '{directory}' cannot be written: {os_reason(error)}"
+        )
+    began = time.monotonic()
+    output = handler(mandate, instance)
+    entry |= {"status": output.status, "duration": time.monotonic() - began}
+    try:
+        append_entry(directory, entry)
+    except OSError as error:
+        journal_error = (
+            f"Journal in '{directory}' cannot be written: {os_reason(error)}"
+        )
+        return output.model_copy(
+            update={"errors": [*output.errors, writable_text(journal_error)]}
         )
     return output
 
@@ -366,12 +380,54 @@ def answerable(record: Mapping[str, object]) -> bool:
     return True
 
 
+def task_entries(
+    entries: Sequence[Mapping[str, object]], lock: Mapping[str, object] | None
+) -> list[Mapping[str, object]]:
+    """Return one entry per task of the journal `entries`, its last line, oldest first.
+
+    Tasks are ordered by their first line; a line whose `task_id` is not a string is a
+    task of its own. `lock` is the lock record, `None` when no run holds the lock. A
+    task whose last line is `running` is shown as `failed`, interrupted, unless the
+    lock is held by that task or by a run whose task is unknown.
+    """
+    tasks: dict[object, Mapping[str, object]] = {}
+    for entry in entries:
+        task_id = entry.get("task_id")
+        tasks[task_id if isinstance(task_id, str) else object()] = entry
+    return [
+        interrupted(entry)
+        if entry.get("status") == "running" and not held_by(lock, entry)
+        else entry
+        for entry in tasks.values()
+    ]
+
+
+def held_by(lock: Mapping[str, object] | None, entry: Mapping[str, object]) -> bool:
+    """Tell whether the lock record `lock` may be held by the run of `entry`.
+
+    False when no run holds the lock (`None`); true when the lock names no task.
+    """
+    if lock is None:
+        return False
+    return "task_id" not in lock or lock["task_id"] == entry.get("task_id")
+
+
+def interrupted(entry: Mapping[str, object]) -> dict[str, object]:
+    """Return the `running` journal entry `entry` as the failed run it became."""
+    return {
+        **entry,
+        "status": "failed",
+        "errors": ["The run stopped before its final journal line was written."],
+    }
+
+
 def read_state(instance_path: Path) -> State:
     """Build the state of the instance read from `instance_path`, writing nothing.
 
     `current` holds the lock record of the run in progress (`{}` when its details are
-    unknown), `recent` the last `RECENT_RUNS` journal entries, most recent first, and
-    `cost` the number of runs and the tokens they spent on the current UTC day. The
+    unknown), `recent` the last `RECENT_RUNS` tasks of the journal (see
+    `task_entries`), most recent first, and `cost` the number of those tasks and the
+    tokens they spent on the current UTC day. The
     instance file itself is not read; an instance path without a suffix gives an empty
     state. A journal entry that `answerable` refuses is skipped, a lock record it
     refuses gives `{}`. Never raises.
@@ -384,7 +440,9 @@ def read_state(instance_path: Path) -> State:
     if lock is not None and not answerable(lock):
         lock = {}
     entries = (
-        [entry for entry in read_entries(directory) if answerable(entry)]
+        task_entries(
+            [entry for entry in read_entries(directory) if answerable(entry)], lock
+        )
         if directory
         else []
     )

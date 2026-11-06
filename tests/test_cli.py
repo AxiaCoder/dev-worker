@@ -121,7 +121,15 @@ def test_valid_ticket_key_completes_and_journals_the_run(
     assert answer["task_id"] == "task-1"
     assert answer["errors"] == []
     assert "Nothing was done" in str(answer["summary"])
-    (line,) = journal_lines(instance)
+    running, line = journal_lines(instance)
+    assert running == {
+        "task_id": "task-1",
+        "ticket_key": "DEMO-1",
+        "status": "running",
+        "start": line["start"],
+        "duration": None,
+        "tokens": 0,
+    }
     assert line.keys() == {
         "task_id",
         "ticket_key",
@@ -182,7 +190,10 @@ def test_repeated_task_id_fails_and_is_journaled_once(
     answer = run_mandate(monkeypatch, capsysbinary, stdin, instance=instance)
 
     assert_failed(answer, "task-1", "Task 'task-1' has already been run.")
-    assert len(journal_lines(instance)) == 1
+    assert [line["status"] for line in journal_lines(instance)] == [
+        "running",
+        "completed",
+    ]
 
 
 def test_other_task_id_after_a_run_is_journaled(
@@ -202,6 +213,8 @@ def test_other_task_id_after_a_run_is_journaled(
     assert answer["status"] == "completed"
     assert [line["task_id"] for line in journal_lines(instance)] == [
         "task-1",
+        "task-1",
+        "task-2",
         "task-2",
     ]
 
@@ -221,8 +234,10 @@ def test_journal_records_the_status_the_mandate_returns(
     )
 
     assert_failed(answer, "task-1", "The ticket cannot be delivered.")
-    (line,) = journal_lines(instance)
-    assert line["status"] == "failed"
+    assert [line["status"] for line in journal_lines(instance)] == [
+        "running",
+        "failed",
+    ]
 
 
 def test_journal_records_the_duration_of_the_mandate_in_seconds(
@@ -235,8 +250,9 @@ def test_journal_records_the_duration_of_the_mandate_in_seconds(
 
     run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
 
-    (line,) = journal_lines(instance)
-    assert line["duration"] == 2.5
+    running, final = journal_lines(instance)
+    assert running["duration"] is None
+    assert final["duration"] == 2.5
 
 
 def test_held_lock_fails_leaving_it_untouched(
@@ -296,7 +312,7 @@ def test_lock_is_released_when_the_mandate_raises(
         run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
 
     assert not (instance.with_suffix("") / run_journal.LOCK_FILE).exists()
-    assert journal_lines(instance) == []
+    assert [line["status"] for line in journal_lines(instance)] == ["running"]
 
 
 def test_instance_directory_that_cannot_be_created_fails_naming_it(
@@ -440,6 +456,7 @@ def test_run_after_a_torn_journal_line_completes_and_journals_after_the_whole_li
         "a",
         "b",
         "task-1",
+        "task-1",
     ]
 
 
@@ -455,7 +472,10 @@ def test_run_after_a_journal_holding_only_a_torn_line_journals_the_run_alone(
     )
 
     assert answer["status"] == "completed"
-    assert [line["task_id"] for line in journal_lines(instance)] == ["task-1"]
+    assert [line["task_id"] for line in journal_lines(instance)] == [
+        "task-1",
+        "task-1",
+    ]
 
 
 @pytest.mark.parametrize("tail", TORN_TAILS)
@@ -498,6 +518,8 @@ def test_two_torn_journal_lines_are_set_aside_one_after_the_other(
     assert [line["task_id"] for line in journal_lines(instance)] == [
         "a",
         "task-1",
+        "task-1",
+        "task-2",
         "task-2",
     ]
 
@@ -519,6 +541,7 @@ def test_run_after_a_whole_unterminated_journal_line_keeps_it_and_terminates_it(
     assert [line["task_id"] for line in journal_lines(instance)] == [
         "a",
         "b",
+        "task-1",
         "task-1",
     ]
     assert not (directory / TORN_FILE).exists()
@@ -570,6 +593,133 @@ def test_journal_that_cannot_be_written_fails_naming_the_reason(
 
     assert_failed(answer, "task-1", "cannot be written: No space left on device")
     assert not (instance.with_suffix("") / run_journal.LOCK_FILE).exists()
+
+
+def test_mandate_is_not_run_when_its_running_line_cannot_be_written(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    called: list[str] = []
+
+    def record(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+        called.append(mandate.task_id)
+        return cli.deliver_ticket(mandate, resolved)
+
+    def full(directory: Path, entry: object) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setitem(cli.MANDATES, "deliver_ticket", record)
+    monkeypatch.setattr(cli, "append_entry", full)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    directory = instance.with_suffix("")
+    assert_failed(
+        answer,
+        "task-1",
+        f"Journal in '{directory}' cannot be written: No space left on device",
+    )
+    assert called == []
+    assert journal_lines(instance) == []
+
+
+def fail_on_final_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make `append_entry` write the `running` line, then fail on every other line."""
+    real_append_entry = cli.append_entry
+
+    def full_after_running(directory: Path, entry: dict[str, object]) -> None:
+        if entry["status"] != "running":
+            raise OSError(28, "No space left on device")
+        real_append_entry(directory, entry)
+
+    monkeypatch.setattr(cli, "append_entry", full_after_running)
+
+
+def test_final_line_that_cannot_be_written_keeps_the_output_and_reports_it(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    fail_on_final_line(monkeypatch)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    directory = instance.with_suffix("")
+    assert answer["status"] == "completed"
+    assert "Nothing was done" in str(answer["summary"])
+    assert answer["errors"] == [
+        f"Journal in '{directory}' cannot be written: No space left on device"
+    ]
+    assert [line["status"] for line in journal_lines(instance)] == ["running"]
+    assert not (directory / run_journal.LOCK_FILE).exists()
+
+
+def test_final_line_that_cannot_be_written_follows_the_errors_of_the_mandate(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    def refuse(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+        return cli.failed(mandate.task_id, "The ticket cannot be delivered.")
+
+    monkeypatch.setitem(cli.MANDATES, "deliver_ticket", refuse)
+    fail_on_final_line(monkeypatch)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    directory = instance.with_suffix("")
+    assert answer["status"] == "failed"
+    assert answer["errors"] == [
+        "The ticket cannot be delivered.",
+        f"Journal in '{directory}' cannot be written: No space left on device",
+    ]
+
+
+def test_task_whose_final_line_could_not_be_written_is_not_run_again(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    with monkeypatch.context() as failing:
+        fail_on_final_line(failing)
+        run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", "Task 'task-1' has already been run.")
+    assert [line["status"] for line in journal_lines(instance)] == ["running"]
+
+
+def test_task_whose_mandate_raised_is_not_run_again(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    def explode(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+        raise RuntimeError("boom")
+
+    with monkeypatch.context() as raising:
+        raising.setitem(cli.MANDATES, "deliver_ticket", explode)
+        with pytest.raises(RuntimeError, match="boom"):
+            run_mandate(
+                monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+            )
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", "Task 'task-1' has already been run.")
+    assert [line["status"] for line in journal_lines(instance)] == ["running"]
 
 
 def test_lock_that_cannot_be_removed_is_reported_with_the_output(
@@ -1026,7 +1176,7 @@ def test_state_after_a_run_lists_it_and_counts_it_today(
 
     answer = common(state(monkeypatch, capsysbinary, instance))
 
-    (entry,) = journal_lines(instance)
+    _, entry = journal_lines(instance)
     assert entry["status"] == "completed"
     assert answer["current"] == []
     assert answer["recent"] == [entry]
@@ -1050,6 +1200,8 @@ def test_state_answers_while_a_run_holds_the_lock(
     run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
 
     (during,) = seen
+    running, _ = journal_lines(instance)
+    assert running["status"] == "running"
     assert common(during)["current"] == [
         {
             "task_id": "task-1",
@@ -1058,7 +1210,137 @@ def test_state_answers_while_a_run_holds_the_lock(
             "pid": os.getpid(),
         }
     ]
-    assert common(during)["recent"] == []
+    assert common(during)["recent"] == [running]
+
+
+INTERRUPTED = "The run stopped before its final journal line was written."
+
+
+def test_state_lists_each_task_once_by_its_last_line_in_the_order_of_its_first(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    write_journal(
+        instance,
+        {"task_id": "a", "status": "running"},
+        {"task_id": "b", "status": "running"},
+        {"task_id": "b", "status": "failed"},
+        {"task_id": "a", "status": "completed"},
+    )
+
+    assert common(state(monkeypatch, capsysbinary, instance))["recent"] == [
+        {"task_id": "b", "status": "failed"},
+        {"task_id": "a", "status": "completed"},
+    ]
+
+
+def test_state_shows_a_task_left_running_without_the_lock_as_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    write_journal(
+        instance, {"task_id": "a", "ticket_key": "DEMO-1", "status": "running"}
+    )
+
+    assert common(state(monkeypatch, capsysbinary, instance))["recent"] == [
+        {
+            "task_id": "a",
+            "ticket_key": "DEMO-1",
+            "status": "failed",
+            "errors": [INTERRUPTED],
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "lock",
+    [
+        pytest.param(b"held by another run", id="unknown-details"),
+        pytest.param(b'{"pid": 1}', id="no-task-id"),
+        pytest.param(b'{"task_id": "a"}', id="same-task"),
+    ],
+)
+def test_state_keeps_a_task_running_while_the_lock_may_be_its_own(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    lock: bytes,
+) -> None:
+    directory = write_journal(
+        instance,
+        {"task_id": "a", "status": "running"},
+        {"task_id": "b", "status": "running"},
+        {"task_id": "b", "status": "completed"},
+    )
+    (directory / run_journal.LOCK_FILE).write_bytes(lock)
+
+    assert common(state(monkeypatch, capsysbinary, instance))["recent"] == [
+        {"task_id": "b", "status": "completed"},
+        {"task_id": "a", "status": "running"},
+    ]
+
+
+def test_state_shows_a_task_left_running_as_interrupted_while_another_holds_the_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    directory = write_journal(
+        instance,
+        {"task_id": "a", "status": "running"},
+        {"task_id": "b", "status": "running"},
+    )
+    (directory / run_journal.LOCK_FILE).write_bytes(b'{"task_id": "b"}')
+
+    assert common(state(monkeypatch, capsysbinary, instance))["recent"] == [
+        {"task_id": "b", "status": "running"},
+        {"task_id": "a", "status": "failed", "errors": [INTERRUPTED]},
+    ]
+
+
+def test_state_takes_each_line_without_a_string_task_id_as_a_task_of_its_own(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    write_journal(
+        instance,
+        {"task_id": None, "status": "completed"},
+        {"task_id": None, "status": "failed"},
+        {"task_id": 1, "status": "completed"},
+        {"task_id": 1, "status": "failed"},
+        {"status": "running"},
+    )
+
+    assert common(state(monkeypatch, capsysbinary, instance))["recent"] == [
+        {"status": "failed", "errors": [INTERRUPTED]},
+        {"task_id": 1, "status": "failed"},
+        {"task_id": 1, "status": "completed"},
+        {"task_id": None, "status": "failed"},
+        {"task_id": None, "status": "completed"},
+    ]
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_state_cost_counts_tasks_with_the_tokens_of_their_last_line(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    start = "2026-11-05T09:00:00+00:00"
+    write_journal(
+        instance,
+        {"task_id": "a", "status": "running", "start": start, "tokens": 0},
+        {"task_id": "b", "status": "running", "start": start, "tokens": 0},
+        {"task_id": "a", "status": "completed", "start": start, "tokens": 4},
+        {"task_id": "b", "status": "failed", "start": start, "tokens": 3},
+    )
+
+    cost = common(state(monkeypatch, capsysbinary, instance))["cost"]
+
+    assert cost == {"day": "2026-11-05", "runs": 2, "tokens": 7}
 
 
 def test_health_is_ok(
@@ -1673,8 +1955,9 @@ def assert_taken_over(
 ) -> None:
     """Check the run completed after journaling `gone`, and left only its journal."""
     assert answer["status"] == "completed"
-    old, own = journal_lines(instance)
+    old, running, own = journal_lines(instance)
     assert old == gone
+    assert running["status"] == "running"
     assert own["task_id"] == "task-1"
     assert own["status"] == "completed"
     assert own["start"] == NOW.isoformat()
@@ -1728,7 +2011,7 @@ def test_run_takes_over_a_lock_of_unknown_details_held_beyond_the_timeout(
     )
 
     assert answer["status"] == "completed"
-    old, own = journal_lines(instance)
+    old, _, own = journal_lines(instance)
     assert old["task_id"] is None
     assert old["ticket_key"] is None
     assert old["start"] is None
@@ -1774,6 +2057,7 @@ def test_run_journals_the_gone_run_after_setting_a_torn_journal_line_aside(
     assert [line["task_id"] for line in journal_lines(instance)] == [
         "first",
         "old",
+        "task-1",
         "task-1",
     ]
 
