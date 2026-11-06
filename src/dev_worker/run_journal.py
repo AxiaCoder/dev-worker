@@ -90,7 +90,7 @@ def journal_holds(directory: Path, task_id: str) -> bool:
                 continue
             try:
                 entry = json.loads(line.decode("utf-8"))
-            except ValueError as error:
+            except (ValueError, RecursionError) as error:
                 raise JournalError(
                     f"line {number} is not valid JSON: {error}"
                 ) from None
