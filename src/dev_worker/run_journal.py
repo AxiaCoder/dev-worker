@@ -220,6 +220,11 @@ def torn_tail(content: bytes) -> bytes | None:
     return None if isinstance(entry, dict) else tail
 
 
+def holds_torn_line(set_aside: bytes, tail: bytes) -> bool:
+    """Tell whether the torn file content `set_aside` already ends with `tail` as a line."""
+    return (b"\n" + set_aside).endswith(b"\n" + tail + b"\n")
+
+
 def set_aside_torn_tail(directory: Path) -> None:
     """Cut the torn last line off the journal of `directory` into its torn file.
 
@@ -245,7 +250,7 @@ def set_aside_torn_tail(directory: Path) -> None:
         set_aside = torn_path.read_bytes()
     except FileNotFoundError:
         set_aside = b""
-    if not (b"\n" + set_aside).endswith(b"\n" + tail + b"\n"):
+    if not holds_torn_line(set_aside, tail):
         with torn_path.open("ab") as torn:
             torn.write(tail + b"\n")
     os.truncate(path, len(content) - len(tail))

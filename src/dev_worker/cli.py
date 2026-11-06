@@ -33,6 +33,7 @@ from dev_worker.run_journal import (
     TORN_FILE,
     JournalError,
     append_entry,
+    holds_torn_line,
     instance_directory,
     journal_entry,
     journal_holds,
@@ -597,8 +598,9 @@ def read_health(instance_path: Path) -> Health:
     `down` when `WORKER.md` or the instance file does not load, the instance path has
     no suffix, the instance directory or its existing journal cannot be written, or
     the journal cannot be read the way a run reads it (see `unreadable_journal`), or
-    its torn last line cannot be set aside (see `unsettable_torn_line`); `degraded` when the run holding the lock is gone (see `gone_reason`), which the
-    next run mends by taking the lock over, or the journal holds a torn line (see
+    its torn last line cannot be set aside (see `unsettable_torn_line`); `degraded`
+    when the run holding the lock is gone (see `gone_reason`), which the next run mends
+    by taking the lock over, or the journal holds a torn line (see
     `torn_journal_line`); `ok` otherwise. Writes nothing and never raises.
     """
     instance = load_checked_instance(instance_path)
@@ -656,16 +658,18 @@ def unreadable_journal(directory: Path) -> str | None:
 
 
 def unsettable_torn_line(directory: Path) -> str | None:
-    """Return why a run could not set aside the torn last line of the journal of `directory`.
+    """Return why a run could not set aside the torn last journal line of `directory`.
 
     `None` when the journal does not end with a torn line, or when the torn file is
-    absent or a regular file the process can read and may write. Never raises.
+    absent or a regular file the process can read and, unless it already ends with that
+    line, may write. Never raises.
     """
     try:
         content = (directory / JOURNAL_FILE).read_bytes()
     except OSError:
         return None
-    if torn_tail(content) is None:
+    tail = torn_tail(content)
+    if tail is None:
         return None
     torn = directory / TORN_FILE
     if not torn.exists():
@@ -673,10 +677,10 @@ def unsettable_torn_line(directory: Path) -> str | None:
     if not torn.is_file():
         return f"Torn file '{torn}' is not a regular file."
     try:
-        torn.read_bytes()
+        set_aside = torn.read_bytes()
     except OSError as error:
         return f"Torn file '{torn}' cannot be read: {os_reason(error)}"
-    if not os.access(torn, os.W_OK):
+    if not holds_torn_line(set_aside, tail) and not os.access(torn, os.W_OK):
         return f"Torn file '{torn}' cannot be written."
     return None
 

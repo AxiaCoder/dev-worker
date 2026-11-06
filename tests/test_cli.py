@@ -1783,6 +1783,22 @@ def test_health_is_degraded_when_an_unsettable_torn_file_sits_beside_a_whole_jou
     assert_degraded_naming(answer, torn)
 
 
+def test_health_is_degraded_when_an_unwritable_torn_file_already_ends_with_the_torn_line(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    tail = b'{"task_id": "y", "st'
+    directory = write_torn_journal(instance, tail, {"task_id": "t"})
+    torn = directory / TORN_FILE
+    torn.write_bytes(b'{"task_id": "x", "st\n' + tail + b"\n")
+    refuse_writing(monkeypatch, torn)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert_degraded_naming(answer, torn)
+
+
 def test_health_is_degraded_after_a_run_set_a_torn_journal_line_aside(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
