@@ -1853,6 +1853,16 @@ def test_health_names_the_invalid_journal_line_a_run_fails_on(
 
     assert_down(answer, f"Journal '{journal}': {fragment}")
     assert_failed(failed, "task-1", fragment)
+    health_detail = str(answer["reason"]).removeprefix(f"Journal '{journal}': ")
+    run_prefix = f"Journal in '{directory}': "
+    errors = failed["errors"]
+    assert isinstance(errors, list)
+    run_details = [
+        str(error).split(run_prefix, 1)[1]
+        for error in errors
+        if run_prefix in str(error)
+    ]
+    assert run_details == [health_detail]
 
 
 def test_health_is_ok_when_the_journal_holds_blank_lines(

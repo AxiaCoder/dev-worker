@@ -5,6 +5,7 @@ on stdin against that instance and the `WORKER.md` shipped with the package.
 """
 
 import argparse
+import io
 import json
 import os
 import re
@@ -641,7 +642,7 @@ def unreadable_journal(directory: Path) -> str | None:
         return f"Journal '{journal}' cannot be read: {os_reason(error)}"
     tail = torn_tail(content)
     whole = content if tail is None else content[: len(content) - len(tail)]
-    for number, line in enumerate(whole.split(b"\n"), start=1):
+    for number, line in enumerate(io.BytesIO(whole), start=1):
         if not line.strip():
             continue
         try:
