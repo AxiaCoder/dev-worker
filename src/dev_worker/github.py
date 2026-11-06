@@ -153,6 +153,9 @@ class GitHubRepository:
     def merge(self, pull_request: PullRequest) -> None:
         """Merge `pull_request` as one squashed commit.
 
+        On a base branch that requires a merge queue, `gh` only enqueues the pull request,
+        and this returns as if it were merged.
+
         Raises `RepositoryError` when the token variable is not set or `gh` fails.
         """
         number = pull_request.number
@@ -216,8 +219,8 @@ class GitHubRepository:
 
 
 def _failure_reason(done: subprocess.CompletedProcess[str]) -> str:
-    """Return why `gh` failed: its last stderr line, else its exit code."""
-    lines = done.stderr.strip().splitlines()
+    """Return why `gh` failed: its non-empty stderr lines, stripped and joined by one space, else its exit code."""
+    lines = [line.strip() for line in done.stderr.splitlines() if line.strip()]
     if lines:
-        return lines[-1].strip()
+        return " ".join(lines)
     return f"exit code {done.returncode}"

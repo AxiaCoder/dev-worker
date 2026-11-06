@@ -240,7 +240,7 @@ def test_merge_failure_is_given_without_the_token(
     answer(
         monkeypatch,
         "",
-        stderr=f"first\nPull request is not mergeable {TOKEN}\n",
+        stderr=f"  first  \n\n   \nPull request is not mergeable {TOKEN}\n",
         code=1,
     )
 
@@ -248,7 +248,33 @@ def test_merge_failure_is_given_without_the_token(
         repository().merge(PULL)
 
     assert str(raised.value) == (
-        "gh failed while merging pull request #42: Pull request is not mergeable [token]"
+        "gh failed while merging pull request #42: "
+        "first Pull request is not mergeable [token]"
+    )
+
+
+def test_a_refused_merge_keeps_the_reason_gh_gave_before_its_hints(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(
+        monkeypatch,
+        "",
+        stderr=(
+            "X Pull request octo/widgets#42 is not mergeable: "
+            "the base branch policy prohibits the merge.\n"
+            "To have the pull request merged after all the requirements have been "
+            "met, add the `--auto` flag.\n"
+            "To use administrator privileges to immediately merge the pull request, "
+            "add the `--admin` flag.\n"
+        ),
+        code=1,
+    )
+
+    with pytest.raises(RepositoryError) as raised:
+        repository().merge(PULL)
+
+    assert "is not mergeable: the base branch policy prohibits the merge" in str(
+        raised.value
     )
 
 
