@@ -17,11 +17,14 @@ import pytest
 from dev_worker import cli, run_journal
 from dev_worker.contract import MandateInput, MandateOutput
 from dev_worker.header import HeaderError
-from dev_worker.instance import Instance
+from dev_worker.instance import Instance, Tracker
+from dev_worker.jira import JiraTracker
+from dev_worker.tickets import Blocker, Ticket, TrackerError
 
 ROOT = Path(__file__).resolve().parent.parent
 INSTANCE = ROOT / "examples" / "instance.yaml"
 TORN_FILE = "journal.torn"
+MAKE_TRACKER = cli.make_tracker
 
 
 def valid_input(**overrides: object) -> dict[str, object]:
@@ -49,6 +52,23 @@ def examples_stay_clean() -> Iterator[None]:
     before = sorted(INSTANCE.parent.rglob("*"))
     yield
     assert sorted(INSTANCE.parent.rglob("*")) == before
+
+
+class ReadyTracker:
+    """A tracker whose every ticket is in the example `ready` status, with no blocker."""
+
+    def read(self, key: str) -> Ticket:
+        """Return the ticket `key`, ready and unblocked."""
+        return Ticket(key=key, status="To Do", labels=(), blockers=())
+
+    def set_status(self, key: str, status: str) -> None:
+        """Change nothing."""
+
+
+@pytest.fixture(autouse=True)
+def ready_tracker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make `run` read every ticket from a `ReadyTracker` instead of the real tracker."""
+    monkeypatch.setattr(cli, "make_tracker", lambda tracker: ReadyTracker())
 
 
 def journal_lines(instance: Path) -> list[dict[str, object]]:
@@ -177,6 +197,248 @@ def test_refused_ticket_key_fails_without_journaling(
     answer = run_mandate(monkeypatch, capsysbinary, stdin, instance=instance)
 
     assert_failed(answer, "task-1", fragment)
+    assert not instance.with_suffix("").exists()
+
+
+class StubTracker:
+    """A tracker that answers every read with `answer`, raising it when it is an error.
+
+    `reads` records each key read and `trackers` each instance tracker it was made for.
+    """
+
+    def __init__(self, answer: Ticket | TrackerError) -> None:
+        """Keep `answer` for every later read."""
+        self.answer = answer
+        self.reads: list[str] = []
+        self.trackers: list[Tracker] = []
+
+    def make(self, tracker: Tracker) -> "StubTracker":
+        """Record `tracker` and return this stub, in place of `cli.make_tracker`."""
+        self.trackers.append(tracker)
+        return self
+
+    def read(self, key: str) -> Ticket:
+        """Record `key`, then return or raise the answer."""
+        self.reads.append(key)
+        if isinstance(self.answer, TrackerError):
+            raise self.answer
+        return self.answer
+
+    def set_status(self, key: str, status: str) -> None:
+        """Change nothing."""
+
+
+def serve(
+    monkeypatch: pytest.MonkeyPatch, answer: Ticket | TrackerError
+) -> StubTracker:
+    """Make `run` read every ticket from a `StubTracker` answering `answer`."""
+    stub = StubTracker(answer)
+    monkeypatch.setattr(cli, "make_tracker", stub.make)
+    return stub
+
+
+def demo_ticket(status: str = "To Do", *blockers: Blocker) -> Ticket:
+    """Return the ticket DEMO-1 in `status`, blocked by `blockers`."""
+    return Ticket(key="DEMO-1", status=status, labels=(), blockers=blockers)
+
+
+def test_run_reads_the_mandate_ticket_from_the_tracker_of_the_instance(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed"
+    assert stub.reads == ["DEMO-1"]
+    assert [tracker.project for tracker in stub.trackers] == ["DEMO"]
+    assert stub.trackers[0].token_env == "JIRA_TOKEN"
+
+
+def test_refused_ticket_key_is_not_read_from_the_tracker(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    stdin = encode(valid_input(params={"ticket_key": "OTHER-1"}))
+
+    answer = run_mandate(monkeypatch, capsysbinary, stdin, instance=instance)
+
+    assert_failed(answer, "task-1", "is not in the tracker project 'DEMO'.")
+    assert stub.reads == []
+
+
+@pytest.mark.parametrize("status", ["In Progress", "Done", "to do", "To Do "])
+def test_ticket_not_in_the_ready_status_fails_naming_both_statuses(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    status: str,
+) -> None:
+    serve(monkeypatch, demo_ticket(status))
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(
+        answer, "task-1", f"Ticket 'DEMO-1' is in status {status!r}, not 'To Do'."
+    )
+    assert not instance.with_suffix("").exists()
+
+
+def test_ticket_whose_blockers_are_all_done_completes(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    serve(
+        monkeypatch,
+        demo_ticket("To Do", Blocker("DEMO-2", "Done"), Blocker("DEMO-3", "Done")),
+    )
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed"
+    assert [line["status"] for line in journal_lines(instance)] == [
+        "running",
+        "completed",
+    ]
+
+
+def test_ticket_with_an_open_blocker_fails_naming_only_the_open_one(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    serve(
+        monkeypatch,
+        demo_ticket(
+            "To Do", Blocker("DEMO-2", "Done"), Blocker("DEMO-3", "In Progress")
+        ),
+    )
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", "DEMO-3")
+    assert answer["errors"] == [
+        "Ticket 'DEMO-1' is blocked by DEMO-3 ('In Progress'), not in status 'Done'."
+    ]
+    assert not instance.with_suffix("").exists()
+
+
+def test_ticket_with_several_open_blockers_fails_naming_each_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    serve(
+        monkeypatch,
+        demo_ticket(
+            "To Do",
+            Blocker("DEMO-4", "Blocked"),
+            Blocker("DEMO-2", "Done"),
+            Blocker("DEMO-3", "done"),
+        ),
+    )
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(
+        answer,
+        "task-1",
+        "Ticket 'DEMO-1' is blocked by DEMO-4 ('Blocked'), DEMO-3 ('done'), "
+        "not in status 'Done'.",
+    )
+
+
+def test_ticket_the_tracker_cannot_read_fails_naming_the_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    serve(monkeypatch, TrackerError("twg failed while reading DEMO-1: timeout"))
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(
+        answer,
+        "task-1",
+        "Ticket 'DEMO-1' cannot be read from the tracker: "
+        "twg failed while reading DEMO-1: timeout",
+    )
+    assert not instance.with_suffix("").exists()
+
+
+def test_ticket_not_ready_is_refused_before_the_lock_and_leaves_the_journal(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+    directory = instance.with_suffix("")
+    journal = (directory / run_journal.JOURNAL_FILE).read_bytes()
+    lock = directory / run_journal.LOCK_FILE
+    lock.write_bytes(b"held by another run")
+    files = sorted(directory.iterdir())
+    serve(monkeypatch, demo_ticket("In Progress"))
+
+    answer = run_mandate(
+        monkeypatch,
+        capsysbinary,
+        encode(valid_input(task_id="task-2")),
+        instance=instance,
+    )
+
+    assert_failed(answer, "task-2", "is in status 'In Progress', not 'To Do'.")
+    assert lock.read_bytes() == b"held by another run"
+    assert (directory / run_journal.JOURNAL_FILE).read_bytes() == journal
+    assert sorted(directory.iterdir()) == files
+
+
+def test_make_tracker_returns_a_jira_tracker() -> None:
+    tracker = Tracker(
+        type="jira",
+        site="example.atlassian.net",
+        user="worker@example.com",
+        project="DEMO",
+        token_env="JIRA_TOKEN",
+    )
+
+    assert isinstance(MAKE_TRACKER(tracker), JiraTracker)
+
+
+def test_run_reads_through_jira_with_the_token_variable_of_the_instance(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    monkeypatch.setattr(cli, "make_tracker", MAKE_TRACKER)
+    monkeypatch.delenv("JIRA_TOKEN", raising=False)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(
+        answer,
+        "task-1",
+        "Ticket 'DEMO-1' cannot be read from the tracker: the variable JIRA_TOKEN, "
+        "which should hold the Jira token, is not set",
+    )
     assert not instance.with_suffix("").exists()
 
 

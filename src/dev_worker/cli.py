@@ -26,7 +26,8 @@ from dev_worker.contract import (
     State,
 )
 from dev_worker.header import Header, HeaderError, load_worker_file
-from dev_worker.instance import Instance, InstanceError, load_instance
+from dev_worker.instance import Instance, InstanceError, Tracker, load_instance
+from dev_worker.jira import JiraTracker
 from dev_worker.run_journal import (
     GUARD_FILE,
     JOURNAL_FILE,
@@ -48,6 +49,7 @@ from dev_worker.run_journal import (
     take_lock,
     torn_tail,
 )
+from dev_worker.tickets import TicketTracker, TrackerError
 from dev_worker.validation import describe_validation_error
 
 TICKET_KEY = re.compile(r"(.+)-([1-9][0-9]*)")
@@ -128,6 +130,39 @@ def check_ticket_key(mandate: MandateInput, instance: Instance) -> str | None:
     return None
 
 
+def make_tracker(tracker: Tracker) -> TicketTracker:
+    """Return the ticket tracker that `tracker` of an instance describes."""
+    return JiraTracker(tracker)
+
+
+def check_ticket_ready(key: str, instance: Instance) -> str | None:
+    """Return why the ticket `key` cannot be run, or None when it can.
+
+    The ticket is read from the tracker of `instance`. It is refused when the tracker
+    cannot read it, when its status is not the real status of the `ready` key, or when
+    a ticket that blocks it is not in the real status of the `done` key.
+    """
+    try:
+        ticket = make_tracker(instance.tracker).read(key)
+    except TrackerError as error:
+        return f"Ticket {key!r} cannot be read from the tracker: {error}"
+    ready = instance.statuses["ready"]
+    if ticket.status != ready:
+        return f"Ticket {key!r} is in status {ticket.status!r}, not {ready!r}."
+    done = instance.statuses["done"]
+    open_blockers = [
+        f"{blocker.key} ({blocker.status!r})"
+        for blocker in ticket.blockers
+        if blocker.status != done
+    ]
+    if open_blockers:
+        return (
+            f"Ticket {key!r} is blocked by {', '.join(open_blockers)}, "
+            f"not in status {done!r}."
+        )
+    return None
+
+
 def run_journaled(
     handler: Callable[[MandateInput, Instance], MandateOutput],
     mandate: MandateInput,
@@ -136,8 +171,10 @@ def run_journaled(
 ) -> MandateOutput:
     """Run `handler` under the lock of the instance directory and journal the run.
 
-    The ticket key is checked first, then the lock is taken, or taken over from a run
-    that is gone (see `take_over_lock`); a task_id already in the journal is refused.
+    The ticket key is checked first, then the ticket is read from the tracker and
+    refused unless it is ready (see `check_ticket_ready`), then the lock is taken, or
+    taken over from a run that is gone (see `take_over_lock`); a task_id already in the
+    journal is refused.
     A refused run is not journaled. The lock is released only if no other run has
     taken it over meanwhile. Every file error becomes a failed output naming the
     reason, except a lock that cannot be removed: the run keeps its status and the
@@ -149,6 +186,10 @@ def run_journaled(
     if refusal is not None:
         return failed(task_id, refusal)
     ticket_key = mandate.params["ticket_key"]
+    assert isinstance(ticket_key, str)
+    refusal = check_ticket_ready(ticket_key, instance)
+    if refusal is not None:
+        return failed(task_id, refusal)
     try:
         directory = instance_directory(instance_path)
     except ValueError as error:
