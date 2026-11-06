@@ -493,7 +493,7 @@ def unwritable_instance_directory(directory: Path) -> str | None:
     if journal.exists() and not os.access(journal, os.W_OK):
         return f"Journal '{journal}' cannot be written."
     guard = directory / GUARD_FILE
-    if guard.exists() and not os.access(guard, os.W_OK):
+    if guard.exists() and not os.access(guard, os.R_OK | os.W_OK):
         return f"Guard file '{guard}' cannot be written."
     return None
 

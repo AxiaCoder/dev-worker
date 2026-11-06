@@ -622,10 +622,10 @@ def guard_held_by_another_process(directory: Path) -> Iterator[subprocess.Popen[
         holder.wait()
 
 
-def set_aside_in_background(
+def remove_lock_in_background(
     directory: Path, seen: bytes
 ) -> tuple[threading.Thread, list[bool]]:
-    """Start a thread setting aside the lock of `directory`; return it and its outcome list."""
+    """Start a thread removing the lock of `directory`; return it and its outcome list."""
     outcomes: list[bool] = []
     remover = threading.Thread(
         target=lambda: outcomes.append(remove_lock_if_unchanged(directory, seen))
@@ -640,7 +640,7 @@ def test_remove_lock_if_unchanged_waits_for_the_guard_held_by_another_process(
     (tmp_path / LOCK_FILE).write_bytes(b"seen")
 
     with guard_held_by_another_process(tmp_path) as holder:
-        remover, outcomes = set_aside_in_background(tmp_path, b"seen")
+        remover, outcomes = remove_lock_in_background(tmp_path, b"seen")
         remover.join(timeout=0.2)
 
         assert remover.is_alive()
@@ -664,7 +664,7 @@ def test_a_process_killed_while_holding_the_guard_blocks_no_later_run(
         holder.kill()
         holder.wait(timeout=10)
 
-        remover, outcomes = set_aside_in_background(tmp_path, b"seen")
+        remover, outcomes = remove_lock_in_background(tmp_path, b"seen")
         remover.join(timeout=10)
 
     assert not remover.is_alive()
