@@ -16,6 +16,7 @@ from dev_worker.run_journal import (
     JournalError,
     append_entry,
     instance_directory,
+    journal_entry,
     journal_holds,
     process_runs_since,
     read_entries,
@@ -135,6 +136,35 @@ def test_journal_line_that_is_not_json_raises(tmp_path: Path, line: bytes) -> No
     (tmp_path / JOURNAL_FILE).write_bytes(line + b"\n")
 
     with pytest.raises(JournalError, match="line 1 is not valid JSON"):
+        journal_holds(tmp_path, "t")
+
+
+def test_journal_entry_returns_the_object_of_its_line() -> None:
+    assert journal_entry(7, b'{"task_id": "t", "n": 1}\n') == {"task_id": "t", "n": 1}
+
+
+@pytest.mark.parametrize(
+    ("line", "message"),
+    [
+        pytest.param(b"{", "line 7 is not valid JSON", id="cut-json"),
+        pytest.param(b"\xff", "line 7 is not valid JSON", id="not-utf8"),
+        pytest.param(
+            b"[" * 100_000 + b"]" * 100_000,
+            "line 7 is not valid JSON",
+            id="too-deeply-nested",
+        ),
+        pytest.param(b'"t"', "line 7 is not a JSON object.", id="not-an-object"),
+    ],
+)
+def test_journal_entry_raises_naming_its_line_number(line: bytes, message: str) -> None:
+    with pytest.raises(JournalError, match=f"^{message}"):
+        journal_entry(7, line)
+
+
+def test_journal_line_that_is_not_an_object_raises(tmp_path: Path) -> None:
+    (tmp_path / JOURNAL_FILE).write_bytes(b'{"task_id": "a"}\n\n[1]\n')
+
+    with pytest.raises(JournalError, match="line 3 is not a JSON object"):
         journal_holds(tmp_path, "t")
 
 

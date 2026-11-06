@@ -89,17 +89,24 @@ def journal_holds(directory: Path, task_id: str) -> bool:
         for number, line in enumerate(journal, start=1):
             if not line.strip():
                 continue
-            try:
-                entry = json.loads(line.decode("utf-8"))
-            except (ValueError, RecursionError) as error:
-                raise JournalError(
-                    f"line {number} is not valid JSON: {error}"
-                ) from None
-            if not isinstance(entry, dict):
-                raise JournalError(f"line {number} is not a JSON object.")
-            if entry.get("task_id") == task_id:
+            if journal_entry(number, line).get("task_id") == task_id:
                 return True
     return False
+
+
+def journal_entry(number: int, line: bytes) -> dict[str, object]:
+    """Return the entry held by `line`, the journal line numbered `number` from 1.
+
+    Raises `JournalError` when `line` is not UTF-8 JSON, is nested too deeply to parse,
+    or is not an object.
+    """
+    try:
+        entry = json.loads(line.decode("utf-8"))
+    except (ValueError, RecursionError) as error:
+        raise JournalError(f"line {number} is not valid JSON: {error}") from None
+    if not isinstance(entry, dict):
+        raise JournalError(f"line {number} is not a JSON object.")
+    return entry
 
 
 def read_lock(directory: Path) -> dict[str, object] | None:
