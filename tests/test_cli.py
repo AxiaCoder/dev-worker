@@ -1033,10 +1033,17 @@ def write_journal(instance: Path, *entries: object) -> Path:
     return directory
 
 
-def snapshot(root: Path) -> dict[Path, bytes | None]:
-    """Return every path under `root` with its content, `None` for a directory."""
+def snapshot(root: Path) -> dict[Path, bytes | str | None]:
+    """Return every path under `root` with its content.
+
+    A symbolic link maps to its target as text, a directory to `None`.
+    """
     return {
-        path: None if path.is_dir() else path.read_bytes()
+        path: str(path.readlink())
+        if path.is_symlink()
+        else None
+        if path.is_dir()
+        else path.read_bytes()
         for path in sorted(root.rglob("*"))
     }
 
@@ -1802,6 +1809,59 @@ def test_health_is_degraded_when_an_unsettable_torn_file_sits_beside_a_whole_jou
     answer = health(monkeypatch, capsysbinary, instance)
 
     assert_degraded_naming(answer, torn)
+
+
+def link_torn_file_into_a_missing_directory(instance: Path) -> Path:
+    """Write a torn journal whose torn file links into an absent directory.
+
+    Return the torn file path.
+    """
+    directory = write_torn_journal(instance, b'{"task_id": "y", "st', {"task_id": "t"})
+    torn = directory / TORN_FILE
+    torn.symlink_to(instance.parent / "missing-dir" / "target")
+    return torn
+
+
+def test_health_is_down_when_the_torn_file_links_into_a_missing_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    torn = link_torn_file_into_a_missing_directory(instance)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert_down(answer, "")
+    assert str(torn) in str(answer["reason"])
+
+
+def test_health_writes_nothing_when_the_torn_file_links_into_a_missing_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    link_torn_file_into_a_missing_directory(instance)
+    before = snapshot(instance.parent)
+
+    health(monkeypatch, capsysbinary, instance)
+
+    assert snapshot(instance.parent) == before
+
+
+def test_health_is_degraded_when_the_torn_file_links_to_an_absent_file_in_a_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    directory = write_torn_journal(instance, b'{"task_id": "y", "st', {"task_id": "t"})
+    torn = directory / TORN_FILE
+    elsewhere = instance.parent / "elsewhere"
+    elsewhere.mkdir()
+    torn.symlink_to(elsewhere / "target")
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert_degraded_naming(answer, directory / run_journal.JOURNAL_FILE)
 
 
 def test_health_is_degraded_when_an_unwritable_torn_file_already_ends_with_the_torn_line(
