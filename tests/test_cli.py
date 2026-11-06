@@ -1658,6 +1658,147 @@ def test_health_sets_no_torn_journal_line_aside(
     assert snapshot(instance.parent) == before
 
 
+def test_health_is_degraded_when_the_journal_ends_with_a_torn_line_beside_a_torn_file(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    directory = write_torn_journal(instance, b'{"task_id": "y", "st', {"task_id": "t"})
+    torn = directory / TORN_FILE
+    torn.write_bytes(b'{"task_id": "x", "st\n')
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert_degraded_naming(answer, torn)
+
+
+def make_torn_directory(torn: Path) -> None:
+    """Create `torn` as a directory instead of a regular file."""
+    torn.mkdir()
+
+
+def make_torn_file(torn: Path) -> None:
+    """Create `torn` as a regular file holding one set-aside line."""
+    torn.write_bytes(b'{"task_id": "x", "st\n')
+
+
+def refuse_nothing(monkeypatch: pytest.MonkeyPatch, torn: Path) -> None:
+    """Leave `torn` reachable as it is."""
+
+
+def refuse_reading(monkeypatch: pytest.MonkeyPatch, torn: Path) -> None:
+    """Make every read or open of `torn` raise `PermissionError`."""
+    opened = Path.open
+    read = Path.read_bytes
+
+    def open_refusing_torn(path: Path, *args: Any, **kwargs: Any) -> Any:
+        if path == torn:
+            raise PermissionError(13, "Permission denied", str(path))
+        return opened(path, *args, **kwargs)
+
+    def read_refusing_torn(path: Path) -> bytes:
+        if path == torn:
+            raise PermissionError(13, "Permission denied", str(path))
+        return read(path)
+
+    monkeypatch.setattr(Path, "open", open_refusing_torn)
+    monkeypatch.setattr(Path, "read_bytes", read_refusing_torn)
+
+
+def refuse_writing(monkeypatch: pytest.MonkeyPatch, torn: Path) -> None:
+    """Make `cli.os.access` refuse `torn` only."""
+    allowed = os.access
+
+    def access(path: Path, mode: int) -> bool:
+        return Path(path) != torn and allowed(path, mode)
+
+    monkeypatch.setattr(cli.os, "access", access)
+
+
+UNSETTABLE_TORN_FILES = pytest.mark.parametrize(
+    ("make", "refuse"),
+    [
+        (make_torn_directory, refuse_nothing),
+        (make_torn_file, refuse_reading),
+        (make_torn_file, refuse_writing),
+    ],
+    ids=["directory", "unreadable", "unwritable"],
+)
+
+
+@UNSETTABLE_TORN_FILES
+def test_health_is_down_when_a_torn_journal_line_cannot_be_set_aside(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    make: Any,
+    refuse: Any,
+) -> None:
+    directory = write_torn_journal(instance, b'{"task_id": "y", "st', {"task_id": "t"})
+    torn = directory / TORN_FILE
+    make(torn)
+    refuse(monkeypatch, torn)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert_down(answer, "")
+    assert str(torn) in str(answer["reason"])
+
+
+@UNSETTABLE_TORN_FILES
+def test_health_writes_nothing_when_a_torn_journal_line_cannot_be_set_aside(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    make: Any,
+    refuse: Any,
+) -> None:
+    directory = write_torn_journal(instance, b'{"task_id": "y", "st', {"task_id": "t"})
+    torn = directory / TORN_FILE
+    make(torn)
+    before = snapshot(instance.parent)
+    refuse(monkeypatch, torn)
+
+    health(monkeypatch, capsysbinary, instance)
+
+    monkeypatch.undo()
+    assert snapshot(instance.parent) == before
+
+
+@UNSETTABLE_TORN_FILES
+def test_health_is_degraded_when_an_unsettable_torn_file_sits_beside_a_whole_journal(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    make: Any,
+    refuse: Any,
+) -> None:
+    directory = write_journal(instance, {"task_id": "t"})
+    torn = directory / TORN_FILE
+    make(torn)
+    refuse(monkeypatch, torn)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert_degraded_naming(answer, torn)
+
+
+def test_health_is_degraded_when_an_unwritable_torn_file_already_ends_with_the_torn_line(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    tail = b'{"task_id": "y", "st'
+    directory = write_torn_journal(instance, tail, {"task_id": "t"})
+    torn = directory / TORN_FILE
+    torn.write_bytes(b'{"task_id": "x", "st\n' + tail + b"\n")
+    refuse_writing(monkeypatch, torn)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert_degraded_naming(answer, torn)
+
+
 def test_health_is_degraded_after_a_run_set_a_torn_journal_line_aside(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
