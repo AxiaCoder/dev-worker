@@ -596,8 +596,8 @@ def read_health(instance_path: Path) -> Health:
 
     `down` when `WORKER.md` or the instance file does not load, the instance path has
     no suffix, the instance directory or its existing journal cannot be written, or
-    the journal cannot be read the way a run reads it (see `unreadable_journal`);
-    `degraded` when the run holding the lock is gone (see `gone_reason`), which the
+    the journal cannot be read the way a run reads it (see `unreadable_journal`), or
+    its torn last line cannot be set aside (see `unsettable_torn_line`); `degraded` when the run holding the lock is gone (see `gone_reason`), which the
     next run mends by taking the lock over, or the journal holds a torn line (see
     `torn_journal_line`); `ok` otherwise. Writes nothing and never raises.
     """
@@ -614,6 +614,9 @@ def read_health(instance_path: Path) -> Health:
     unreadable = unreadable_journal(directory)
     if unreadable is not None:
         return Health(status="down", reason=writable_text(unreadable), active=True)
+    unsettable = unsettable_torn_line(directory)
+    if unsettable is not None:
+        return Health(status="down", reason=writable_text(unsettable), active=True)
     lock = read_lock(directory)
     timeout = instance.limits["run_timeout_seconds"]
     gone = None if lock is None else gone_reason(directory, lock, timeout)
@@ -649,6 +652,32 @@ def unreadable_journal(directory: Path) -> str | None:
             journal_entry(number, line)
         except JournalError as error:
             return f"Journal '{journal}': {error}"
+    return None
+
+
+def unsettable_torn_line(directory: Path) -> str | None:
+    """Return why a run could not set aside the torn last line of the journal of `directory`.
+
+    `None` when the journal does not end with a torn line, or when the torn file is
+    absent or a regular file the process can read and may write. Never raises.
+    """
+    try:
+        content = (directory / JOURNAL_FILE).read_bytes()
+    except OSError:
+        return None
+    if torn_tail(content) is None:
+        return None
+    torn = directory / TORN_FILE
+    if not torn.exists():
+        return None
+    if not torn.is_file():
+        return f"Torn file '{torn}' is not a regular file."
+    try:
+        torn.read_bytes()
+    except OSError as error:
+        return f"Torn file '{torn}' cannot be read: {os_reason(error)}"
+    if not os.access(torn, os.W_OK):
+        return f"Torn file '{torn}' cannot be written."
     return None
 
 
