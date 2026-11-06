@@ -24,7 +24,7 @@ Real instances and secrets stay outside the repository: the file under `examples
 
 ## Development
 
-Requires [uv](https://docs.astral.sh/uv/). From the repository root:
+Requires [uv](https://docs.astral.sh/uv/). The tests create symbolic links: on Windows, turn on Developer Mode first. From the repository root:
 
 ```
 uv sync

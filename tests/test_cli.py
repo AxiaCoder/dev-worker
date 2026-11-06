@@ -1033,10 +1033,17 @@ def write_journal(instance: Path, *entries: object) -> Path:
     return directory
 
 
-def snapshot(root: Path) -> dict[Path, bytes | None]:
-    """Return every path under `root` with its content, `None` for a directory."""
+def snapshot(root: Path) -> dict[Path, bytes | str | None]:
+    """Return every path under `root` with its content.
+
+    A symbolic link maps to its target as text, a directory to `None`.
+    """
     return {
-        path: None if path.is_dir() else path.read_bytes()
+        path: str(path.readlink())
+        if path.is_symlink()
+        else None
+        if path.is_dir()
+        else path.read_bytes()
         for path in sorted(root.rglob("*"))
     }
 
@@ -1802,6 +1809,104 @@ def test_health_is_degraded_when_an_unsettable_torn_file_sits_beside_a_whole_jou
     answer = health(monkeypatch, capsysbinary, instance)
 
     assert_degraded_naming(answer, torn)
+
+
+def link_torn_file_into_a_missing_directory(
+    instance: Path, _: pytest.MonkeyPatch
+) -> Path:
+    """Write a torn journal whose torn file links into an absent directory.
+
+    Return the torn file path.
+    """
+    directory = write_torn_journal(instance, b'{"task_id": "y", "st', {"task_id": "t"})
+    torn = directory / TORN_FILE
+    torn.symlink_to(instance.parent / "missing-dir" / "target")
+    return torn
+
+
+def link_torn_file_into_an_unwritable_directory(
+    instance: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Write a torn journal whose torn file links into a directory `cli.os.access` refuses.
+
+    Return the torn file path.
+    """
+    directory = write_torn_journal(instance, b'{"task_id": "y", "st', {"task_id": "t"})
+    torn = directory / TORN_FILE
+    locked = instance.parent / "locked"
+    locked.mkdir()
+    torn.symlink_to(locked / "target")
+    refuse_writing(monkeypatch, Path(os.path.realpath(locked)))
+    return torn
+
+
+def link_torn_file_to_itself(instance: Path, _: pytest.MonkeyPatch) -> Path:
+    """Write a torn journal whose torn file is a link to itself.
+
+    Return the torn file path.
+    """
+    directory = write_torn_journal(instance, b'{"task_id": "y", "st', {"task_id": "t"})
+    torn = directory / TORN_FILE
+    torn.symlink_to(torn)
+    return torn
+
+
+UNREACHABLE_TORN_LINKS = pytest.mark.parametrize(
+    "link",
+    [
+        link_torn_file_into_a_missing_directory,
+        link_torn_file_into_an_unwritable_directory,
+        link_torn_file_to_itself,
+    ],
+    ids=["missing-directory", "unwritable-directory", "loop"],
+)
+
+
+@UNREACHABLE_TORN_LINKS
+def test_health_is_down_when_the_torn_file_links_where_a_run_cannot_append(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    link: Any,
+) -> None:
+    torn = link(instance, monkeypatch)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert_down(answer, "")
+    assert str(torn) in str(answer["reason"])
+
+
+@UNREACHABLE_TORN_LINKS
+def test_health_writes_nothing_when_the_torn_file_links_where_a_run_cannot_append(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    link: Any,
+) -> None:
+    link(instance, monkeypatch)
+    before = snapshot(instance.parent)
+
+    health(monkeypatch, capsysbinary, instance)
+
+    monkeypatch.undo()
+    assert snapshot(instance.parent) == before
+
+
+def test_health_is_degraded_when_the_torn_file_links_to_an_absent_file_in_a_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    directory = write_torn_journal(instance, b'{"task_id": "y", "st', {"task_id": "t"})
+    torn = directory / TORN_FILE
+    elsewhere = instance.parent / "elsewhere"
+    elsewhere.mkdir()
+    torn.symlink_to(elsewhere / "target")
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert_degraded_naming(answer, directory / run_journal.JOURNAL_FILE)
 
 
 def test_health_is_degraded_when_an_unwritable_torn_file_already_ends_with_the_torn_line(
