@@ -1282,6 +1282,26 @@ def test_state_shows_a_task_left_running_without_the_lock_as_interrupted(
     ]
 
 
+def test_state_shows_the_line_a_run_left_before_its_body_returned_as_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    left = {
+        "task_id": "a",
+        "ticket_key": "DEMO-1",
+        "status": "running",
+        "start": NOW.isoformat(),
+        "duration": None,
+        "tokens": 0,
+    }
+    write_journal(instance, left)
+
+    assert common(state(monkeypatch, capsysbinary, instance))["recent"] == [
+        left | {"status": "failed", "errors": [INTERRUPTED]}
+    ]
+
+
 @pytest.mark.parametrize(
     "lock",
     [
