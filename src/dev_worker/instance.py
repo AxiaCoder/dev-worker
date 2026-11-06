@@ -21,11 +21,19 @@ from dev_worker.header import (
 
 ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]*")
 
-Name = Annotated[str, Field(min_length=1)]
-
 
 class InstanceError(ValueError):
     """Raised when an instance file is invalid or loosens its header."""
+
+
+def _check_not_blank(value: str) -> str:
+    """Return `value` unchanged when it holds a non-blank character; raise `ValueError` otherwise."""
+    if not value.strip():
+        raise ValueError("must not be blank")
+    return value
+
+
+Name = Annotated[str, AfterValidator(_check_not_blank)]
 
 
 def _check_env_name(value: str) -> str:

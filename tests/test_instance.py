@@ -244,12 +244,16 @@ def test_token_env_not_a_variable_name_is_refused_without_echo(
         ("type: jira", "type: linear", "tracker.type"),
         ("type: github", "type: gitlab", "repository.type"),
         ("project: ABC", "project: ''", "tracker.project"),
-        ("site: example.atlassian.net", "site: ''", "tracker.site: .*at least 1"),
-        ("user: bot@example.com", "user: ''", "tracker.user: .*at least 1"),
+        (
+            "site: example.atlassian.net",
+            "site: ''",
+            "tracker.site: .*must not be blank",
+        ),
+        ("user: bot@example.com", "user: ''", "tracker.user: .*must not be blank"),
         (
             "hold_merge_label: hold-merge",
             "hold_merge_label: ''",
-            "hold_merge_label: .*at least 1",
+            "hold_merge_label: .*must not be blank",
         ),
         ("name: example/project", "name: ''", "repository.name"),
     ],
@@ -259,6 +263,41 @@ def test_invalid_field_is_refused(
 ) -> None:
     with pytest.raises(InstanceError, match=f"invalid instance file: {location}"):
         load(tmp_path, VALID.replace(old, new))
+
+
+@pytest.mark.parametrize(
+    ("old", "location"),
+    [
+        ("site: example.atlassian.net", "tracker.site"),
+        ("user: bot@example.com", "tracker.user"),
+        ("project: ABC", "tracker.project"),
+        ("hold_merge_label: hold-merge", "hold_merge_label"),
+        ("name: example/project", "repository.name"),
+        ("blocked: Blocked", "statuses.blocked"),
+    ],
+)
+@pytest.mark.parametrize("blank", ['" "', '"   "', '"\\t"', '" \\t "'])
+def test_blank_name_is_refused(
+    tmp_path: Path, old: str, location: str, blank: str
+) -> None:
+    key = old.split(":")[0]
+    text = VALID.replace(old, f"{key}: {blank}")
+
+    with pytest.raises(
+        InstanceError, match=f"invalid instance file: {location}: .*blank"
+    ) as caught:
+        load(tmp_path, text)
+
+    assert "(got" not in str(caught.value)
+    assert "input_value" not in str(caught.value)
+
+
+def test_status_name_with_surrounding_blanks_is_kept_as_written(
+    tmp_path: Path,
+) -> None:
+    instance = load(tmp_path, VALID.replace("ready: To Do", 'ready: "  To Do "'))
+
+    assert instance.statuses["ready"] == "  To Do "
 
 
 @pytest.mark.parametrize(
