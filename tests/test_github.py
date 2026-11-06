@@ -168,6 +168,9 @@ def test_read_ci_asks_for_the_check_rollup(
         ([run("COMPLETED", "SUCCESS"), run("IN_PROGRESS")], "running"),
         ([run("IN_PROGRESS"), context("FAILURE")], "failed"),
         ([context("PENDING"), run("COMPLETED", "FAILURE")], "failed"),
+        ([run("COMPLETED", "FAILURE"), run("IN_PROGRESS")], "failed"),
+        ([run("COMPLETED", "FAILURE"), run("COMPLETED", "SUCCESS")], "failed"),
+        ([run("IN_PROGRESS"), context("SUCCESS")], "running"),
     ],
 )
 def test_read_ci_aggregates_the_checks(
@@ -348,3 +351,27 @@ def test_the_token_is_read_at_each_call_not_at_construction(
     second = called(record)["env"]["GH_TOKEN"]
 
     assert (first, second) == ("first-token", "second-token")
+
+
+@pytest.mark.parametrize(
+    ("error", "reason"),
+    [
+        (
+            OSError(13, f"Permission denied for {TOKEN}"),
+            "Permission denied for [token]",
+        ),
+        (OSError(), "OSError"),
+    ],
+)
+def test_gh_that_cannot_be_started_is_explained_without_the_token(
+    record: Path, monkeypatch: pytest.MonkeyPatch, error: OSError, reason: str
+) -> None:
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise error
+
+    monkeypatch.setattr("dev_worker.github.subprocess.run", refuse)
+
+    with pytest.raises(RepositoryError) as raised:
+        repository().merge(PULL)
+
+    assert str(raised.value) == f"gh could not be started: {reason}"
