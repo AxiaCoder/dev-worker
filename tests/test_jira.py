@@ -237,3 +237,105 @@ def test_an_answer_of_the_wrong_shape_raises(
     message = str(raised.value)
     assert message.startswith("the answer of twg to reading ABC-218 cannot be read: ")
     assert where in message
+
+
+def test_twg_variables_already_set_are_replaced_by_the_tracker_ones(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TWG_SITE", "stale.atlassian.net")
+    monkeypatch.setenv("TWG_USER", "stale@example.com")
+    monkeypatch.setenv("TWG_TOKEN", "stale-token")
+    answer(monkeypatch, TICKET)
+
+    tracker().read("ABC-218")
+
+    called = json.loads(record.read_text(encoding="utf-8"))
+    assert called["env"] == {
+        "TWG_SITE": "example.atlassian.net",
+        "TWG_USER": "bot@example.com",
+        "TWG_TOKEN": TOKEN,
+    }
+
+
+def test_the_token_is_read_at_each_call_not_at_construction(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("JIRA_TOKEN")
+    built = tracker()
+    monkeypatch.setenv("JIRA_TOKEN", "first-token")
+    answer(monkeypatch, {"ok": True, "data": {}})
+
+    built.set_status("ABC-218", "Done")
+    first = json.loads(record.read_text(encoding="utf-8"))["env"]["TWG_TOKEN"]
+    monkeypatch.setenv("JIRA_TOKEN", "second-token")
+    built.set_status("ABC-218", "Done")
+    second = json.loads(record.read_text(encoding="utf-8"))["env"]["TWG_TOKEN"]
+
+    assert (first, second) == ("first-token", "second-token")
+
+
+def test_a_ticket_without_links_or_labels_has_no_blockers(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, {"data": [{**ITEM, "labels": [], "issuelinks": []}]})
+
+    ticket = tracker().read("ABC-218")
+
+    assert (ticket.labels, ticket.blockers) == ((), ())
+
+
+def test_a_ticket_that_only_blocks_others_has_no_blockers(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    links = [link("outwardIssue", "ABC-220", "À faire")]
+    answer(monkeypatch, {"data": [{**ITEM, "issuelinks": links}]})
+
+    assert tracker().read("ABC-218").blockers == ()
+
+
+def test_a_nonzero_exit_is_a_failure_even_with_a_readable_answer(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, TICKET, stderr="rate limited\n", code=1)
+
+    with pytest.raises(
+        TrackerError, match="^twg failed while reading ABC-218: rate limited$"
+    ):
+        tracker().read("ABC-218")
+
+
+def test_an_answer_of_the_wrong_shape_does_not_echo_the_token(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, {"data": [{**ITEM, "labels": TOKEN, "status": TOKEN}]})
+
+    with pytest.raises(TrackerError) as raised:
+        tracker().read("ABC-218")
+
+    message = str(raised.value)
+    assert "data.0.labels" in message
+    assert TOKEN not in message
+
+
+def test_set_status_with_a_twg_failure_does_not_give_the_token(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, "", stderr=f"token {TOKEN} expired\n", code=1)
+
+    with pytest.raises(TrackerError) as raised:
+        tracker().set_status("ABC-218", "Done")
+
+    assert str(raised.value) == (
+        "twg failed while moving ABC-218 to 'Done': token [token] expired"
+    )
+
+
+def test_set_status_with_an_answer_that_is_not_json_raises(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, "Transitioned.")
+
+    with pytest.raises(
+        TrackerError, match="answer of twg to moving ABC-218 to 'Done' is not JSON"
+    ):
+        tracker().set_status("ABC-218", "Done")
