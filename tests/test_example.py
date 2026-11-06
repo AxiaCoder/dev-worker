@@ -13,3 +13,6 @@ def test_example_instance_loads_against_the_worker_header() -> None:
 
     assert set(instance.statuses) == set(header.status_keys)
     assert instance.limits["max_turns"] == 40
+    assert instance.tracker.site == "example.atlassian.net"
+    assert instance.tracker.user == "worker@example.com"
+    assert instance.hold_merge_label == "hold-merge"
