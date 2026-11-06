@@ -34,9 +34,12 @@ from dev_worker.run_journal import (
     append_entry,
     instance_directory,
     journal_holds,
+    parse_lock,
+    process_runs_since,
     read_entries,
     read_lock,
     release_lock,
+    set_aside_lock,
     set_aside_torn_tail,
     take_lock,
     torn_tail,
@@ -129,11 +132,13 @@ def run_journaled(
 ) -> MandateOutput:
     """Run `handler` under the lock of the instance directory and journal the run.
 
-    The ticket key is checked first, then the lock is taken; a task_id already in the
-    journal is refused. A refused run is not journaled. Every file error becomes a
-    failed output naming the reason, except a lock that cannot be removed: the run
-    keeps its status and the reason is added to `errors`. An exception raised by
-    `handler` propagates once the lock is released.
+    The ticket key is checked first, then the lock is taken, or taken over from a run
+    that is gone (see `take_over_lock`); a task_id already in the journal is refused.
+    A refused run is not journaled. The lock is released only if no other run has
+    taken it over meanwhile. Every file error becomes a failed output naming the
+    reason, except a lock that cannot be removed: the run keeps its status and the
+    reason is added to `errors`. An exception raised by `handler` propagates once the
+    lock is released.
     """
     task_id = mandate.task_id
     refusal = check_ticket_key(mandate, instance)
@@ -152,25 +157,28 @@ def run_journaled(
             f"Instance directory '{directory}' cannot be created: {os_reason(error)}",
         )
     start = datetime.now(UTC).isoformat()
+    record = {
+        "task_id": task_id,
+        "ticket_key": ticket_key,
+        "start": start,
+        "pid": os.getpid(),
+    }
     try:
-        lock = take_lock(
-            directory, {"task_id": task_id, "ticket_key": ticket_key, "start": start}
-        )
+        taken: Path | str = take_lock(directory, record)
     except FileExistsError:
-        return failed(
-            task_id,
-            f"A run is already in progress in instance directory '{directory}'.",
+        taken = take_over_lock(
+            directory, record, instance.limits["run_timeout_seconds"]
         )
     except OSError as error:
-        return failed(
-            task_id,
-            f"Lock file in '{directory}' cannot be written: {os_reason(error)}",
-        )
+        taken = lock_unwritable(directory, error)
+    if isinstance(taken, str):
+        return failed(task_id, taken)
+    lock = taken
     try:
         output = run_under_lock(handler, mandate, instance, directory, start)
     finally:
         try:
-            release_lock(lock)
+            release_lock(lock, record)
         except OSError as error:
             release_error = f"Lock file '{lock}' cannot be removed: {os_reason(error)}"
         else:
@@ -437,15 +445,96 @@ def lock_age(directory: Path, lock: Mapping[str, object]) -> float | None:
     return now.timestamp() - modified
 
 
+def gone_reason(
+    directory: Path, lock: Mapping[str, object], timeout: int
+) -> str | None:
+    """Return why the run holding the lock of `directory` is gone, `None` if it is not.
+
+    `lock` is the lock record. The run is gone when it has held the lock longer than
+    `timeout` seconds (see `lock_age`), or when the record names its process by a
+    positive integer `pid` and a usable `start`, and that process no longer runs or
+    was started after `start`.
+    """
+    age = lock_age(directory, lock)
+    if age is not None and age > timeout:
+        return (
+            f"The run holding the lock of instance directory '{directory}' "
+            f"started {age:.0f} seconds ago, beyond the run timeout of "
+            f"{timeout} seconds."
+        )
+    pid = lock.get("pid")
+    start = run_start(lock)
+    if (
+        isinstance(pid, int)
+        and not isinstance(pid, bool)
+        and pid > 0
+        and start is not None
+        and not process_runs_since(pid, start.timestamp())
+    ):
+        return (
+            f"The run holding the lock of instance directory '{directory}' "
+            f"is gone: its process {pid} no longer runs."
+        )
+    return None
+
+
+def take_over_lock(
+    directory: Path, record: Mapping[str, object], timeout: int
+) -> Path | str:
+    """Take the lock of `directory` from a run that is gone, writing `record` in it.
+
+    The gone run (see `gone_reason`) is journaled first, as a failed run with the
+    `task_id`, `ticket_key` and `start` of its lock record and the reason it is gone
+    in `errors`; a torn last journal line is set aside before. Returns the lock file
+    path, or why the lock cannot be taken: its run is not gone, another run took it
+    first, or a file cannot be read or written. Never raises on a file error.
+    """
+    in_progress = f"A run is already in progress in instance directory '{directory}'."
+    try:
+        seen = (directory / LOCK_FILE).read_bytes()
+        held = parse_lock(seen)
+        reason = gone_reason(directory, held, timeout)
+        if reason is None or not set_aside_lock(directory, seen):
+            return in_progress
+    except FileNotFoundError:
+        return in_progress
+    except OSError as error:
+        return lock_unwritable(directory, error)
+    entry = {
+        "task_id": held.get("task_id"),
+        "ticket_key": held.get("ticket_key"),
+        "status": "failed",
+        "start": held.get("start"),
+        "duration": None,
+        "tokens": 0,
+        "errors": [reason],
+    }
+    try:
+        set_aside_torn_tail(directory)
+        append_entry(directory, entry)
+    except OSError as error:
+        return f"Journal in '{directory}' cannot be written: {os_reason(error)}"
+    try:
+        return take_lock(directory, record)
+    except FileExistsError:
+        return in_progress
+    except OSError as error:
+        return lock_unwritable(directory, error)
+
+
+def lock_unwritable(directory: Path, error: OSError) -> str:
+    """Return the sentence saying the lock file in `directory` fails with `error`."""
+    return f"Lock file in '{directory}' cannot be written: {os_reason(error)}"
+
+
 def read_health(instance_path: Path) -> Health:
     """Tell whether the worker can run against the instance read from `instance_path`.
 
     `down` when `WORKER.md` or the instance file does not load, the instance path has
     no suffix, or the instance directory or its existing journal cannot be written;
-    `degraded` when a run has
-    held the lock longer than the instance's `run_timeout_seconds`, or the journal holds a
-    torn line (see `torn_journal_line`); `ok` otherwise.
-    Writes nothing and never raises.
+    `degraded` when the run holding the lock is gone (see `gone_reason`), which the
+    next run mends by taking the lock over, or the journal holds a torn line (see
+    `torn_journal_line`); `ok` otherwise. Writes nothing and never raises.
     """
     instance = load_checked_instance(instance_path)
     if isinstance(instance, str):
@@ -458,18 +547,10 @@ def read_health(instance_path: Path) -> Health:
     if unwritable is not None:
         return Health(status="down", reason=writable_text(unwritable), active=True)
     lock = read_lock(directory)
-    age = None if lock is None else lock_age(directory, lock)
     timeout = instance.limits["run_timeout_seconds"]
-    if age is not None and age > timeout:
-        return Health(
-            status="degraded",
-            reason=writable_text(
-                f"The run holding the lock of instance directory '{directory}' "
-                f"started {age:.0f} seconds ago, beyond the run timeout of "
-                f"{timeout} seconds."
-            ),
-            active=True,
-        )
+    gone = None if lock is None else gone_reason(directory, lock, timeout)
+    if gone is not None:
+        return Health(status="degraded", reason=writable_text(gone), active=True)
     torn = torn_journal_line(directory)
     if torn is not None:
         return Health(status="degraded", reason=writable_text(torn), active=True)

@@ -275,7 +275,8 @@ def test_lock_holds_the_run_in_progress(
     run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
 
     (record,) = seen
-    assert record.keys() == {"task_id", "ticket_key", "start"}
+    assert record.keys() == {"task_id", "ticket_key", "start", "pid"}
+    assert record["pid"] == os.getpid()
     assert record["task_id"] == "task-1"
     assert record["ticket_key"] == "DEMO-1"
     assert record["start"] == journal_lines(instance)[0]["start"]
@@ -576,7 +577,7 @@ def test_lock_that_cannot_be_removed_is_reported_with_the_output(
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
 ) -> None:
-    def stuck(path: Path) -> None:
+    def stuck(path: Path, *record: object) -> None:
         raise PermissionError(13, "Permission denied")
 
     monkeypatch.setattr(cli, "release_lock", stuck)
@@ -590,6 +591,33 @@ def test_lock_that_cannot_be_removed_is_reported_with_the_output(
     assert answer["errors"] == [
         f"Lock file '{lock}' cannot be removed: Permission denied"
     ]
+
+
+def test_run_leaves_the_lock_of_the_run_that_took_it_over_meanwhile(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    successor = encode({"task_id": "successor", "ticket_key": "DEMO-2"})
+    lock = instance.with_suffix("") / run_journal.LOCK_FILE
+
+    def taken_over_while_running(
+        mandate: MandateInput, resolved: Instance
+    ) -> MandateOutput:
+        lock.write_bytes(successor)
+        return cli.deliver_ticket(mandate, resolved)
+
+    monkeypatch.setitem(cli.MANDATES, "deliver_ticket", taken_over_while_running)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed"
+    assert run_journal.read_lock(lock.parent) == {
+        "task_id": "successor",
+        "ticket_key": "DEMO-2",
+    }
 
 
 def test_input_that_is_not_utf8_fails(
@@ -1023,7 +1051,12 @@ def test_state_answers_while_a_run_holds_the_lock(
 
     (during,) = seen
     assert common(during)["current"] == [
-        {"task_id": "task-1", "ticket_key": "DEMO-1", "start": NOW.isoformat()}
+        {
+            "task_id": "task-1",
+            "ticket_key": "DEMO-1",
+            "start": NOW.isoformat(),
+            "pid": os.getpid(),
+        }
     ]
     assert common(during)["recent"] == []
 
@@ -1586,3 +1619,398 @@ def test_state_reports_a_run_of_unknown_details_for_a_lock_it_cannot_answer_in_j
     (directory / run_journal.LOCK_FILE).write_bytes(content)
 
     assert common(state(monkeypatch, capsysbinary, instance))["current"] == [{}]
+
+
+def dead_pid() -> int:
+    """Return the PID of a process that has run and exited."""
+    finished = subprocess.Popen([sys.executable, "-c", "pass"])
+    finished.wait()
+    return finished.pid
+
+
+def lock_of(seconds_ago: float, **fields: object) -> bytes:
+    """Return a lock record of task `old` started `seconds_ago` seconds before `NOW`."""
+    record: dict[str, object] = {
+        "task_id": "old",
+        "ticket_key": "DEMO-7",
+        "start": (NOW - timedelta(seconds=seconds_ago)).isoformat(),
+    }
+    record.update(fields)
+    return json.dumps(record).encode()
+
+
+def gone_line(seconds_ago: float, reason: str) -> dict[str, object]:
+    """Return the journal line of the run of `lock_of(seconds_ago)`, gone for `reason`."""
+    return {
+        "task_id": "old",
+        "ticket_key": "DEMO-7",
+        "status": "failed",
+        "start": (NOW - timedelta(seconds=seconds_ago)).isoformat(),
+        "duration": None,
+        "tokens": 0,
+        "errors": [reason],
+    }
+
+
+def timed_out(instance: Path, seconds: int) -> str:
+    """Return the reason given for a run of `instance` gone past the timeout."""
+    return (
+        f"The run holding the lock of instance directory '{instance.with_suffix('')}' "
+        f"started {seconds} seconds ago, beyond the run timeout of 1800 seconds."
+    )
+
+
+def process_gone(instance: Path, pid: int) -> str:
+    """Return the reason given for a run of `instance` whose process `pid` is gone."""
+    return (
+        f"The run holding the lock of instance directory '{instance.with_suffix('')}' "
+        f"is gone: its process {pid} no longer runs."
+    )
+
+
+def assert_taken_over(
+    answer: dict[str, object], instance: Path, gone: dict[str, object]
+) -> None:
+    """Check the run completed after journaling `gone`, and left only its journal."""
+    assert answer["status"] == "completed"
+    old, own = journal_lines(instance)
+    assert old == gone
+    assert own["task_id"] == "task-1"
+    assert own["status"] == "completed"
+    assert own["start"] == NOW.isoformat()
+    directory = instance.with_suffix("")
+    assert [path.name for path in directory.iterdir()] == [run_journal.JOURNAL_FILE]
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_run_takes_over_a_lock_held_beyond_the_timeout_and_journals_the_gone_run(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    hold_lock(instance, lock_of(1801, pid=os.getpid()))
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_taken_over(answer, instance, gone_line(1801, timed_out(instance, 1801)))
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_run_takes_over_a_lock_whose_process_is_gone_and_journals_the_gone_run(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    pid = dead_pid()
+    hold_lock(instance, lock_of(60, pid=pid))
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_taken_over(answer, instance, gone_line(60, process_gone(instance, pid)))
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_run_takes_over_a_lock_of_unknown_details_held_beyond_the_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    lock = hold_lock(instance, b"held by another run")
+    modified = NOW.timestamp() - 1801
+    os.utime(lock, (modified, modified))
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed"
+    old, own = journal_lines(instance)
+    assert old["task_id"] is None
+    assert old["ticket_key"] is None
+    assert old["start"] is None
+    assert old["errors"] == [timed_out(instance, 1801)]
+    assert own["task_id"] == "task-1"
+
+
+def test_run_refuses_a_lock_whose_process_still_runs_leaving_it_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    content = json.dumps(
+        {
+            "task_id": "old",
+            "ticket_key": "DEMO-7",
+            "start": datetime.now(UTC).isoformat(),
+            "pid": os.getpid(),
+        }
+    ).encode()
+    lock = hold_lock(instance, content)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", "A run is already in progress")
+    assert lock.read_bytes() == content
+    assert journal_lines(instance) == []
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_run_journals_the_gone_run_after_setting_a_torn_journal_line_aside(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    write_torn_journal(instance, b'{"task_id": "to', {"task_id": "first"})
+    hold_lock(instance, lock_of(1801))
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert [line["task_id"] for line in journal_lines(instance)] == [
+        "first",
+        "old",
+        "task-1",
+    ]
+
+
+def test_run_fails_as_already_in_progress_when_the_lock_is_released_before_it_is_read(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    lock = hold_lock(instance, b"held by another run")
+    real_take_lock = cli.take_lock
+
+    def take_lock_then_see_it_released(
+        directory: Path, record: dict[str, object]
+    ) -> Path:
+        try:
+            return real_take_lock(directory, record)
+        except FileExistsError:
+            lock.unlink()
+            raise
+
+    monkeypatch.setattr(cli, "take_lock", take_lock_then_see_it_released)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", "A run is already in progress")
+    assert journal_lines(instance) == []
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_run_keeps_the_gone_run_journaled_when_another_run_takes_the_lock_first(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    hold_lock(instance, lock_of(1801))
+    real_take_lock = cli.take_lock
+    calls: list[Path] = []
+
+    def take_lock_after_another_run(directory: Path, record: dict[str, object]) -> Path:
+        calls.append(directory)
+        if len(calls) == 2:
+            real_take_lock(directory, {"task_id": "other"})
+        return real_take_lock(directory, record)
+
+    monkeypatch.setattr(cli, "take_lock", take_lock_after_another_run)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", "A run is already in progress")
+    assert run_journal.read_lock(instance.with_suffix("")) == {"task_id": "other"}
+    assert journal_lines(instance) == [gone_line(1801, timed_out(instance, 1801))]
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_run_keeps_the_gone_run_journaled_when_the_lock_cannot_be_taken_after_it(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    hold_lock(instance, lock_of(1801))
+    real_take_lock = cli.take_lock
+    calls: list[Path] = []
+
+    def take_lock_then_run_out_of_space(
+        directory: Path, record: dict[str, object]
+    ) -> Path:
+        calls.append(directory)
+        if len(calls) == 2:
+            raise OSError(28, "No space left on device")
+        return real_take_lock(directory, record)
+
+    monkeypatch.setattr(cli, "take_lock", take_lock_then_run_out_of_space)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(
+        answer,
+        "task-1",
+        f"Lock file in '{instance.with_suffix('')}' cannot be written: "
+        "No space left on device",
+    )
+    assert journal_lines(instance) == [gone_line(1801, timed_out(instance, 1801))]
+    assert not (instance.with_suffix("") / run_journal.LOCK_FILE).exists()
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_run_fails_naming_the_journal_when_the_gone_run_cannot_be_journaled(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    hold_lock(instance, lock_of(1801))
+
+    def full(directory: Path, entry: object) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(cli, "append_entry", full)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(
+        answer,
+        "task-1",
+        f"Journal in '{instance.with_suffix('')}' cannot be written: "
+        "No space left on device",
+    )
+    assert not (instance.with_suffix("") / run_journal.LOCK_FILE).exists()
+
+
+def test_run_fails_naming_the_lock_when_the_held_lock_cannot_be_read(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    lock = instance.with_suffix("") / run_journal.LOCK_FILE
+    lock.mkdir(parents=True)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(
+        answer,
+        "task-1",
+        f"Lock file in '{instance.with_suffix('')}' cannot be written: ",
+    )
+    assert lock.is_dir()
+    assert journal_lines(instance) == []
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_run_fails_naming_the_lock_when_a_changed_lock_cannot_be_put_back(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    lock = hold_lock(instance, lock_of(1801))
+    real_gone_reason = cli.gone_reason
+
+    def gone_then_taken_by_another_run(
+        directory: Path, held: dict[str, object], timeout: int
+    ) -> str | None:
+        reason = real_gone_reason(directory, held, timeout)
+        lock.write_bytes(b'{"task_id": "other"}')
+        return reason
+
+    def unsupported(source: Path, target: Path) -> None:
+        raise OSError(1, "Operation not permitted")
+
+    monkeypatch.setattr(cli, "gone_reason", gone_then_taken_by_another_run)
+    monkeypatch.setattr(run_journal.os, "link", unsupported)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(
+        answer,
+        "task-1",
+        f"Lock file in '{instance.with_suffix('')}' cannot be written: "
+        "Operation not permitted",
+    )
+    assert journal_lines(instance) == []
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_run_fails_as_already_in_progress_when_the_lock_changes_before_it_is_set_aside(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    lock = hold_lock(instance, lock_of(1801))
+    real_gone_reason = cli.gone_reason
+
+    def gone_then_taken_by_another_run(
+        directory: Path, held: dict[str, object], timeout: int
+    ) -> str | None:
+        reason = real_gone_reason(directory, held, timeout)
+        lock.write_bytes(b'{"task_id": "other"}')
+        return reason
+
+    monkeypatch.setattr(cli, "gone_reason", gone_then_taken_by_another_run)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", "A run is already in progress")
+    assert lock.read_bytes() == b'{"task_id": "other"}'
+    assert journal_lines(instance) == []
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_health_is_degraded_when_the_process_of_the_run_holding_the_lock_is_gone(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    pid = dead_pid()
+    hold_lock(instance, lock_of(60, pid=pid))
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert answer == {
+        "status": "degraded",
+        "reason": process_gone(instance, pid),
+        "active": True,
+    }
+
+
+@pytest.mark.usefixtures("frozen_now")
+@pytest.mark.parametrize("pid", [True, 0, -1, "1", 1.0, None])
+def test_health_ignores_a_pid_that_is_not_a_positive_integer(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    pid: object,
+) -> None:
+    hold_lock(instance, lock_of(60, pid=pid))
+
+    assert health(monkeypatch, capsysbinary, instance)["status"] == "ok"
+
+
+def test_health_ignores_a_gone_process_when_the_lock_has_no_usable_start(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    hold_lock(instance, json.dumps({"pid": dead_pid()}).encode())
+
+    assert health(monkeypatch, capsysbinary, instance)["status"] == "ok"
