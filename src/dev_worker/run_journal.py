@@ -3,22 +3,61 @@
 The instance directory is the instance file path without its suffix
 (`instances/acme.yaml` gives `instances/acme/`). It holds `journal.jsonl`, JSON lines
 appended when a run starts and when it ends, the last line of a task giving its
-outcome, `run.lock`, present while a run is in progress, and `journal.torn`, the
-journal lines a run cut off while writing them, once a later run has set them aside.
+outcome, `run.lock`, present while a run is in progress, `run.guard`, the file locked
+while a run removes the lock, and `journal.torn`, the journal lines a run cut off while
+writing them, once a later run has set them aside.
 """
 
 import json
 import os
-import uuid
-from collections.abc import Mapping
+import sys
+import time
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 
 import psutil
 
 JOURNAL_FILE = "journal.jsonl"
 LOCK_FILE = "run.lock"
+GUARD_FILE = "run.guard"
 TORN_FILE = "journal.torn"
 CREATE_TIME_SLACK = 1.0
+GUARD_POLL_SECONDS = 0.001
+
+if sys.platform == "win32":  # pragma: not on posix
+    import msvcrt
+
+    def lock_guard(descriptor: int) -> None:
+        """Lock the first byte of the open guard file, waiting while it is locked.
+
+        Raises `OSError` when the file cannot be locked for another reason.
+        """
+        while True:
+            try:
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+            except PermissionError:
+                time.sleep(GUARD_POLL_SECONDS)
+            else:
+                return
+
+    def unlock_guard(descriptor: int) -> None:
+        """Unlock the first byte of the open guard file."""
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+
+else:  # pragma: not on Windows_NT
+    import fcntl
+
+    def lock_guard(descriptor: int) -> None:
+        """Lock the open guard file, waiting while it is locked.
+
+        Raises `OSError` when the file cannot be locked.
+        """
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+
+    def unlock_guard(descriptor: int) -> None:
+        """Unlock the open guard file."""
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
 
 
 class JournalError(ValueError):
@@ -64,15 +103,39 @@ def lock_content(record: Mapping[str, object]) -> bytes:
 def release_lock(path: Path, record: Mapping[str, object]) -> None:
     """Remove the lock file at `path` if it still holds `record`; leave it otherwise.
 
-    A lock already gone, or taken over by another run, is left as it is. Raises
-    `OSError` when the lock cannot be read or removed.
+    The lock is read and removed while holding the guard of its directory (see
+    `held_guard`), so that no run takes it over in between. A lock already gone, or
+    taken over by another run, is left as it is. Raises `OSError` when the guard
+    cannot be held or the lock cannot be read or removed.
     """
-    try:
-        content = path.read_bytes()
-    except FileNotFoundError:
+    if not path.exists():
         return
-    if content == lock_content(record):
-        path.unlink(missing_ok=True)
+    with held_guard(path.parent):
+        try:
+            content = path.read_bytes()
+        except FileNotFoundError:
+            return
+        if content == lock_content(record):
+            path.unlink(missing_ok=True)
+
+
+@contextmanager
+def held_guard(directory: Path) -> Iterator[None]:
+    """Hold the guard of `directory` for the duration of the `with` block.
+
+    The guard is an OS lock on the guard file, created if missing; it waits while
+    another run, or another thread, holds it, and the OS releases it when the process
+    holding it dies. Raises `OSError` when the guard file cannot be opened or locked.
+    """
+    descriptor = os.open(directory / GUARD_FILE, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        lock_guard(descriptor)
+        try:
+            yield
+        finally:
+            unlock_guard(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def journal_holds(directory: Path, task_id: str) -> bool:
@@ -157,31 +220,23 @@ def process_runs_since(pid: int, moment: float) -> bool:
 def set_aside_lock(directory: Path, seen: bytes) -> bool:
     """Remove the lock of `directory` if it still holds `seen`; tell whether it did.
 
-    The lock is first renamed to a name of its own, so that of several runs removing
-    the same lock only one succeeds, on Linux and macOS; on Windows, where a rename is
-    not atomic, none may. A rename or read refused for lack of rights counts as another
-    run moving the lock. A lock found to hold anything but `seen` is put back, unless
-    a new lock was taken meanwhile, in which case it is lost; one that cannot be put
-    back is left under its new name. Raises `OSError` when the lock cannot be moved,
-    read or put back.
+    The lock is read and removed while holding the guard of `directory` (see
+    `held_guard`), so that of several runs removing the same lock only one succeeds,
+    and a lock taken over since it was seen is left as it is. Raises `OSError` when
+    the guard cannot be held or the lock cannot be read or removed.
     """
     path = directory / LOCK_FILE
-    aside = directory / f"{LOCK_FILE}.{uuid.uuid4().hex}"
-    try:
-        path.rename(aside)
-    except (FileNotFoundError, PermissionError):
+    if not path.exists():
         return False
-    try:
-        content = aside.read_bytes()
-    except (FileNotFoundError, PermissionError):
-        return False
-    if content != seen:
+    with held_guard(directory):
         try:
-            os.link(aside, path)
-        except FileExistsError:
-            pass
-    aside.unlink(missing_ok=True)
-    return content == seen
+            content = path.read_bytes()
+        except FileNotFoundError:
+            return False
+        if content != seen:
+            return False
+        path.unlink(missing_ok=True)
+    return True
 
 
 def read_entries(directory: Path) -> list[dict[str, object]]:
