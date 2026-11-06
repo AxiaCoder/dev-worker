@@ -1,8 +1,9 @@
 """The run journal and the run lock of an instance, kept in the instance directory.
 
 The instance directory is the instance file path without its suffix
-(`instances/acme.yaml` gives `instances/acme/`). It holds `journal.jsonl`, one JSON
-line per run, `run.lock`, present while a run is in progress, and `journal.torn`, the
+(`instances/acme.yaml` gives `instances/acme/`). It holds `journal.jsonl`, JSON lines
+appended when a run starts and when it ends, the last line of a task giving its
+outcome, `run.lock`, present while a run is in progress, and `journal.torn`, the
 journal lines a run cut off while writing them, once a later run has set them aside.
 """
 
