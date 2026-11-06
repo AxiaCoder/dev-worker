@@ -667,9 +667,9 @@ def unsettable_torn_line(directory: Path) -> str | None:
     """Return why a run could not set aside the torn last journal line of `directory`.
 
     `None` when the journal does not end with a torn line, or when the torn file is
-    absent, a link to an absent file in an existing directory, or a regular file the
-    process can read and, unless it already ends with that line, may write. Never
-    raises.
+    absent, a link to an absent file in a directory the process may write, or a regular
+    file the process can read and, unless it already ends with that line, may write.
+    Never raises.
     """
     try:
         content = (directory / JOURNAL_FILE).read_bytes()
@@ -679,12 +679,15 @@ def unsettable_torn_line(directory: Path) -> str | None:
     if tail is None:
         return None
     torn = directory / TORN_FILE
-    if not torn.exists():
-        if torn.is_symlink() and not os.path.isdir(
-            os.path.dirname(os.path.realpath(torn))
-        ):
-            return f"Torn file '{torn}' links into a directory that does not exist."
+    try:
+        torn.stat()
+    except FileNotFoundError:
+        target_directory = os.path.dirname(os.path.realpath(torn))
+        if torn.is_symlink() and not os.access(target_directory, os.W_OK | os.X_OK):
+            return f"Torn file '{torn}' links where a run cannot create it."
         return None
+    except OSError as error:
+        return f"Torn file '{torn}' cannot be read: {os_reason(error)}"
     if not torn.is_file():
         return f"Torn file '{torn}' is not a regular file."
     try:

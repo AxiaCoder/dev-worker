@@ -1811,7 +1811,9 @@ def test_health_is_degraded_when_an_unsettable_torn_file_sits_beside_a_whole_jou
     assert_degraded_naming(answer, torn)
 
 
-def link_torn_file_into_a_missing_directory(instance: Path) -> Path:
+def link_torn_file_into_a_missing_directory(
+    instance: Path, _: pytest.MonkeyPatch
+) -> Path:
     """Write a torn journal whose torn file links into an absent directory.
 
     Return the torn file path.
@@ -1822,12 +1824,52 @@ def link_torn_file_into_a_missing_directory(instance: Path) -> Path:
     return torn
 
 
-def test_health_is_down_when_the_torn_file_links_into_a_missing_directory(
+def link_torn_file_into_an_unwritable_directory(
+    instance: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Write a torn journal whose torn file links into a directory `cli.os.access` refuses.
+
+    Return the torn file path.
+    """
+    directory = write_torn_journal(instance, b'{"task_id": "y", "st', {"task_id": "t"})
+    torn = directory / TORN_FILE
+    locked = instance.parent / "locked"
+    locked.mkdir()
+    torn.symlink_to(locked / "target")
+    refuse_writing(monkeypatch, Path(os.path.realpath(locked)))
+    return torn
+
+
+def link_torn_file_to_itself(instance: Path, _: pytest.MonkeyPatch) -> Path:
+    """Write a torn journal whose torn file is a link to itself.
+
+    Return the torn file path.
+    """
+    directory = write_torn_journal(instance, b'{"task_id": "y", "st', {"task_id": "t"})
+    torn = directory / TORN_FILE
+    torn.symlink_to(torn)
+    return torn
+
+
+UNREACHABLE_TORN_LINKS = pytest.mark.parametrize(
+    "link",
+    [
+        link_torn_file_into_a_missing_directory,
+        link_torn_file_into_an_unwritable_directory,
+        link_torn_file_to_itself,
+    ],
+    ids=["missing-directory", "unwritable-directory", "loop"],
+)
+
+
+@UNREACHABLE_TORN_LINKS
+def test_health_is_down_when_the_torn_file_links_where_a_run_cannot_append(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
+    link: Any,
 ) -> None:
-    torn = link_torn_file_into_a_missing_directory(instance)
+    torn = link(instance, monkeypatch)
 
     answer = health(monkeypatch, capsysbinary, instance)
 
@@ -1835,16 +1877,19 @@ def test_health_is_down_when_the_torn_file_links_into_a_missing_directory(
     assert str(torn) in str(answer["reason"])
 
 
-def test_health_writes_nothing_when_the_torn_file_links_into_a_missing_directory(
+@UNREACHABLE_TORN_LINKS
+def test_health_writes_nothing_when_the_torn_file_links_where_a_run_cannot_append(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
+    link: Any,
 ) -> None:
-    link_torn_file_into_a_missing_directory(instance)
+    link(instance, monkeypatch)
     before = snapshot(instance.parent)
 
     health(monkeypatch, capsysbinary, instance)
 
+    monkeypatch.undo()
     assert snapshot(instance.parent) == before
 
 
