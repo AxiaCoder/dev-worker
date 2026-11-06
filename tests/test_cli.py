@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from importlib.metadata import entry_points
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -1707,6 +1708,189 @@ def test_health_is_down_rather_than_degraded_when_the_journal_cannot_be_written(
 
     assert_down(answer, "")
     assert str(journal) in str(answer["reason"])
+
+
+INVALID_JOURNAL_LINES = [
+    pytest.param(b'{"task_id": "b", "sta\n', id="not-json"),
+    pytest.param(b"\xff\xfe\n", id="not-utf8"),
+    pytest.param(b"[" * 100_000 + b"]" * 100_000 + b"\n", id="too-deeply-nested"),
+    pytest.param(b"[1]\n", id="json-not-an-object"),
+]
+
+
+def write_invalid_journal(instance: Path, line: bytes, tail: bytes = b"") -> Path:
+    """Write a journal with `line` between two valid lines, then `tail`; return its path."""
+    directory = write_journal(instance, {"task_id": "a"})
+    journal = directory / run_journal.JOURNAL_FILE
+    with journal.open("ab") as file:
+        file.write(line + b'{"task_id": "c"}\n' + tail)
+    return journal
+
+
+@pytest.mark.parametrize("line", INVALID_JOURNAL_LINES)
+def test_health_is_down_when_a_complete_journal_line_is_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    line: bytes,
+) -> None:
+    journal = write_invalid_journal(instance, line)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert_down(answer, "")
+    assert str(journal) in str(answer["reason"])
+
+
+@pytest.mark.parametrize("line", INVALID_JOURNAL_LINES)
+def test_health_is_down_rather_than_degraded_when_an_invalid_line_precedes_a_torn_one(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    line: bytes,
+) -> None:
+    journal = write_invalid_journal(instance, line, tail=b'{"task_id": "x", "st')
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert_down(answer, "")
+    assert str(journal) in str(answer["reason"])
+
+
+@pytest.mark.parametrize("line", INVALID_JOURNAL_LINES)
+def test_health_writes_nothing_when_a_journal_line_is_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    line: bytes,
+) -> None:
+    write_invalid_journal(instance, line, tail=b'{"task_id": "x", "st')
+    before = snapshot(instance.parent)
+
+    health(monkeypatch, capsysbinary, instance)
+
+    assert snapshot(instance.parent) == before
+
+
+def test_health_is_down_when_the_journal_is_a_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    journal = instance.with_suffix("") / run_journal.JOURNAL_FILE
+    journal.mkdir(parents=True)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert_down(answer, "")
+    assert str(journal) in str(answer["reason"])
+
+
+def test_health_is_down_when_the_journal_cannot_be_read(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    journal = write_journal(instance, {"task_id": "t"}) / run_journal.JOURNAL_FILE
+    opened = Path.open
+    read = Path.read_bytes
+
+    def open_refusing_journal(path: Path, *args: Any, **kwargs: Any) -> Any:
+        if path == journal:
+            raise PermissionError(13, "Permission denied", str(path))
+        return opened(path, *args, **kwargs)
+
+    def read_refusing_journal(path: Path) -> bytes:
+        if path == journal:
+            raise PermissionError(13, "Permission denied", str(path))
+        return read(path)
+
+    monkeypatch.setattr(Path, "open", open_refusing_journal)
+    monkeypatch.setattr(Path, "read_bytes", read_refusing_journal)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert_down(answer, "")
+    assert str(journal) in str(answer["reason"])
+
+
+@pytest.mark.parametrize(
+    ("content", "fragment"),
+    [
+        pytest.param(
+            b'{"task_id": "a"}\n{"task_id": "b", "sta\n{"task_id": "c"}\n',
+            "line 2 is not valid JSON",
+            id="not-json",
+        ),
+        pytest.param(
+            b'{"task_id": "a"}\n\n  \n[1]\n',
+            "line 4 is not a JSON object.",
+            id="after-blank-lines",
+        ),
+        pytest.param(
+            b'{"task_id": "a"}\n[1]\n{"task_id": "x", "st',
+            "line 2 is not a JSON object.",
+            id="before-a-torn-line",
+        ),
+    ],
+)
+def test_health_names_the_invalid_journal_line_a_run_fails_on(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    content: bytes,
+    fragment: str,
+) -> None:
+    directory = instance.with_suffix("")
+    directory.mkdir()
+    journal = directory / run_journal.JOURNAL_FILE
+    journal.write_bytes(content)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+    failed = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_down(answer, f"Journal '{journal}': {fragment}")
+    assert_failed(failed, "task-1", fragment)
+    health_detail = str(answer["reason"]).removeprefix(f"Journal '{journal}': ")
+    run_prefix = f"Journal in '{directory}': "
+    errors = failed["errors"]
+    assert isinstance(errors, list)
+    run_details = [
+        str(error).split(run_prefix, 1)[1]
+        for error in errors
+        if run_prefix in str(error)
+    ]
+    assert run_details == [health_detail]
+
+
+def test_health_is_ok_when_the_journal_holds_blank_lines(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    directory = instance.with_suffix("")
+    directory.mkdir()
+    (directory / run_journal.JOURNAL_FILE).write_bytes(
+        b'\n{"task_id": "a"}\n\n \t\n \r\n{"task_id": "b"}\n'
+    )
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert answer == {"status": "ok", "reason": None, "active": True}
+
+
+def test_health_is_degraded_rather_than_down_when_the_unterminated_last_line_is_not_an_object(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    directory = write_torn_journal(instance, b"[1]", {"task_id": "a"})
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert_degraded_naming(answer, directory / run_journal.JOURNAL_FILE)
 
 
 @pytest.mark.usefixtures("frozen_now")
