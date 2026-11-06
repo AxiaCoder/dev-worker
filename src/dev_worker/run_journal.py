@@ -8,12 +8,16 @@ journal lines a run cut off while writing them, once a later run has set them as
 
 import json
 import os
+import uuid
 from collections.abc import Mapping
 from pathlib import Path
+
+import psutil
 
 JOURNAL_FILE = "journal.jsonl"
 LOCK_FILE = "run.lock"
 TORN_FILE = "journal.torn"
+CREATE_TIME_SLACK = 1.0
 
 
 class JournalError(ValueError):
@@ -95,11 +99,65 @@ def read_lock(directory: Path) -> dict[str, object] | None:
         return None
     except OSError:
         return {}
+    return parse_lock(content)
+
+
+def parse_lock(content: bytes) -> dict[str, object]:
+    """Return the lock record held in `content`, `{}` when it is not a UTF-8 JSON object.
+
+    A record nested too deeply gives `{}` too. Never raises.
+    """
     try:
         record = json.loads(content.decode("utf-8"))
     except (ValueError, RecursionError):
         return {}
     return record if isinstance(record, dict) else {}
+
+
+def process_runs_since(pid: int, moment: float) -> bool:
+    """Tell whether process `pid` runs and was started no later than `moment`.
+
+    `pid` must be positive; `moment` is a POSIX timestamp in seconds, allowed
+    `CREATE_TIME_SLACK` seconds of imprecision. A process started after `moment` holds
+    a reused PID and does not count; a process this one cannot inspect, for lack of
+    rights or otherwise, does.
+    """
+    try:
+        created = psutil.Process(pid).create_time()
+    except psutil.NoSuchProcess:
+        return False
+    except (psutil.Error, OSError):
+        return True
+    return created <= moment + CREATE_TIME_SLACK
+
+
+def set_aside_lock(directory: Path, seen: bytes) -> bool:
+    """Remove the lock of `directory` if it still holds `seen`; tell whether it did.
+
+    The lock is first renamed to a name of its own, so that of several runs removing
+    the same lock only one succeeds, on Linux and macOS; on Windows, where a rename is
+    not atomic, none may. A rename or read refused for lack of rights counts as another
+    run moving the lock. A lock found to hold anything but `seen` is put back, unless a new
+    lock was taken meanwhile; one that cannot be put back is left under its new name.
+    Raises `OSError` when the lock cannot be moved, read or put back.
+    """
+    path = directory / LOCK_FILE
+    aside = directory / f"{LOCK_FILE}.{uuid.uuid4().hex}"
+    try:
+        path.rename(aside)
+    except (FileNotFoundError, PermissionError):
+        return False
+    try:
+        content = aside.read_bytes()
+    except (FileNotFoundError, PermissionError):
+        return False
+    if content != seen:
+        try:
+            os.link(aside, path)
+        except FileExistsError:
+            pass
+    aside.unlink(missing_ok=True)
+    return content == seen
 
 
 def read_entries(directory: Path) -> list[dict[str, object]]:
