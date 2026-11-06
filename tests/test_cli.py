@@ -1599,6 +1599,27 @@ def test_health_is_down_when_the_journal_cannot_be_written(
     assert str(journal) in str(answer["reason"])
 
 
+def test_health_is_down_when_the_guard_cannot_be_written(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    write_journal(instance, {"task_id": "t"})
+    guard = instance.with_suffix("") / run_journal.GUARD_FILE
+    guard.touch()
+    allowed = os.access
+
+    def access(path: Path, mode: int) -> bool:
+        return Path(path) != guard and allowed(path, mode)
+
+    monkeypatch.setattr(cli.os, "access", access)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert_down(answer, "")
+    assert str(guard) in str(answer["reason"])
+
+
 def test_health_is_ok_when_the_journal_does_not_exist_yet(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
@@ -2328,7 +2349,10 @@ def assert_taken_over(
     assert own["status"] == "completed"
     assert own["start"] == NOW.isoformat()
     directory = instance.with_suffix("")
-    assert [path.name for path in directory.iterdir()] == [run_journal.JOURNAL_FILE]
+    assert sorted(path.name for path in directory.iterdir()) == [
+        run_journal.JOURNAL_FILE,
+        run_journal.GUARD_FILE,
+    ]
 
 
 @pytest.mark.usefixtures("frozen_now")
@@ -2564,26 +2588,20 @@ def test_run_fails_naming_the_lock_when_the_held_lock_cannot_be_read(
 
 
 @pytest.mark.usefixtures("frozen_now")
-def test_run_fails_naming_the_lock_when_a_changed_lock_cannot_be_put_back(
+def test_run_fails_naming_the_lock_when_its_guard_cannot_be_opened(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
 ) -> None:
     lock = hold_lock(instance, lock_of(1801))
-    real_gone_reason = cli.gone_reason
+    real_open = os.open
 
-    def gone_then_taken_by_another_run(
-        directory: Path, held: dict[str, object], timeout: int
-    ) -> str | None:
-        reason = real_gone_reason(directory, held, timeout)
-        lock.write_bytes(b'{"task_id": "other"}')
-        return reason
+    def refuse_the_guard(path: Path, flags: int, mode: int = 0o777) -> int:
+        if Path(path).name == run_journal.GUARD_FILE:
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, flags, mode)
 
-    def unsupported(source: Path, target: Path) -> None:
-        raise OSError(1, "Operation not permitted")
-
-    monkeypatch.setattr(cli, "gone_reason", gone_then_taken_by_another_run)
-    monkeypatch.setattr(run_journal.os, "link", unsupported)
+    monkeypatch.setattr(run_journal.os, "open", refuse_the_guard)
 
     answer = run_mandate(
         monkeypatch, capsysbinary, encode(valid_input()), instance=instance
@@ -2593,8 +2611,9 @@ def test_run_fails_naming_the_lock_when_a_changed_lock_cannot_be_put_back(
         answer,
         "task-1",
         f"Lock file in '{instance.with_suffix('')}' cannot be written: "
-        "Operation not permitted",
+        "Permission denied",
     )
+    assert lock.exists()
     assert journal_lines(instance) == []
 
 

@@ -4,6 +4,8 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import psutil
@@ -11,10 +13,12 @@ import pytest
 
 from dev_worker import run_journal
 from dev_worker.run_journal import (
+    GUARD_FILE,
     JOURNAL_FILE,
     LOCK_FILE,
     JournalError,
     append_entry,
+    held_guard,
     instance_directory,
     journal_entry,
     journal_holds,
@@ -22,7 +26,7 @@ from dev_worker.run_journal import (
     read_entries,
     read_lock,
     release_lock,
-    set_aside_lock,
+    remove_lock_if_unchanged,
     take_lock,
 )
 
@@ -92,6 +96,7 @@ def test_release_lock_raises_when_its_own_lock_cannot_be_removed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     lock = take_lock(tmp_path, {"task_id": "t"})
+    monkeypatch.setattr(run_journal, "LOCK_REMOVAL_SECONDS", 0.0)
 
     def refuse(path: Path, missing_ok: bool = False) -> None:
         raise PermissionError(13, "Permission denied")
@@ -341,7 +346,7 @@ def test_process_runs_since_on_a_process_it_cannot_inspect(
 
 
 def leftovers(directory: Path) -> list[str]:
-    """Return the names of the set-aside lock files left in `directory`."""
+    """Return the names of the copies of the lock file left in `directory`."""
     return sorted(
         path.name
         for path in directory.iterdir()
@@ -349,54 +354,88 @@ def leftovers(directory: Path) -> list[str]:
     )
 
 
-def test_set_aside_lock_removes_a_lock_still_holding_what_was_seen(
+def test_remove_lock_if_unchanged_removes_a_lock_still_holding_what_was_seen(
     tmp_path: Path,
 ) -> None:
     (tmp_path / LOCK_FILE).write_bytes(b"seen")
 
-    assert set_aside_lock(tmp_path, b"seen") is True
+    assert remove_lock_if_unchanged(tmp_path, b"seen") is True
 
     assert not (tmp_path / LOCK_FILE).exists()
     assert leftovers(tmp_path) == []
 
 
-def test_set_aside_lock_puts_back_a_lock_changed_since_it_was_seen(
+def test_remove_lock_if_unchanged_leaves_alone_a_lock_changed_since_it_was_seen(
     tmp_path: Path,
 ) -> None:
     (tmp_path / LOCK_FILE).write_bytes(b"newer run")
 
-    assert set_aside_lock(tmp_path, b"seen") is False
+    assert remove_lock_if_unchanged(tmp_path, b"seen") is False
 
     assert (tmp_path / LOCK_FILE).read_bytes() == b"newer run"
     assert leftovers(tmp_path) == []
 
 
-def test_set_aside_lock_gives_false_when_the_lock_is_gone(tmp_path: Path) -> None:
-    assert set_aside_lock(tmp_path, b"seen") is False
+def test_remove_lock_if_unchanged_gives_false_when_the_lock_is_gone(
+    tmp_path: Path,
+) -> None:
+    assert remove_lock_if_unchanged(tmp_path, b"seen") is False
 
     assert list(tmp_path.iterdir()) == []
 
 
-def test_set_aside_lock_keeps_a_lock_taken_while_a_changed_one_was_aside(
+def refuse_lock_removal_once(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Make the first removal of a lock file fail with a sharing violation.
+
+    Return the list of lock paths whose removal was attempted.
+    """
+    attempts: list[Path] = []
+    unlink = Path.unlink
+
+    def unlink_refused_once(path: Path, missing_ok: bool = False) -> None:
+        if path.name == LOCK_FILE:
+            attempts.append(path)
+            if len(attempts) == 1:
+                raise PermissionError(13, "Permission denied", str(path))
+        unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", unlink_refused_once)
+    return attempts
+
+
+windows_only = pytest.mark.skipif(
+    sys.platform != "win32", reason="sharing violations only happen on Windows"
+)
+
+
+@windows_only
+def test_remove_lock_if_unchanged_removes_a_lock_held_open_for_a_moment_by_another_process(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    (tmp_path / LOCK_FILE).write_bytes(b"newer run")
-    real_link = os.link
+    (tmp_path / LOCK_FILE).write_bytes(b"seen")
+    attempts = refuse_lock_removal_once(monkeypatch)
 
-    def link_after_a_new_lock(source: Path, target: Path) -> None:
-        take_lock(tmp_path, {"task_id": "newest"})
-        real_link(source, target)
+    assert remove_lock_if_unchanged(tmp_path, b"seen") is True
 
-    monkeypatch.setattr(run_journal.os, "link", link_after_a_new_lock)
+    assert len(attempts) == 2
+    assert not (tmp_path / LOCK_FILE).exists()
 
-    assert set_aside_lock(tmp_path, b"seen") is False
 
-    assert read_lock(tmp_path) == {"task_id": "newest"}
-    assert leftovers(tmp_path) == []
+@windows_only
+def test_release_lock_removes_a_lock_held_open_for_a_moment_by_another_process(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lock = take_lock(tmp_path, {"task_id": "t"})
+    attempts = refuse_lock_removal_once(monkeypatch)
+
+    release_lock(lock, {"task_id": "t"})
+
+    assert len(attempts) == 2
+    assert not lock.exists()
 
 
 def contend_for_one_lock(directory: Path, contenders: int) -> list[str]:
-    """Have `contenders` threads set aside the same lock of `directory` at once.
+    """Have `contenders` threads remove the same unchanged lock of `directory` at once.
 
     Returns one outcome per thread, sorted: `removed`, `lost` (returned `False`), or
     the representation of the error raised.
@@ -408,7 +447,7 @@ def contend_for_one_lock(directory: Path, contenders: int) -> list[str]:
     def contend() -> None:
         barrier.wait()
         try:
-            removed = set_aside_lock(directory, b"seen")
+            removed = remove_lock_if_unchanged(directory, b"seen")
         except OSError as error:
             outcomes.append(repr(error))
         else:
@@ -422,79 +461,235 @@ def contend_for_one_lock(directory: Path, contenders: int) -> list[str]:
     return sorted(outcomes)
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="a rename is atomic off Windows")
-def test_concurrent_set_aside_lock_lets_exactly_one_run_remove_it_off_windows(
+def test_concurrent_remove_lock_if_unchanged_lets_exactly_one_run_remove_it(
     tmp_path: Path,
 ) -> None:
     contenders = 8
-    for _ in range(50):
-        outcomes = contend_for_one_lock(tmp_path, contenders)
-
-        assert outcomes == ["lost"] * (contenders - 1) + ["removed"]
-        assert list(tmp_path.iterdir()) == []
-
-
-@pytest.mark.skipif(sys.platform != "win32", reason="a rename is not atomic on Windows")
-def test_concurrent_set_aside_lock_lets_at_most_one_run_remove_it_on_windows(
-    tmp_path: Path,
-) -> None:
-    contenders = 8
-    for _ in range(50):
+    for _ in range(200):
         for leftover in tmp_path.iterdir():
             leftover.unlink()
 
         outcomes = contend_for_one_lock(tmp_path, contenders)
 
-        assert set(outcomes) <= {"lost", "removed"}, outcomes
-        assert outcomes.count("removed") <= 1
+        assert outcomes == ["lost"] * (contenders - 1) + ["removed"]
+        assert [path for path in tmp_path.iterdir() if path.name != GUARD_FILE] == []
 
 
-def test_set_aside_lock_counts_a_rename_refused_for_lack_of_rights_as_lost(
+def test_release_lock_keeps_a_lock_taken_over_between_its_read_and_its_removal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    record = {"task_id": "released"}
+    path = take_lock(tmp_path, record)
+    real_read_bytes = Path.read_bytes
+    takeover_errors: list[OSError] = []
+    threads: list[threading.Thread] = []
+    taken_over: list[bool] = []
+
+    def take_over(content: bytes) -> None:
+        try:
+            remove_lock_if_unchanged(tmp_path, content)
+            take_lock(tmp_path, {"task_id": "taker"})
+        except OSError as error:
+            takeover_errors.append(error)
+
+    def read_then_let_a_takeover_in(self: Path) -> bytes:
+        content = real_read_bytes(self)
+        if self == path and not taken_over:
+            taken_over.append(True)
+            taker = threading.Thread(target=take_over, args=(content,))
+            taker.start()
+            taker.join(timeout=0.05)
+            threads.append(taker)
+        return content
+
+    monkeypatch.setattr(Path, "read_bytes", read_then_let_a_takeover_in)
+
+    release_lock(path, record)
+    for thread in threads:
+        thread.join()
+
+    assert takeover_errors == []
+    assert read_lock(tmp_path) == {"task_id": "taker"}
+
+
+def test_remove_lock_if_unchanged_waits_for_the_guard_held_by_another_run(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / LOCK_FILE).write_bytes(b"seen")
+    outcomes: list[bool] = []
+    remover = threading.Thread(
+        target=lambda: outcomes.append(remove_lock_if_unchanged(tmp_path, b"seen"))
+    )
+
+    with held_guard(tmp_path):
+        remover.start()
+        remover.join(timeout=0.05)
+
+        assert remover.is_alive()
+        assert (tmp_path / LOCK_FILE).exists()
+
+    remover.join()
+    assert outcomes == [True]
+    assert not (tmp_path / LOCK_FILE).exists()
+
+
+def test_remove_lock_if_unchanged_raises_when_the_guard_cannot_be_opened(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     (tmp_path / LOCK_FILE).write_bytes(b"seen")
+    real_open = os.open
 
-    def refuse(source: Path, target: Path) -> Path:
-        raise PermissionError(13, "Permission denied")
+    def refuse_the_guard(path: Path, flags: int, mode: int = 0o777) -> int:
+        if Path(path).name == GUARD_FILE:
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, flags, mode)
 
-    monkeypatch.setattr(Path, "rename", refuse)
+    monkeypatch.setattr(run_journal.os, "open", refuse_the_guard)
 
-    assert set_aside_lock(tmp_path, b"seen") is False
+    with pytest.raises(PermissionError):
+        remove_lock_if_unchanged(tmp_path, b"seen")
 
     assert (tmp_path / LOCK_FILE).read_bytes() == b"seen"
 
 
-def test_set_aside_lock_counts_a_lock_moved_again_before_it_is_read_as_lost(
+def test_release_lock_of_a_lock_gone_once_the_guard_is_held_does_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    record = {"task_id": "t"}
+    path = take_lock(tmp_path, record)
+    real_held_guard = run_journal.held_guard
+
+    @contextmanager
+    def remove_then_hold(directory: Path) -> Iterator[None]:
+        path.unlink()
+        with real_held_guard(directory):
+            yield
+
+    monkeypatch.setattr(run_journal, "held_guard", remove_then_hold)
+
+    release_lock(path, record)
+
+    assert not path.exists()
+
+
+def test_remove_lock_if_unchanged_of_a_lock_gone_once_the_guard_is_held_gives_false(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     (tmp_path / LOCK_FILE).write_bytes(b"seen")
-    real_rename = Path.rename
+    real_held_guard = run_journal.held_guard
 
-    def rename_then_moved_by_another_run(source: Path, target: Path) -> Path:
-        moved = real_rename(source, target)
-        real_rename(moved, tmp_path / "elsewhere")
-        return moved
+    @contextmanager
+    def remove_then_hold(directory: Path) -> Iterator[None]:
+        (directory / LOCK_FILE).unlink()
+        with real_held_guard(directory):
+            yield
 
-    monkeypatch.setattr(Path, "rename", rename_then_moved_by_another_run)
+    monkeypatch.setattr(run_journal, "held_guard", remove_then_hold)
 
-    assert set_aside_lock(tmp_path, b"seen") is False
-
-    assert [path.name for path in tmp_path.iterdir()] == ["elsewhere"]
+    assert remove_lock_if_unchanged(tmp_path, b"seen") is False
 
 
-def test_set_aside_lock_leaves_a_changed_lock_aside_when_it_cannot_be_put_back(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+HOLD_THE_GUARD = """
+import sys
+from pathlib import Path
+
+from dev_worker.run_journal import held_guard
+
+with held_guard(Path(sys.argv[1])):
+    print("held", flush=True)
+    sys.stdin.readline()
+"""
+
+
+@contextmanager
+def guard_held_by_another_process(directory: Path) -> Iterator[subprocess.Popen[str]]:
+    """Start a process that holds the guard of `directory` until its stdin closes.
+
+    Yields the process once it holds the guard; kills it on exit if still running.
+    """
+    holder = subprocess.Popen(
+        [sys.executable, "-c", HOLD_THE_GUARD, str(directory)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline() == "held\n"
+        yield holder
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def remove_lock_in_background(
+    directory: Path, seen: bytes
+) -> tuple[threading.Thread, list[bool]]:
+    """Start a thread removing the lock of `directory`; return it and its outcome list."""
+    outcomes: list[bool] = []
+    remover = threading.Thread(
+        target=lambda: outcomes.append(remove_lock_if_unchanged(directory, seen))
+    )
+    remover.start()
+    return remover, outcomes
+
+
+def test_remove_lock_if_unchanged_waits_for_the_guard_held_by_another_process(
+    tmp_path: Path,
 ) -> None:
-    (tmp_path / LOCK_FILE).write_bytes(b"newer run")
+    (tmp_path / LOCK_FILE).write_bytes(b"seen")
 
-    def unsupported(source: Path, target: Path) -> None:
-        raise OSError(1, "Operation not permitted")
+    with guard_held_by_another_process(tmp_path) as holder:
+        remover, outcomes = remove_lock_in_background(tmp_path, b"seen")
+        remover.join(timeout=0.2)
 
-    monkeypatch.setattr(run_journal.os, "link", unsupported)
+        assert remover.is_alive()
+        assert (tmp_path / LOCK_FILE).exists()
 
-    with pytest.raises(OSError, match="Operation not permitted"):
-        set_aside_lock(tmp_path, b"seen")
+        assert holder.stdin is not None
+        holder.stdin.close()
+        holder.wait(timeout=10)
 
-    (aside,) = leftovers(tmp_path)
-    assert (tmp_path / aside).read_bytes() == b"newer run"
+    remover.join(timeout=10)
+    assert outcomes == [True]
     assert not (tmp_path / LOCK_FILE).exists()
+
+
+def test_a_process_killed_while_holding_the_guard_blocks_no_later_run(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / LOCK_FILE).write_bytes(b"seen")
+
+    with guard_held_by_another_process(tmp_path) as holder:
+        holder.kill()
+        holder.wait(timeout=10)
+
+        remover, outcomes = remove_lock_in_background(tmp_path, b"seen")
+        remover.join(timeout=10)
+
+    assert not remover.is_alive()
+    assert outcomes == [True]
+    assert not (tmp_path / LOCK_FILE).exists()
+
+
+def test_release_lock_waits_for_the_guard_held_by_another_process(
+    tmp_path: Path,
+) -> None:
+    record = {"task_id": "released"}
+    path = take_lock(tmp_path, record)
+    released = threading.Thread(target=release_lock, args=(path, record))
+
+    with guard_held_by_another_process(tmp_path) as holder:
+        released.start()
+        released.join(timeout=0.2)
+
+        assert released.is_alive()
+        assert path.exists()
+
+        assert holder.stdin is not None
+        holder.stdin.close()
+        holder.wait(timeout=10)
+
+    released.join(timeout=10)
+    assert not released.is_alive()
+    assert not path.exists()

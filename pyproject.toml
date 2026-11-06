@@ -33,6 +33,7 @@ branch = true
 [tool.coverage.report]
 fail_under = 100
 show_missing = true
+exclude_also = ["pragma: not on ${OS-posix}"]
 
 [dependency-groups]
 dev = [
