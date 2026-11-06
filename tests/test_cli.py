@@ -1300,6 +1300,27 @@ def test_state_shows_a_task_left_running_as_interrupted_while_another_holds_the_
     ]
 
 
+def test_state_keeps_running_a_task_that_takes_the_lock_while_state_is_read(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    directory = instance.with_suffix("")
+    directory.mkdir()
+    running = {"task_id": "a", "status": "running"}
+    real_read_entries = cli.read_entries
+
+    def run_starts_first(read_from: Path) -> list[dict[str, object]]:
+        if not (read_from / run_journal.LOCK_FILE).exists():
+            run_journal.take_lock(read_from, {"task_id": "a"})
+            run_journal.append_entry(read_from, running)
+        return real_read_entries(read_from)
+
+    monkeypatch.setattr(cli, "read_entries", run_starts_first)
+
+    assert common(state(monkeypatch, capsysbinary, instance))["recent"] == [running]
+
+
 def test_state_takes_each_line_without_a_string_task_id_as_a_task_of_its_own(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],

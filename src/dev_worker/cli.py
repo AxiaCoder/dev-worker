@@ -381,14 +381,16 @@ def answerable(record: Mapping[str, object]) -> bool:
 
 
 def task_entries(
-    entries: Sequence[Mapping[str, object]], lock: Mapping[str, object] | None
+    entries: Sequence[Mapping[str, object]],
+    locks: Sequence[Mapping[str, object] | None],
 ) -> list[Mapping[str, object]]:
     """Return one entry per task of the journal `entries`, its last line, oldest first.
 
     Tasks are ordered by their first line; a line whose `task_id` is not a string is a
-    task of its own. `lock` is the lock record, `None` when no run holds the lock. A
-    task whose last line is `running` is shown as `failed`, interrupted, unless the
-    lock is held by that task or by a run whose task is unknown.
+    task of its own. `locks` are the lock records read before and after `entries`,
+    `None` when no run held the lock. A task whose last line is `running` is shown as
+    `failed`, interrupted, unless one of `locks` is held by that task or by a run
+    whose task is unknown.
     """
     tasks: dict[object, Mapping[str, object]] = {}
     for entry in entries:
@@ -396,7 +398,8 @@ def task_entries(
         tasks[task_id if isinstance(task_id, str) else object()] = entry
     return [
         interrupted(entry)
-        if entry.get("status") == "running" and not held_by(lock, entry)
+        if entry.get("status") == "running"
+        and not any(held_by(lock, entry) for lock in locks)
         else entry
         for entry in tasks.values()
     ]
@@ -441,7 +444,8 @@ def read_state(instance_path: Path) -> State:
         lock = {}
     entries = (
         task_entries(
-            [entry for entry in read_entries(directory) if answerable(entry)], lock
+            [entry for entry in read_entries(directory) if answerable(entry)],
+            [lock, read_lock(directory)],
         )
         if directory
         else []
