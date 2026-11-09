@@ -12,8 +12,14 @@ from dev_worker.repositories import PullRequest, RepositoryError
 FAKE_GH = Path(__file__).with_name("fake_gh.py")
 TOKEN = "s3cret-token-value"
 REPOSITORY = Repository(type="github", name="octo/widgets", token_env="GITHUB_TOKEN")
-PULL = PullRequest(number=42, url="https://github.com/octo/widgets/pull/42")
-LISTED = {"number": 42, "url": "https://github.com/octo/widgets/pull/42"}
+HEAD = "0123456789abcdef0123456789abcdef01234567"
+MOVED = "fedcba9876543210fedcba9876543210fedcba98"
+PULL = PullRequest(number=42, url="https://github.com/octo/widgets/pull/42", head=HEAD)
+LISTED = {
+    "number": 42,
+    "url": "https://github.com/octo/widgets/pull/42",
+    "headRefOid": HEAD,
+}
 
 
 def run(status: str, conclusion: str | None = None) -> dict[str, Any]:
@@ -29,8 +35,8 @@ def context(state: str) -> dict[str, Any]:
     return {"__typename": "StatusContext", "context": "ci/legacy", "state": state}
 
 
-def rollup(*checks: dict[str, Any]) -> dict[str, Any]:
-    return {"statusCheckRollup": list(checks)}
+def rollup(*checks: dict[str, Any], head: str = HEAD) -> dict[str, Any]:
+    return {"headRefOid": head, "statusCheckRollup": list(checks)}
 
 
 @pytest.fixture
@@ -68,7 +74,7 @@ def test_find_pull_request_returns_the_open_pull_request_of_the_branch(
     assert found == PULL
     assert called(record)["argv"] == [
         "pr", "list", "--head=feat/widgets", "--state", "open",
-        "--json", "number,url", "--repo", "octo/widgets",
+        "--json", "number,url,headRefOid", "--repo", "octo/widgets",
     ]  # fmt: skip
     assert called(record)["env"] == {"GH_TOKEN": TOKEN, "GH_PROMPT_DISABLED": "1"}
 
@@ -120,6 +126,8 @@ def test_a_branch_that_looks_like_a_flag_stays_the_head_value(
         ({"number": 42}, "answer"),
         ([{"number": "x", "url": "u"}], "0.number"),
         ([{"number": 42}], "0.url"),
+        ([{"number": 42, "url": "u"}], "0.headRefOid"),
+        ([{"number": 42, "url": "u", "headRefOid": 7}], "0.headRefOid"),
     ],
 )
 def test_a_listing_of_the_wrong_shape_raises(
@@ -144,7 +152,8 @@ def test_read_ci_asks_for_the_check_rollup(
 
     assert repository().read_ci(PULL) == "passed"
     assert called(record)["argv"] == [
-        "pr", "view", "42", "--json", "statusCheckRollup", "--repo", "octo/widgets",
+        "pr", "view", "42", "--json", "headRefOid,statusCheckRollup",
+        "--repo", "octo/widgets",
     ]  # fmt: skip
     assert called(record)["env"]["GH_TOKEN"] == TOKEN
 
@@ -195,11 +204,27 @@ def test_a_pull_request_without_checks_raises(
         repository().read_ci(PULL)
 
 
+def test_read_ci_refuses_a_pull_request_whose_head_has_moved(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, rollup(run("COMPLETED", "SUCCESS"), head=MOVED))
+
+    with pytest.raises(RepositoryError) as raised:
+        repository().read_ci(PULL)
+
+    assert str(raised.value) == (
+        f"the head of pull request #42 has moved from {HEAD} to {MOVED} "
+        "since it was found"
+    )
+
+
 @pytest.mark.parametrize(
     ("stdout", "where"),
     [
-        ({}, "statusCheckRollup"),
-        ({"statusCheckRollup": None}, "statusCheckRollup"),
+        ({"headRefOid": HEAD}, "statusCheckRollup"),
+        ({"headRefOid": HEAD, "statusCheckRollup": None}, "statusCheckRollup"),
+        ({"statusCheckRollup": [run("COMPLETED", "SUCCESS")]}, "headRefOid"),
+        ({**rollup(run("COMPLETED", "SUCCESS")), "headRefOid": None}, "headRefOid"),
         (rollup({"__typename": "Other"}), "statusCheckRollup.0"),
         (rollup({"state": "SUCCESS"}), "statusCheckRollup.0"),
         (rollup(context("WEIRD")), "statusCheckRollup.0"),
@@ -229,9 +254,31 @@ def test_merge_squashes_the_pull_request(
     repository().merge(PULL)
 
     assert called(record)["argv"] == [
-        "pr", "merge", "42", "--squash", "--repo", "octo/widgets",
+        "pr", "merge", "42", "--squash", "--match-head-commit", HEAD,
+        "--repo", "octo/widgets",
     ]  # fmt: skip
     assert called(record)["env"]["GH_TOKEN"] == TOKEN
+
+
+def test_a_merge_refused_because_the_head_moved_says_so(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(
+        monkeypatch,
+        "",
+        stderr=(
+            "GraphQL: Head branch was modified. Review and try the merge again. "
+            "(mergePullRequest)\n"
+        ),
+        code=1,
+    )
+
+    with pytest.raises(RepositoryError) as raised:
+        repository().merge(PULL)
+
+    assert str(raised.value) == (
+        f"the head of pull request #42 has moved since commit {HEAD}; it was not merged"
+    )
 
 
 def test_merge_failure_is_given_without_the_token(
