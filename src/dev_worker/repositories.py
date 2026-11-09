@@ -59,7 +59,6 @@ class CodeRepository(Protocol):
         """Merge `pull_request` as a single squashed commit, only while its head is still `pull_request.head`.
 
         Raises `HeadMovedError` when the head has moved, and `RepositoryError` on any other
-        failure. When the call
-        timed out, the merge may still have happened: the pull request is to be read again,
-        not assumed open.
+        failure. When the call timed out, the merge may still have happened: the pull
+        request is to be read again, not assumed open.
         """
