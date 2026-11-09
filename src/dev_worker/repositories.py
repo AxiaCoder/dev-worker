@@ -14,6 +14,13 @@ class RepositoryError(Exception):
     """
 
 
+class HeadMovedError(RepositoryError):
+    """Raised when the head of a pull request is no longer the commit it pointed to when found.
+
+    The pull request is to be found again and its CI read anew.
+    """
+
+
 @dataclass(frozen=True)
 class PullRequest:
     """An open pull request, by its number, its web address and the commit its head pointed to when found.
@@ -43,15 +50,15 @@ class CodeRepository(Protocol):
     def read_ci(self, pull_request: PullRequest) -> CiState:
         """Return the state of the CI of the commit `pull_request.head`.
 
-        Raises `RepositoryError` when it cannot be read, no check is reported, or the head
-        of the pull request has moved since it was found.
+        Raises `HeadMovedError` when the head of the pull request has moved since it was
+        found, and `RepositoryError` when the CI cannot be read or no check is reported.
         """
         ...
 
     def merge(self, pull_request: PullRequest) -> None:
         """Merge `pull_request` as a single squashed commit, only while its head is still `pull_request.head`.
 
-        Raises `RepositoryError` on failure, including when the head has moved. When the call
-        timed out, the merge may still have happened: the pull request is to be read again,
-        not assumed open.
+        Raises `HeadMovedError` when the head has moved, and `RepositoryError` on any other
+        failure. When the call timed out, the merge may still have happened: the pull
+        request is to be read again, not assumed open.
         """

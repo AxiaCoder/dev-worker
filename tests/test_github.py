@@ -10,7 +10,7 @@ import pytest
 
 from dev_worker.github import GitHubRepository
 from dev_worker.instance import Repository
-from dev_worker.repositories import PullRequest, RepositoryError
+from dev_worker.repositories import HeadMovedError, PullRequest, RepositoryError
 
 FAKE_GH = Path(__file__).with_name("fake_gh.py")
 TOKEN = "s3cret-token-value"
@@ -212,7 +212,7 @@ def test_read_ci_refuses_a_pull_request_whose_head_has_moved(
 ) -> None:
     answer(monkeypatch, rollup(run("COMPLETED", "SUCCESS"), head=MOVED))
 
-    with pytest.raises(RepositoryError) as raised:
+    with pytest.raises(HeadMovedError) as raised:
         repository().read_ci(PULL)
 
     assert str(raised.value) == (
@@ -276,12 +276,56 @@ def test_a_merge_refused_because_the_head_moved_says_so(
         code=1,
     )
 
-    with pytest.raises(RepositoryError) as raised:
+    with pytest.raises(HeadMovedError) as raised:
         repository().merge(PULL)
 
     assert str(raised.value) == (
         f"the head of pull request #42 has moved since commit {HEAD}; it was not merged"
     )
+
+
+@pytest.mark.parametrize(
+    ("stdout", "stderr", "code"),
+    [
+        (rollup(), "", 0),
+        ({"headRefOid": HEAD}, "", 0),
+        ("<html>", "", 0),
+        (rollup(run("COMPLETED", "SUCCESS")), "HTTP 502\n", 1),
+        ("", "", 4),
+    ],
+)
+def test_read_ci_failures_other_than_a_moved_head_are_not_told_as_one(
+    record: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: object,
+    stderr: str,
+    code: int,
+) -> None:
+    answer(monkeypatch, stdout, stderr=stderr, code=code)
+
+    with pytest.raises(RepositoryError) as raised:
+        repository().read_ci(PULL)
+
+    assert type(raised.value) is RepositoryError
+
+
+@pytest.mark.parametrize(
+    ("stderr", "code"),
+    [
+        ("X Pull request octo/widgets#42 is not mergeable\n", 1),
+        ("HTTP 502\n", 1),
+        ("", 4),
+    ],
+)
+def test_merge_failures_other_than_a_moved_head_are_not_told_as_one(
+    record: Path, monkeypatch: pytest.MonkeyPatch, stderr: str, code: int
+) -> None:
+    answer(monkeypatch, "", stderr=stderr, code=code)
+
+    with pytest.raises(RepositoryError) as raised:
+        repository().merge(PULL)
+
+    assert type(raised.value) is RepositoryError
 
 
 def test_merge_failure_is_given_without_the_token(
