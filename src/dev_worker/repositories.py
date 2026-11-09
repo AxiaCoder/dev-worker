@@ -16,10 +16,14 @@ class RepositoryError(Exception):
 
 @dataclass(frozen=True)
 class PullRequest:
-    """An open pull request, by its number in the repository and its web address."""
+    """An open pull request, by its number, its web address and the commit its head pointed to when found.
+
+    `head` is the full SHA of that commit; the CI read and the merge are tied to it.
+    """
 
     number: int
     url: str
+    head: str
 
 
 class CodeRepository(Protocol):
@@ -33,11 +37,15 @@ class CodeRepository(Protocol):
         ...
 
     def read_ci(self, pull_request: PullRequest) -> CiState:
-        """Return the state of the CI of `pull_request`.
+        """Return the state of the CI of the commit `pull_request.head`.
 
-        Raises `RepositoryError` when it cannot be read or no check is reported.
+        Raises `RepositoryError` when it cannot be read, no check is reported, or the head
+        of the pull request has moved since it was found.
         """
         ...
 
     def merge(self, pull_request: PullRequest) -> None:
-        """Merge `pull_request` as a single squashed commit; raise `RepositoryError` on failure."""
+        """Merge `pull_request` as a single squashed commit, only while its head is still `pull_request.head`.
+
+        Raises `RepositoryError` on failure, including when the head has moved.
+        """

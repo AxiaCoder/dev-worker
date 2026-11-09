@@ -14,6 +14,7 @@ from dev_worker.repositories import CiState, PullRequest, RepositoryError
 
 REDACTED = "[token]"
 COMPLETED = "COMPLETED"
+HEAD_MOVED = "Head branch was modified"
 PASSING_CONCLUSIONS = frozenset({"SUCCESS", "NEUTRAL", "SKIPPED"})
 STATUS_STATES: dict[str, CiState] = {
     "SUCCESS": "passed",
@@ -25,10 +26,11 @@ STATUS_STATES: dict[str, CiState] = {
 
 
 class _ListedPullRequest(BaseModel):
-    """A pull request as `gh pr list --json number,url` writes it."""
+    """A pull request as `gh pr list --json number,url,headRefOid` writes it."""
 
     number: int
     url: str
+    headRefOid: str
 
 
 _LIST_ANSWER = TypeAdapter(list[_ListedPullRequest])
@@ -50,8 +52,9 @@ class _StatusContext(BaseModel):
 
 
 class _ViewAnswer(BaseModel):
-    """The answer of `gh pr view --json statusCheckRollup`."""
+    """The answer of `gh pr view --json headRefOid,statusCheckRollup`."""
 
+    headRefOid: str
     statusCheckRollup: list[
         Annotated[_CheckRun | _StatusContext, Field(discriminator="typename")]
     ]
@@ -110,7 +113,7 @@ class GitHubRepository:
                 "--state",
                 "open",
                 "--json",
-                "number,url",
+                "number,url,headRefOid",
             ],
         )
         try:
@@ -124,23 +127,32 @@ class GitHubRepository:
             raise RepositoryError(
                 f"the branch {branch} has more than one open pull request: {numbers}"
             )
-        return PullRequest(number=listed[0].number, url=listed[0].url)
+        found = listed[0]
+        return PullRequest(number=found.number, url=found.url, head=found.headRefOid)
 
     def read_ci(self, pull_request: PullRequest) -> CiState:
         """Return `"failed"` when a check failed, else `"running"` when one still runs, else `"passed"`.
 
-        Raises `RepositoryError` when the token variable is not set, `gh` fails, its answer
-        cannot be read, or the pull request reports no check at all.
+        The checks are those of the head commit, read in the same answer as its SHA. Raises
+        `RepositoryError` when the token variable is not set, `gh` fails, its answer cannot
+        be read, the head is no longer `pull_request.head`, or no check is reported.
         """
         number = pull_request.number
         action = f"reading the CI of pull request #{number}"
         answer = self._run_json(
-            action, ["pr", "view", str(number), "--json", "statusCheckRollup"]
+            action,
+            ["pr", "view", str(number), "--json", "headRefOid,statusCheckRollup"],
         )
         try:
-            checks = _ViewAnswer.model_validate(answer).statusCheckRollup
+            view = _ViewAnswer.model_validate(answer)
         except ValidationError as error:
             raise self._unreadable(action, error) from None
+        if view.headRefOid != pull_request.head:
+            raise RepositoryError(
+                f"the head of pull request #{number} has moved from "
+                f"{pull_request.head} to {view.headRefOid} since it was found"
+            )
+        checks = view.statusCheckRollup
         if not checks:
             raise RepositoryError(f"no CI check is reported on pull request #{number}")
         states = {_check_state(check) for check in checks}
@@ -151,18 +163,34 @@ class GitHubRepository:
         return "passed"
 
     def merge(self, pull_request: PullRequest) -> None:
-        """Merge `pull_request` as one squashed commit.
+        """Merge `pull_request` as one squashed commit, which GitHub refuses once its head is not `pull_request.head`.
 
         On a base branch that requires a merge queue, `gh` only enqueues the pull request,
         and this returns as if it were merged.
 
-        Raises `RepositoryError` when the token variable is not set or `gh` fails.
+        Raises `RepositoryError` when the token variable is not set or `gh` fails; when the
+        refusal is GitHub's for a moved head, the sentence says so.
         """
         number = pull_request.number
-        self._run(
-            f"merging pull request #{number}",
-            ["pr", "merge", str(number), "--squash"],
-        )
+        try:
+            self._run(
+                f"merging pull request #{number}",
+                [
+                    "pr",
+                    "merge",
+                    str(number),
+                    "--squash",
+                    "--match-head-commit",
+                    pull_request.head,
+                ],
+            )
+        except RepositoryError as error:
+            if HEAD_MOVED not in str(error):
+                raise
+            raise RepositoryError(
+                f"the head of pull request #{number} has moved since commit "
+                f"{pull_request.head}; it was not merged"
+            ) from None
 
     def _token(self) -> str:
         """Return the token held by the variable `token_env` names; raise `RepositoryError` if unset."""
