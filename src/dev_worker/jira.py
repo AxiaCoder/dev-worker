@@ -161,12 +161,53 @@ class JiraTracker:
             )
         return token
 
+    def check_access(self) -> None:
+        """Raise `TrackerError` unless `twg doctor` reaches Jira with the instance credentials.
+
+        Access holds only when the doctor reports its connectivity check passed, whatever
+        its exit code. Raises when the token variable is not set, `twg` cannot be started,
+        does not answer within the timeout, or reports no passing connectivity check; the
+        sentence carries the doctor's own message when it gives one. Changes nothing on Jira.
+        """
+        answer, done, token = self._call("checking access to Jira", ["doctor"])
+        connectivity = _connectivity(answer)
+        if connectivity.get("ok") is True:
+            return
+        message = connectivity.get("message")
+        if isinstance(message, str) and message.strip():
+            reason = message.strip()
+        else:
+            reason = _failure_reason(answer, done)
+        raise TrackerError(
+            f"twg cannot reach Jira with the instance credentials: {reason}".replace(
+                token, REDACTED
+            )
+        )
+
     def _run(self, action: str, arguments: list[str]) -> object:
         """Run `twg` with `arguments` and JSON output; return its decoded answer.
 
         `action` names the call in error sentences. Raises `TrackerError` when the
         token variable is not set, `twg` cannot be started, does not answer within the
         timeout, exits nonzero, answers `"ok": false`, or answers something that is not JSON.
+        """
+        answer, done, token = self._call(action, arguments)
+        failed = isinstance(answer, dict) and answer.get("ok") is False
+        if done.returncode != 0 or failed:
+            reason = _failure_reason(answer, done).replace(token, REDACTED)
+            raise TrackerError(f"twg failed while {action}: {reason}")
+        if answer is _UNREADABLE:
+            raise TrackerError(f"the answer of twg to {action} is not JSON")
+        return answer
+
+    def _call(
+        self, action: str, arguments: list[str]
+    ) -> tuple[object, subprocess.CompletedProcess[str], str]:
+        """Run `twg` with `arguments` and JSON output, whatever its exit code.
+
+        Returns its decoded answer (`_UNREADABLE` when not JSON), the finished process and
+        the token passed. Raises `TrackerError` when the token variable is not set, `twg`
+        cannot be started, or does not answer within the timeout.
         """
         token = self._token()
         environment = {
@@ -200,14 +241,14 @@ class JiraTracker:
         except OSError as error:
             reason = (error.strerror or type(error).__name__).replace(token, REDACTED)
             raise TrackerError(f"twg could not be started: {reason}") from None
-        answer = _parse_json(done.stdout)
-        failed = isinstance(answer, dict) and answer.get("ok") is False
-        if done.returncode != 0 or failed:
-            reason = _failure_reason(answer, done).replace(token, REDACTED)
-            raise TrackerError(f"twg failed while {action}: {reason}")
-        if answer is _UNREADABLE:
-            raise TrackerError(f"the answer of twg to {action} is not JSON")
-        return answer
+        return _parse_json(done.stdout), done, token
+
+
+def _connectivity(answer: object) -> dict[str, object]:
+    """Return the `data.connectivity` object of a `twg doctor` answer, empty when absent."""
+    data = answer.get("data") if isinstance(answer, dict) else None
+    connectivity = data.get("connectivity") if isinstance(data, dict) else None
+    return connectivity if isinstance(connectivity, dict) else {}
 
 
 def _failure_reason(answer: object, done: subprocess.CompletedProcess[str]) -> str:

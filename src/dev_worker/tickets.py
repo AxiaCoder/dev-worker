@@ -36,6 +36,10 @@ class Ticket:
 class TicketTracker(Protocol):
     """A ticket tracker: reads a ticket by key and changes its status."""
 
+    def check_access(self) -> None:
+        """Raise `TrackerError` when the tracker cannot be reached with the instance credentials; change nothing."""
+        ...
+
     def read(self, key: str) -> Ticket:
         """Return the ticket `key`; raise `TrackerError` when it cannot be read."""
         ...

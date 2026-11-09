@@ -25,9 +25,17 @@ from dev_worker.contract import (
     MandateOutput,
     State,
 )
+from dev_worker.github import GitHubRepository
 from dev_worker.header import Header, HeaderError, load_worker_file
-from dev_worker.instance import Instance, InstanceError, Tracker, load_instance
+from dev_worker.instance import (
+    Instance,
+    InstanceError,
+    Repository,
+    Tracker,
+    load_instance,
+)
 from dev_worker.jira import JiraTracker
+from dev_worker.repositories import CodeRepository, RepositoryError
 from dev_worker.run_journal import (
     GUARD_FILE,
     JOURNAL_FILE,
@@ -133,6 +141,28 @@ def check_ticket_key(mandate: MandateInput, instance: Instance) -> str | None:
 def make_tracker(tracker: Tracker) -> TicketTracker:
     """Return the ticket tracker that `tracker` of an instance describes."""
     return JiraTracker(tracker)
+
+
+def make_repository(repository: Repository) -> CodeRepository:
+    """Return the code repository that `repository` of an instance describes."""
+    return GitHubRepository(repository)
+
+
+def unreachable_connector(instance: Instance) -> str | None:
+    """Return why the tracker or then the repository of `instance` cannot be reached, `None` when both can.
+
+    Each is asked to check its access with the instance credentials; nothing is changed
+    on either. Never raises.
+    """
+    try:
+        make_tracker(instance.tracker).check_access()
+    except TrackerError as error:
+        return f"The tracker cannot be reached: {error}"
+    try:
+        make_repository(instance.repository).check_access()
+    except RepositoryError as error:
+        return f"The repository cannot be reached: {error}"
+    return None
 
 
 def check_ticket_ready(key: str, instance: Instance) -> str | None:
@@ -648,7 +678,9 @@ def read_health(instance_path: Path) -> Health:
     no suffix, the instance directory or its existing journal or guard file cannot be
     written (see `unwritable_instance_directory`), or
     the journal cannot be read the way a run reads it (see `unreadable_journal`), or
-    its torn last line cannot be set aside (see `unsettable_torn_line`); `degraded`
+    its torn last line cannot be set aside (see `unsettable_torn_line`), or the
+    tracker or the repository cannot be reached with the instance credentials (see
+    `unreachable_connector`); `degraded`
     when the run holding the lock is gone (see `gone_reason`), which the next run mends
     by taking the lock over, or the journal holds a torn line (see
     `torn_journal_line`); `ok` otherwise. Writes nothing and never raises.
@@ -669,6 +701,9 @@ def read_health(instance_path: Path) -> Health:
     unsettable = unsettable_torn_line(directory)
     if unsettable is not None:
         return Health(status="down", reason=writable_text(unsettable), active=True)
+    unreachable = unreachable_connector(instance)
+    if unreachable is not None:
+        return Health(status="down", reason=writable_text(unreachable), active=True)
     lock = read_lock(directory)
     timeout = instance.limits["run_timeout_seconds"]
     gone = None if lock is None else gone_reason(directory, lock, timeout)
