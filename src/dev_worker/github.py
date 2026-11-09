@@ -1,6 +1,6 @@
 """The GitHub code repository, reached through GitHub's `gh` command line.
 
-The access check is bounded: a `gh` that has not answered within `GH_TIMEOUT_SECONDS`
+Each `gh` call is bounded: one that has not answered within `GH_TIMEOUT_SECONDS`
 (60 seconds) is stopped and raises `RepositoryError`.
 """
 
@@ -92,8 +92,8 @@ class GitHubRepository:
     `command` is the program and leading arguments that run `gh`. Each call passes
     `GH_PROMPT_DISABLED` and, as `GH_TOKEN`, the value of the variable
     `repository.token_env` names, read at call time; each call on the repository also
-    passes `--repo` with the repository name. `timeout` is the
-    bound of the access check, in seconds.
+    passes `--repo` with the repository name. `timeout` is the bound of each call, in
+    seconds.
     """
 
     def __init__(
@@ -117,7 +117,6 @@ class GitHubRepository:
             f"checking access to {GITHUB_HOST}",
             ["auth", "status", "--active", "--hostname", GITHUB_HOST],
             on_repository=False,
-            timeout=self._timeout,
         )
 
     def find_pull_request(self, branch: str) -> PullRequest | None:
@@ -194,7 +193,9 @@ class GitHubRepository:
         and this returns as if it were merged.
 
         Raises `RepositoryError` when the token variable is not set or `gh` fails; when the
-        refusal is GitHub's for a moved head, the sentence says so.
+        refusal is GitHub's for a moved head, the sentence says so. After a timeout the
+        merge may still have happened: the pull request is to be read again, not assumed
+        open.
         """
         number = pull_request.number
         try:
@@ -250,14 +251,13 @@ class GitHubRepository:
         arguments: list[str],
         *,
         on_repository: bool = True,
-        timeout: float | None = None,
     ) -> str:
         """Run `gh` with `arguments` and return what it wrote to stdout.
 
-        `--repo` is added with the repository name when `on_repository` is true. `timeout`
-        bounds the call, in seconds; `None` leaves it unbounded. `action` names the call in
-        error sentences. Raises `RepositoryError` when the token variable is not set, `gh`
-        cannot be started, does not answer within `timeout`, or exits nonzero.
+        `--repo` is added with the repository name when `on_repository` is true. `action`
+        names the call in error sentences. Raises `RepositoryError` when the token variable
+        is not set, `gh` cannot be started, does not answer within the timeout, or exits
+        nonzero.
         """
         token = self._token()
         environment = {**os.environ, "GH_TOKEN": token, "GH_PROMPT_DISABLED": "1"}
@@ -271,11 +271,11 @@ class GitHubRepository:
                 encoding="utf-8",
                 errors="replace",
                 check=False,
-                timeout=timeout,
+                timeout=self._timeout,
             )
         except subprocess.TimeoutExpired:
             raise RepositoryError(
-                f"gh did not answer within {timeout:g} seconds while {action}"
+                f"gh did not answer within {self._timeout:g} seconds while {action}"
             ) from None
         except OSError as error:
             reason = (error.strerror or type(error).__name__).replace(token, REDACTED)

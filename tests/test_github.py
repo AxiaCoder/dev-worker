@@ -1,6 +1,8 @@
 import json
 import subprocess
 import sys
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -543,4 +545,46 @@ def test_check_access_is_bounded_by_default(
     repository().check_access()
     repository().merge(PULL)
 
-    assert bounds == [60.0, None]
+    assert bounds == [60.0, 60.0]
+
+
+@pytest.mark.parametrize(
+    ("call", "stdout", "action"),
+    [
+        (
+            lambda github: github.find_pull_request("feature/x"),
+            [LISTED],
+            "finding the pull request of feature/x",
+        ),
+        (
+            lambda github: github.read_ci(PULL),
+            rollup(run("COMPLETED", "SUCCESS")),
+            "reading the CI of pull request #42",
+        ),
+        (lambda github: github.merge(PULL), "", "merging pull request #42"),
+        (lambda github: github.check_access(), "", "checking access to github.com"),
+    ],
+    ids=["find_pull_request", "read_ci", "merge", "check_access"],
+)
+def test_gh_that_does_not_answer_is_stopped_at_the_timeout(
+    record: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    call: Callable[[GitHubRepository], object],
+    stdout: object,
+    action: str,
+) -> None:
+    answer(monkeypatch, stdout)
+    monkeypatch.setenv("FAKE_GH_SLEEP", "30")
+    github = GitHubRepository(
+        REPOSITORY, command=[sys.executable, str(FAKE_GH)], timeout=0.5
+    )
+
+    started = time.monotonic()
+    with pytest.raises(RepositoryError) as raised:
+        call(github)
+    elapsed = time.monotonic() - started
+
+    assert str(raised.value) == f"gh did not answer within 0.5 seconds while {action}"
+    assert TOKEN not in str(raised.value)
+    assert record.exists()
+    assert elapsed < 10
