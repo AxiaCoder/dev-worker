@@ -1,5 +1,7 @@
 import json
 import sys
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -339,3 +341,32 @@ def test_set_status_with_an_answer_that_is_not_json_raises(
         TrackerError, match="answer of twg to moving ABC-218 to 'Done' is not JSON"
     ):
         tracker().set_status("ABC-218", "Done")
+
+
+@pytest.mark.parametrize(
+    ("call", "action"),
+    [
+        (lambda jira: jira.read("ABC-218"), "reading ABC-218"),
+        (lambda jira: jira.set_status("ABC-218", "Done"), "moving ABC-218 to 'Done'"),
+    ],
+    ids=["read", "set_status"],
+)
+def test_twg_that_does_not_answer_is_stopped_at_the_timeout(
+    record: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    call: Callable[[JiraTracker], object],
+    action: str,
+) -> None:
+    answer(monkeypatch, TICKET)
+    monkeypatch.setenv("FAKE_TWG_SLEEP", "30")
+    jira = JiraTracker(TRACKER, command=[sys.executable, str(FAKE_TWG)], timeout=0.5)
+
+    started = time.monotonic()
+    with pytest.raises(TrackerError) as raised:
+        call(jira)
+    elapsed = time.monotonic() - started
+
+    assert str(raised.value) == f"twg did not answer within 0.5 seconds while {action}"
+    assert TOKEN not in str(raised.value)
+    assert record.exists()
+    assert elapsed < 10

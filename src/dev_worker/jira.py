@@ -1,4 +1,8 @@
-"""The Jira ticket tracker, reached through Atlassian's `twg` command line."""
+"""The Jira ticket tracker, reached through Atlassian's `twg` command line.
+
+Each `twg` call is bounded: one that has not answered within `TWG_TIMEOUT_SECONDS`
+(60 seconds) is stopped and raises `TrackerError`.
+"""
 
 import json
 import os
@@ -16,6 +20,7 @@ from dev_worker.tickets import Blocker, Ticket, TrackerError
 TICKET_KEY = re.compile(r"[A-Z][A-Z0-9_]*-[0-9]+")
 BLOCKS = "Blocks"
 REDACTED = "[token]"
+TWG_TIMEOUT_SECONDS = 60.0
 
 
 class _Status(BaseModel):
@@ -87,13 +92,19 @@ class JiraTracker:
 
     `command` is the program and leading arguments that run `twg`. Each call passes
     `TWG_SITE`, `TWG_USER` and, as `TWG_TOKEN`, the value of the variable `tracker.token_env`
-    names, read at call time.
+    names, read at call time. `timeout` is the bound of each call, in seconds.
     """
 
-    def __init__(self, tracker: Tracker, command: Sequence[str] = ("twg",)) -> None:
-        """Keep `tracker` and `command` for later calls; nothing is run or read yet."""
+    def __init__(
+        self,
+        tracker: Tracker,
+        command: Sequence[str] = ("twg",),
+        timeout: float = TWG_TIMEOUT_SECONDS,
+    ) -> None:
+        """Keep `tracker`, `command` and `timeout` for later calls; nothing is run or read yet."""
         self._tracker = tracker
         self._command = tuple(command)
+        self._timeout = timeout
 
     def read(self, key: str) -> Ticket:
         """Return the ticket `key`, with its status, labels and blockers.
@@ -131,7 +142,8 @@ class JiraTracker:
         """Move the ticket `key` to the real status name `status`.
 
         Raises `TrackerError` when `key` is not a ticket key, the token variable is not set,
-        `twg` fails, or its answer is not JSON.
+        `twg` fails, or its answer is not JSON. After a timeout the transition may still
+        have happened: the status is to be read again, not assumed unchanged.
         """
         _check_key(key)
         self._run(
@@ -153,8 +165,8 @@ class JiraTracker:
         """Run `twg` with `arguments` and JSON output; return its decoded answer.
 
         `action` names the call in error sentences. Raises `TrackerError` when the
-        token variable is not set, `twg` cannot be started, exits nonzero, answers
-        `"ok": false`, or answers something that is not JSON.
+        token variable is not set, `twg` cannot be started, does not answer within the
+        timeout, exits nonzero, answers `"ok": false`, or answers something that is not JSON.
         """
         token = self._token()
         environment = {
@@ -179,7 +191,12 @@ class JiraTracker:
                 encoding="utf-8",
                 errors="replace",
                 check=False,
+                timeout=self._timeout,
             )
+        except subprocess.TimeoutExpired:
+            raise TrackerError(
+                f"twg did not answer within {self._timeout:g} seconds while {action}"
+            ) from None
         except OSError as error:
             reason = (error.strerror or type(error).__name__).replace(token, REDACTED)
             raise TrackerError(f"twg could not be started: {reason}") from None
