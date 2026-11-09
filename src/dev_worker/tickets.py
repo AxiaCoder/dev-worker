@@ -45,4 +45,8 @@ class TicketTracker(Protocol):
         ...
 
     def set_status(self, key: str, status: str) -> None:
-        """Move the ticket `key` to the real status name `status`; raise `TrackerError` on failure."""
+        """Move the ticket `key` to the real status name `status`.
+
+        Raises `TrackerError` on failure. When the call timed out, the transition may still
+        have happened: the status is to be read again, not assumed unchanged.
+        """
