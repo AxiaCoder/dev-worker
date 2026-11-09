@@ -90,8 +90,9 @@ class GitHubRepository:
     """A `CodeRepository` for the GitHub repository `repository`, through the `gh` command line.
 
     `command` is the program and leading arguments that run `gh`. Each call passes
-    `--repo` with the repository name, `GH_PROMPT_DISABLED`, and, as `GH_TOKEN`, the value
-    of the variable `repository.token_env` names, read at call time. `timeout` is the
+    `GH_PROMPT_DISABLED` and, as `GH_TOKEN`, the value of the variable
+    `repository.token_env` names, read at call time; each call on the repository also
+    passes `--repo` with the repository name. `timeout` is the
     bound of the access check, in seconds.
     """
 
