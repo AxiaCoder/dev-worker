@@ -142,7 +142,8 @@ class JiraTracker:
         """Move the ticket `key` to the real status name `status`.
 
         Raises `TrackerError` when `key` is not a ticket key, the token variable is not set,
-        `twg` fails, or its answer is not JSON.
+        `twg` fails, or its answer is not JSON. After a timeout the transition may still
+        have happened: the status is to be read again, not assumed unchanged.
         """
         _check_key(key)
         self._run(
