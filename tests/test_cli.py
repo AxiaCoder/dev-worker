@@ -3221,3 +3221,37 @@ def test_make_repository_returns_a_github_repository() -> None:
     )
 
     assert isinstance(MAKE_REPOSITORY(repository), GitHubRepository)
+
+
+def test_health_does_not_check_the_connectors_when_a_local_check_is_down(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    journal = write_invalid_journal(instance, b"[1]\n")
+    tracker = Unreachable(TrackerError("refused"))
+    repository = Unreachable(RepositoryError("refused"))
+    monkeypatch.setattr(cli, "make_tracker", lambda made: tracker)
+    monkeypatch.setattr(cli, "make_repository", lambda made: repository)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert_down(answer, "")
+    assert str(journal) in str(answer["reason"])
+    assert (tracker.checks, repository.checks) == (0, 0)
+
+
+def test_health_is_degraded_when_both_connectors_can_be_reached(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    directory = instance.with_suffix("")
+    directory.mkdir()
+    (directory / run_journal.JOURNAL_FILE).write_bytes(b'{"torn')
+    tracker = ReadyTracker()
+    repository = ReachableRepository()
+    monkeypatch.setattr(cli, "make_tracker", lambda made: tracker)
+    monkeypatch.setattr(cli, "make_repository", lambda made: repository)
+
+    assert health(monkeypatch, capsysbinary, instance)["status"] == "degraded"
