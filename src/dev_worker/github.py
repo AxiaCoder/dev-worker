@@ -14,7 +14,12 @@ from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 from dev_worker.header import _describe
 from dev_worker.instance import Repository
-from dev_worker.repositories import CiState, PullRequest, RepositoryError
+from dev_worker.repositories import (
+    CiState,
+    HeadMovedError,
+    PullRequest,
+    RepositoryError,
+)
 
 REDACTED = "[token]"
 GH_TIMEOUT_SECONDS = 60.0
@@ -158,8 +163,9 @@ class GitHubRepository:
         """Return `"failed"` when a check failed, else `"running"` when one still runs, else `"passed"`.
 
         The checks are those of the head commit, read in the same answer as its SHA. Raises
+        `HeadMovedError` when the head is no longer `pull_request.head`, and
         `RepositoryError` when the token variable is not set, `gh` fails, its answer cannot
-        be read, the head is no longer `pull_request.head`, or no check is reported.
+        be read, or no check is reported.
         """
         number = pull_request.number
         action = f"reading the CI of pull request #{number}"
@@ -172,7 +178,7 @@ class GitHubRepository:
         except ValidationError as error:
             raise self._unreadable(action, error) from None
         if view.headRefOid != pull_request.head:
-            raise RepositoryError(
+            raise HeadMovedError(
                 f"the head of pull request #{number} has moved from "
                 f"{pull_request.head} to {view.headRefOid} since it was found"
             )
@@ -193,7 +199,7 @@ class GitHubRepository:
         and this returns as if it were merged.
 
         Raises `RepositoryError` when the token variable is not set or `gh` fails; when the
-        refusal is GitHub's for a moved head, the sentence says so. After a timeout the
+        refusal is GitHub's for a moved head, it raises `HeadMovedError`. After a timeout the
         merge may still have happened: the pull request is to be read again, not assumed
         open.
         """
@@ -213,7 +219,7 @@ class GitHubRepository:
         except RepositoryError as error:
             if HEAD_MOVED not in str(error):
                 raise
-            raise RepositoryError(
+            raise HeadMovedError(
                 f"the head of pull request #{number} has moved since commit "
                 f"{pull_request.head}; it was not merged"
             ) from None
