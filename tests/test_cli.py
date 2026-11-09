@@ -16,15 +16,18 @@ import pytest
 
 from dev_worker import cli, run_journal
 from dev_worker.contract import MandateInput, MandateOutput
+from dev_worker.github import GitHubRepository
 from dev_worker.header import HeaderError
-from dev_worker.instance import Instance, Tracker
+from dev_worker.instance import Instance, Repository, Tracker
 from dev_worker.jira import JiraTracker
+from dev_worker.repositories import RepositoryError
 from dev_worker.tickets import Blocker, Ticket, TrackerError
 
 ROOT = Path(__file__).resolve().parent.parent
 INSTANCE = ROOT / "examples" / "instance.yaml"
 TORN_FILE = "journal.torn"
 MAKE_TRACKER = cli.make_tracker
+MAKE_REPOSITORY = cli.make_repository
 
 
 def valid_input(**overrides: object) -> dict[str, object]:
@@ -64,11 +67,29 @@ class ReadyTracker:
     def set_status(self, key: str, status: str) -> None:
         """Change nothing."""
 
+    def check_access(self) -> None:
+        """Grant access."""
+
+
+class ReachableRepository:
+    """A repository whose access check passes."""
+
+    def check_access(self) -> None:
+        """Grant access."""
+
 
 @pytest.fixture(autouse=True)
 def ready_tracker(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make `run` read every ticket from a `ReadyTracker` instead of the real tracker."""
     monkeypatch.setattr(cli, "make_tracker", lambda tracker: ReadyTracker())
+
+
+@pytest.fixture(autouse=True)
+def reachable_repository(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make `health` check a `ReachableRepository` instead of the real repository."""
+    monkeypatch.setattr(
+        cli, "make_repository", lambda repository: ReachableRepository()
+    )
 
 
 def journal_lines(instance: Path) -> list[dict[str, object]]:
@@ -226,6 +247,9 @@ class StubTracker:
 
     def set_status(self, key: str, status: str) -> None:
         """Change nothing."""
+
+    def check_access(self) -> None:
+        """Grant access."""
 
 
 def serve(
@@ -3092,3 +3116,108 @@ def test_health_ignores_a_gone_process_when_the_lock_has_no_usable_start(
     hold_lock(instance, json.dumps({"pid": dead_pid()}).encode())
 
     assert health(monkeypatch, capsysbinary, instance)["status"] == "ok"
+
+
+class Unreachable:
+    """A tracker or repository whose access check raises `error`; `checks` counts the calls."""
+
+    def __init__(self, error: Exception) -> None:
+        """Keep `error` for every later check."""
+        self.error = error
+        self.checks = 0
+
+    def check_access(self) -> None:
+        """Count the call, then raise the error."""
+        self.checks += 1
+        raise self.error
+
+
+def test_health_is_down_when_the_tracker_cannot_be_reached(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    tracker = Unreachable(TrackerError("twg could not be started: not found"))
+    repository = Unreachable(RepositoryError("never asked"))
+    monkeypatch.setattr(cli, "make_tracker", lambda made: tracker)
+    monkeypatch.setattr(cli, "make_repository", lambda made: repository)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert answer == {
+        "status": "down",
+        "reason": "The tracker cannot be reached: twg could not be started: not found",
+        "active": True,
+    }
+    assert (tracker.checks, repository.checks) == (1, 0)
+
+
+def test_health_is_down_when_the_repository_cannot_be_reached(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    repository = Unreachable(
+        RepositoryError("gh did not answer within 60 seconds while checking access")
+    )
+    monkeypatch.setattr(cli, "make_repository", lambda made: repository)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert answer == {
+        "status": "down",
+        "reason": "The repository cannot be reached: "
+        "gh did not answer within 60 seconds while checking access",
+        "active": True,
+    }
+
+
+def test_health_checks_the_connectors_of_the_instance_with_its_token_variables(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    monkeypatch.setattr(cli, "make_tracker", MAKE_TRACKER)
+    monkeypatch.setattr(cli, "make_repository", MAKE_REPOSITORY)
+    monkeypatch.setenv("JIRA_TOKEN", "")
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
+    tracker_down = health(monkeypatch, capsysbinary, instance)
+    monkeypatch.setattr(cli, "make_tracker", lambda made: ReadyTracker())
+    repository_down = health(monkeypatch, capsysbinary, instance)
+
+    assert tracker_down["reason"] == (
+        "The tracker cannot be reached: the variable JIRA_TOKEN, "
+        "which should hold the Jira token, is not set"
+    )
+    assert repository_down["reason"] == (
+        "The repository cannot be reached: the variable GITHUB_TOKEN, "
+        "which should hold the GitHub token, is not set"
+    )
+    assert not instance.with_suffix("").exists()
+
+
+def test_health_is_down_rather_than_degraded_when_a_connector_cannot_be_reached(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    directory = instance.with_suffix("")
+    directory.mkdir()
+    (directory / run_journal.JOURNAL_FILE).write_bytes(b'{"torn')
+    monkeypatch.setattr(
+        cli, "make_tracker", lambda made: Unreachable(TrackerError("refused"))
+    )
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert answer["status"] == "down"
+    assert answer["reason"] == "The tracker cannot be reached: refused"
+
+
+def test_make_repository_returns_a_github_repository() -> None:
+    repository = Repository(
+        type="github", name="example/project", token_env="GITHUB_TOKEN"
+    )
+
+    assert isinstance(MAKE_REPOSITORY(repository), GitHubRepository)

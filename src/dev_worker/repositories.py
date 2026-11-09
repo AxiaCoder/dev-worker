@@ -29,6 +29,10 @@ class PullRequest:
 class CodeRepository(Protocol):
     """A code repository: finds the pull request of a branch, reads its CI and merges it."""
 
+    def check_access(self) -> None:
+        """Raise `RepositoryError` when the repository host cannot be reached with the instance credentials; change nothing."""
+        ...
+
     def find_pull_request(self, branch: str) -> PullRequest | None:
         """Return the open pull request of `branch`, or `None` when it has none.
 

@@ -1,4 +1,8 @@
-"""The GitHub code repository, reached through GitHub's `gh` command line."""
+"""The GitHub code repository, reached through GitHub's `gh` command line.
+
+The access check is bounded: a `gh` that has not answered within `GH_TIMEOUT_SECONDS`
+(60 seconds) is stopped and raises `RepositoryError`.
+"""
 
 import json
 import os
@@ -13,6 +17,8 @@ from dev_worker.instance import Repository
 from dev_worker.repositories import CiState, PullRequest, RepositoryError
 
 REDACTED = "[token]"
+GH_TIMEOUT_SECONDS = 60.0
+GITHUB_HOST = "github.com"
 COMPLETED = "COMPLETED"
 HEAD_MOVED = "Head branch was modified"
 PASSING_CONCLUSIONS = frozenset({"SUCCESS", "NEUTRAL", "SKIPPED"})
@@ -85,15 +91,33 @@ class GitHubRepository:
 
     `command` is the program and leading arguments that run `gh`. Each call passes
     `--repo` with the repository name, `GH_PROMPT_DISABLED`, and, as `GH_TOKEN`, the value
-    of the variable `repository.token_env` names, read at call time.
+    of the variable `repository.token_env` names, read at call time. `timeout` is the
+    bound of the access check, in seconds.
     """
 
     def __init__(
-        self, repository: Repository, command: Sequence[str] = ("gh",)
+        self,
+        repository: Repository,
+        command: Sequence[str] = ("gh",),
+        timeout: float = GH_TIMEOUT_SECONDS,
     ) -> None:
-        """Keep `repository` and `command` for later calls; nothing is run or read yet."""
+        """Keep `repository`, `command` and `timeout` for later calls; nothing is run or read yet."""
         self._repository = repository
         self._command = tuple(command)
+        self._timeout = timeout
+
+    def check_access(self) -> None:
+        """Raise `RepositoryError` unless `gh` is signed in to github.com with the instance token.
+
+        Raises when the token variable is not set, `gh` cannot be started, does not answer
+        within the timeout, or reports the token cannot sign in. Changes nothing on GitHub.
+        """
+        self._run(
+            f"checking access to {GITHUB_HOST}",
+            ["auth", "status", "--active", "--hostname", GITHUB_HOST],
+            on_repository=False,
+            timeout=self._timeout,
+        )
 
     def find_pull_request(self, branch: str) -> PullRequest | None:
         """Return the open pull request whose head is `branch`, or `None` when there is none.
@@ -219,24 +243,39 @@ class GitHubRepository:
             raise RepositoryError(f"the answer of gh to {action} is not JSON")
         return answer
 
-    def _run(self, action: str, arguments: list[str]) -> str:
-        """Run `gh` with `arguments` on the repository and return what it wrote to stdout.
+    def _run(
+        self,
+        action: str,
+        arguments: list[str],
+        *,
+        on_repository: bool = True,
+        timeout: float | None = None,
+    ) -> str:
+        """Run `gh` with `arguments` and return what it wrote to stdout.
 
-        `action` names the call in error sentences. Raises `RepositoryError` when the token
-        variable is not set, `gh` cannot be started, or it exits nonzero.
+        `--repo` is added with the repository name when `on_repository` is true. `timeout`
+        bounds the call, in seconds; `None` leaves it unbounded. `action` names the call in
+        error sentences. Raises `RepositoryError` when the token variable is not set, `gh`
+        cannot be started, does not answer within `timeout`, or exits nonzero.
         """
         token = self._token()
         environment = {**os.environ, "GH_TOKEN": token, "GH_PROMPT_DISABLED": "1"}
+        target = ["--repo", self._repository.name] if on_repository else []
         try:
             done = subprocess.run(
-                [*self._command, *arguments, "--repo", self._repository.name],
+                [*self._command, *arguments, *target],
                 env=environment,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
                 check=False,
+                timeout=timeout,
             )
+        except subprocess.TimeoutExpired:
+            raise RepositoryError(
+                f"gh did not answer within {timeout:g} seconds while {action}"
+            ) from None
         except OSError as error:
             reason = (error.strerror or type(error).__name__).replace(token, REDACTED)
             raise RepositoryError(f"gh could not be started: {reason}") from None

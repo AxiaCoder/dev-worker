@@ -348,8 +348,9 @@ def test_set_status_with_an_answer_that_is_not_json_raises(
     [
         (lambda jira: jira.read("ABC-218"), "reading ABC-218"),
         (lambda jira: jira.set_status("ABC-218", "Done"), "moving ABC-218 to 'Done'"),
+        (lambda jira: jira.check_access(), "checking access to Jira"),
     ],
-    ids=["read", "set_status"],
+    ids=["read", "set_status", "check_access"],
 )
 def test_twg_that_does_not_answer_is_stopped_at_the_timeout(
     record: Path,
@@ -370,3 +371,112 @@ def test_twg_that_does_not_answer_is_stopped_at_the_timeout(
     assert TOKEN not in str(raised.value)
     assert record.exists()
     assert elapsed < 10
+
+
+def doctor(connectivity: object) -> dict[str, Any]:
+    return {"ok": None, "data": {"connectivity": connectivity}}
+
+
+REFUSED = {
+    "attempted": True,
+    "ok": False,
+    "message": "GraphQL request failed with status 401 (HTTP 401)",
+    "source": "TWG_TOKEN + TWG_USER",
+    "statusCode": 401,
+}
+
+
+def test_check_access_runs_the_doctor_with_the_instance_credentials(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, doctor({"attempted": True, "ok": True}))
+
+    tracker().check_access()
+
+    called = json.loads(record.read_text(encoding="utf-8"))
+    assert called["argv"] == [
+        "doctor", "--output", "json", "--output-summary", "none",
+    ]  # fmt: skip
+    assert called["env"] == {
+        "TWG_SITE": "example.atlassian.net",
+        "TWG_USER": "bot@example.com",
+        "TWG_TOKEN": TOKEN,
+    }
+
+
+def test_check_access_passes_on_connectivity_whatever_the_exit_code(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, doctor({"ok": True}), code=1)
+
+    tracker().check_access()
+
+
+def test_refused_credentials_are_explained_by_the_doctor_message(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, doctor(REFUSED), code=1)
+
+    with pytest.raises(TrackerError) as raised:
+        tracker().check_access()
+
+    assert str(raised.value) == (
+        "twg cannot reach Jira with the instance credentials: "
+        "GraphQL request failed with status 401 (HTTP 401)"
+    )
+
+
+@pytest.mark.parametrize(
+    ("stdout", "stderr", "reason"),
+    [
+        (doctor({"ok": False, "message": "  "}), "offline\n", "offline"),
+        (doctor({"ok": "yes"}), "", "exit code 1"),
+        (doctor("broken"), "", "exit code 1"),
+        ({"data": "broken"}, "", "exit code 1"),
+        ("not json", "", "exit code 1"),
+    ],
+)
+def test_a_doctor_without_a_passing_connectivity_check_refuses_access(
+    record: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: object,
+    stderr: str,
+    reason: str,
+) -> None:
+    answer(monkeypatch, stdout, stderr=stderr, code=1)
+
+    with pytest.raises(TrackerError) as raised:
+        tracker().check_access()
+
+    assert str(raised.value) == (
+        f"twg cannot reach Jira with the instance credentials: {reason}"
+    )
+
+
+def test_a_refused_access_does_not_give_the_token(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, doctor({**REFUSED, "message": f"bad token {TOKEN}"}), code=1)
+
+    with pytest.raises(TrackerError) as raised:
+        tracker().check_access()
+
+    assert TOKEN not in str(raised.value)
+    assert str(raised.value).endswith("bad token [token]")
+
+
+def test_check_access_without_the_token_variable_names_it_and_runs_nothing(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("JIRA_TOKEN")
+
+    with pytest.raises(TrackerError, match="JIRA_TOKEN.*not set"):
+        tracker().check_access()
+    assert not record.exists()
+
+
+def test_check_access_with_twg_missing_raises(record: Path) -> None:
+    missing = JiraTracker(TRACKER, command=[str(record.parent / "no-such-twg")])
+
+    with pytest.raises(TrackerError, match="^twg could not be started: "):
+        missing.check_access()

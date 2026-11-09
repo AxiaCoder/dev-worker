@@ -1,4 +1,5 @@
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -448,3 +449,98 @@ def test_gh_that_cannot_be_started_is_explained_without_the_token(
         repository().merge(PULL)
 
     assert str(raised.value) == f"gh could not be started: {reason}"
+
+
+def test_check_access_asks_gh_for_the_active_github_account_only(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, "github.com\n  ✓ Logged in to github.com\n")
+
+    repository().check_access()
+
+    assert called(record)["argv"] == [
+        "auth", "status", "--active", "--hostname", "github.com",
+    ]  # fmt: skip
+    assert called(record)["env"] == {"GH_TOKEN": TOKEN, "GH_PROMPT_DISABLED": "1"}
+
+
+def test_a_token_gh_cannot_sign_in_with_refuses_access_without_echoing_it(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(
+        monkeypatch,
+        "",
+        stderr=(
+            "github.com\n"
+            "  X Failed to log in to github.com using token (GH_TOKEN)\n"
+            "  - Active account: true\n"
+            f"  - The token in GH_TOKEN is invalid: {TOKEN}\n"
+        ),
+        code=1,
+    )
+
+    with pytest.raises(RepositoryError) as raised:
+        repository().check_access()
+
+    assert str(raised.value) == (
+        "gh failed while checking access to github.com: github.com "
+        "X Failed to log in to github.com using token (GH_TOKEN) "
+        "- Active account: true - The token in GH_TOKEN is invalid: [token]"
+    )
+
+
+def test_check_access_without_the_token_variable_names_it_and_runs_nothing(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("GITHUB_TOKEN")
+
+    with pytest.raises(RepositoryError, match="GITHUB_TOKEN.*not set"):
+        repository().check_access()
+    assert not record.exists()
+
+
+def test_check_access_with_gh_missing_raises(record: Path) -> None:
+    missing = GitHubRepository(REPOSITORY, command=[str(record.parent / "no-such-gh")])
+
+    with pytest.raises(RepositoryError, match="^gh could not be started: "):
+        missing.check_access()
+
+
+def test_check_access_is_bounded_by_the_timeout(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bounds: list[object] = []
+
+    def hang(*args: object, **kwargs: object) -> None:
+        bounds.append(kwargs["timeout"])
+        raise subprocess.TimeoutExpired(cmd="gh", timeout=0.5)
+
+    monkeypatch.setattr("dev_worker.github.subprocess.run", hang)
+    bounded = GitHubRepository(
+        REPOSITORY, command=[sys.executable, str(FAKE_GH)], timeout=0.5
+    )
+
+    with pytest.raises(RepositoryError) as raised:
+        bounded.check_access()
+
+    assert str(raised.value) == (
+        "gh did not answer within 0.5 seconds while checking access to github.com"
+    )
+    assert bounds == [0.5]
+
+
+def test_check_access_is_bounded_by_default(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bounds: list[object] = []
+
+    def finish(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        bounds.append(kwargs["timeout"])
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("dev_worker.github.subprocess.run", finish)
+
+    repository().check_access()
+    repository().merge(PULL)
+
+    assert bounds == [60.0, None]
