@@ -13,7 +13,7 @@ import subprocess
 from collections.abc import Sequence
 from pathlib import Path
 
-from dev_worker.github import REDACTED, _failure_reason
+from dev_worker.github import REDACTED, failure_reason
 from dev_worker.instance import Repository
 
 GIT_TIMEOUT_SECONDS = 600.0
@@ -87,26 +87,38 @@ class Workspace:
         from the remote's default branch; never from a local branch. Raises
         `WorkspaceError` when a git call fails, as when a worktree or a local `branch` is
         left from an earlier run.
+
+        An `open` that fails leaves no local `branch` it created: one that did not exist
+        before is deleted, and a deletion that fails is added to the error message. A
+        local `branch` that existed before, and whatever occupies the worktree path, are
+        left as they are.
         """
         remote_ref = f"refs/remotes/{REMOTE}/{branch}"
+        local_ref = f"refs/heads/{branch}"
         listed = self._git_mirror(
             f"looking for the branch {branch}",
             "for-each-ref",
             "--format=%(refname)",
             remote_ref,
-        )
-        start = remote_ref if remote_ref in listed.splitlines() else DEFAULT_BRANCH_REF
-        self._git_mirror(
-            f"creating the worktree of the branch {branch}",
-            "worktree",
-            "add",
-            "--quiet",
-            "--no-track",
-            "-b",
-            branch,
-            str(self.worktree),
-            start,
-        )
+            local_ref,
+        ).splitlines()
+        start = remote_ref if remote_ref in listed else DEFAULT_BRANCH_REF
+        try:
+            self._git_mirror(
+                f"creating the worktree of the branch {branch}",
+                "worktree",
+                "add",
+                "--quiet",
+                "--no-track",
+                "-b",
+                branch,
+                str(self.worktree),
+                start,
+            )
+        except WorkspaceError as error:
+            if local_ref not in listed:
+                self._delete_ref_after(error, local_ref)
+            raise
         return self.worktree
 
     def close(self, branch: str) -> None:
@@ -120,6 +132,17 @@ class Workspace:
         self._git_mirror(
             f"deleting the local branch {branch}", "branch", "--quiet", "-D", branch
         )
+
+    def _delete_ref_after(self, error: WorkspaceError, ref: str) -> None:
+        """Delete `ref` from the mirror, if it exists, after `error` made an `open` fail.
+
+        Raises a `WorkspaceError` holding the message of `error` followed by why the
+        deletion failed, when it does; returns otherwise.
+        """
+        try:
+            self._git_mirror(f"deleting {ref}", "update-ref", "-d", ref)
+        except WorkspaceError as cleanup_error:
+            raise WorkspaceError(f"{error}; then {cleanup_error}") from error
 
     def _token(self) -> str:
         """Return the token held by the variable `token_env` names; raise `WorkspaceError` if unset."""
@@ -175,6 +198,6 @@ class Workspace:
             reason = (error.strerror or type(error).__name__).replace(token, REDACTED)
             raise WorkspaceError(f"git could not be started: {reason}") from None
         if done.returncode != 0:
-            reason = _failure_reason(done).replace(token, REDACTED)
+            reason = failure_reason(done).replace(token, REDACTED)
             raise WorkspaceError(f"git failed while {action}: {reason}")
         return done.stdout

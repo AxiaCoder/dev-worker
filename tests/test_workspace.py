@@ -179,6 +179,53 @@ def test_open_fails_naming_why_when_a_worktree_is_left(space: Workspace) -> None
         space.open(BRANCH)
 
 
+def test_open_that_fails_leaves_no_branch_it_created(space: Workspace) -> None:
+    space.refresh()
+    space.worktree.mkdir(parents=True)
+    (space.worktree / "occupied.txt").write_text("left behind", encoding="utf-8")
+
+    with pytest.raises(WorkspaceError):
+        space.open("agent/Y")
+
+    assert git("-C", space.mirror, "for-each-ref", "refs/heads/agent/Y") == ""
+
+
+def test_open_that_fails_keeps_a_branch_that_existed_before(
+    space: Workspace, work: Path
+) -> None:
+    space.refresh()
+    tip = git("-C", work, "rev-parse", "HEAD")
+    git("-C", space.mirror, "branch", "agent/Z", tip)
+
+    with pytest.raises(WorkspaceError):
+        space.open("agent/Z")
+
+    assert git("-C", space.mirror, "rev-parse", "refs/heads/agent/Z") == tip
+
+
+def test_open_that_fails_then_cannot_delete_its_branch_says_both(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def answer(
+        arguments: list[str], **options: Any
+    ) -> subprocess.CompletedProcess[str]:
+        if "worktree" in arguments:
+            return subprocess.CompletedProcess(arguments, 1, "", "path is busy\n")
+        if "update-ref" in arguments:
+            return subprocess.CompletedProcess(arguments, 1, "", "ref is locked\n")
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    monkeypatch.setattr(workspace_module.subprocess, "run", answer)
+
+    with pytest.raises(WorkspaceError) as caught:
+        Workspace(REPOSITORY, tmp_path).open("agent/Y")
+
+    assert str(caught.value) == (
+        "git failed while creating the worktree of the branch agent/Y: path is busy;"
+        " then git failed while deleting refs/heads/agent/Y: ref is locked"
+    )
+
+
 def test_close_fails_naming_why_when_no_worktree_is_open(space: Workspace) -> None:
     space.refresh()
 

@@ -287,13 +287,13 @@ class GitHubRepository:
             reason = (error.strerror or type(error).__name__).replace(token, REDACTED)
             raise RepositoryError(f"gh could not be started: {reason}") from None
         if done.returncode != 0:
-            reason = _failure_reason(done).replace(token, REDACTED)
+            reason = failure_reason(done).replace(token, REDACTED)
             raise RepositoryError(f"gh failed while {action}: {reason}")
         return done.stdout
 
 
-def _failure_reason(done: subprocess.CompletedProcess[str]) -> str:
-    """Return why `gh` failed: its non-empty stderr lines, stripped and joined by one space, else its exit code."""
+def failure_reason(done: subprocess.CompletedProcess[str]) -> str:
+    """Return why a command failed: its non-empty stderr lines, stripped and joined by one space, else its exit code."""
     lines = [line.strip() for line in done.stderr.splitlines() if line.strip()]
     if lines:
         return " ".join(lines)

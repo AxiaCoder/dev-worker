@@ -357,6 +357,15 @@ def run_under_lock(
     return output
 
 
+def close_worktree(workspace: Workspace, branch: str) -> str | None:
+    """Close the worktree of `workspace` on `branch`; return why it failed, or None."""
+    try:
+        workspace.close(branch)
+    except WorkspaceError as error:
+        return f"The worktree cannot be removed: {error}"
+    return None
+
+
 def run_in_worktree(
     handler: Callable[[MandateInput, Instance], MandateOutput],
     mandate: MandateInput,
@@ -370,7 +379,7 @@ def run_in_worktree(
     cannot be opened gives a failed output naming the reason, without running
     `handler`. Once opened, the worktree and its local branch are removed whatever
     `handler` returns or raises; a removal that fails keeps the output, with the reason
-    added to `errors`.
+    added to `errors`, or the exception `handler` raised, with the reason added as a note.
     """
     ticket_key = mandate.params["ticket_key"]
     assert isinstance(ticket_key, str)
@@ -383,13 +392,12 @@ def run_in_worktree(
         return failed(mandate.task_id, f"The worktree cannot be prepared: {error}")
     try:
         output = handler(mandate, instance)
-    finally:
-        try:
-            workspace.close(branch)
-        except WorkspaceError as error:
-            close_error = f"The worktree cannot be removed: {error}"
-        else:
-            close_error = None
+    except BaseException as error:
+        close_error = close_worktree(workspace, branch)
+        if close_error is not None:
+            error.add_note(close_error)
+        raise
+    close_error = close_worktree(workspace, branch)
     if close_error is not None:
         return output.model_copy(
             update={"errors": [*output.errors, writable_text(close_error)]}

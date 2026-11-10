@@ -970,7 +970,7 @@ def test_worktree_that_cannot_be_removed_keeps_the_output_and_reports_it(
     ]
 
 
-def test_worktree_that_cannot_be_removed_after_the_mandate_raised_lets_it_propagate(
+def test_worktree_that_cannot_be_removed_after_the_mandate_raised_notes_why_on_it(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
@@ -982,10 +982,11 @@ def test_worktree_that_cannot_be_removed_after_the_mandate_raised_lets_it_propag
     monkeypatch.setitem(cli.MANDATES, "deliver_ticket", explode)
     workspace.fail = "close"
 
-    with pytest.raises(RuntimeError, match="boom"):
+    with pytest.raises(RuntimeError, match="boom") as caught:
         run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
 
     assert workspace.calls[-1] == ("close", "agent/DEMO-1")
+    assert caught.value.__notes__ == ["The worktree cannot be removed: close broke"]
 
 
 def test_instance_directory_that_cannot_be_created_fails_naming_it(
