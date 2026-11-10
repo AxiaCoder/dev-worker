@@ -221,11 +221,11 @@ def run_journaled(
     """Run `handler` under the lock of the instance directory and journal the run.
 
     The ticket key is checked first, then the ticket is read from the tracker and
-    refused unless it is ready (see `check_ticket_ready`), then moved to the real status
-    of the `in_progress` key (see `take_ticket`), then the lock is taken, or
+    refused unless it is ready (see `check_ticket_ready`), then the lock is taken, or
     taken over from a run that is gone (see `take_over_lock`); a task_id already in the
-    journal is refused.
-    A refused run is not journaled. The lock is released only if no other run has
+    journal is refused, otherwise the ticket is moved to the real status of the
+    `in_progress` key (see `take_ticket`) before the run is journaled.
+    A refused run, or one whose ticket cannot be moved, is not journaled. The lock is released only if no other run has
     taken it over meanwhile. Every file error becomes a failed output naming the
     reason, except a lock that cannot be removed: the run keeps its status and the
     reason is added to `errors`. An exception raised by `handler` propagates once the
@@ -239,8 +239,6 @@ def run_journaled(
     assert isinstance(ticket_key, str)
     tracker = make_tracker(instance.tracker)
     refusal = check_ticket_ready(ticket_key, instance, tracker)
-    if refusal is None:
-        refusal = take_ticket(ticket_key, instance, tracker)
     if refusal is not None:
         return failed(task_id, refusal)
     try:
@@ -273,7 +271,7 @@ def run_journaled(
         return failed(task_id, taken)
     lock = taken
     try:
-        output = run_under_lock(handler, mandate, instance, directory, start)
+        output = run_under_lock(handler, mandate, instance, tracker, directory, start)
     finally:
         try:
             release_lock(lock, record)
@@ -290,12 +288,15 @@ def run_under_lock(
     handler: Callable[[MandateInput, Instance], MandateOutput],
     mandate: MandateInput,
     instance: Instance,
+    tracker: TicketTracker,
     directory: Path,
     start: str,
 ) -> MandateOutput:
     """Run `handler` unless its task_id is already journaled, journaling the run twice.
 
-    A `running` line is appended before `handler` runs, so that the task is never run
+    Before anything is journaled, the ticket is moved through `tracker` to the real
+    status of the `in_progress` key; a run whose ticket cannot be moved fails without
+    being journaled. A `running` line is appended before `handler` runs, so that the task is never run
     again even if its final line, appended once `handler` returns, cannot be written;
     the output is then kept, with the journal error added to `errors`. A run whose
     `running` line cannot be written fails without running `handler`. `start` is the
@@ -315,6 +316,11 @@ def run_under_lock(
         return failed(task_id, f"Journal in '{directory}': {error}")
     if repeated:
         return failed(task_id, f"Task {task_id!r} has already been run.")
+    ticket_key = mandate.params["ticket_key"]
+    assert isinstance(ticket_key, str)
+    refusal = take_ticket(ticket_key, instance, tracker)
+    if refusal is not None:
+        return failed(task_id, refusal)
     entry: dict[str, object] = {
         "task_id": task_id,
         "ticket_key": mandate.params["ticket_key"],

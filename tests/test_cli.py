@@ -447,18 +447,20 @@ def test_ticket_not_ready_is_refused_before_the_lock_and_leaves_the_journal(
     assert sorted(directory.iterdir()) == files
 
 
-def test_ready_ticket_is_moved_to_in_progress_once_before_any_file_is_created(
+def test_ready_ticket_is_moved_to_in_progress_once_under_the_lock_before_the_journal(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
 ) -> None:
     stub = serve(monkeypatch, demo_ticket())
     directory = instance.with_suffix("")
-    directory_existed: list[bool] = []
+    seen: list[tuple[bool, list[dict[str, object]]]] = []
     move = stub.set_status
 
     def spy(key: str, status: str) -> None:
-        directory_existed.append(directory.exists())
+        seen.append(
+            ((directory / run_journal.LOCK_FILE).exists(), journal_lines(instance))
+        )
         move(key, status)
 
     monkeypatch.setattr(stub, "set_status", spy)
@@ -469,7 +471,7 @@ def test_ready_ticket_is_moved_to_in_progress_once_before_any_file_is_created(
 
     assert answer["status"] == "completed"
     assert stub.moves == [("DEMO-1", "In Progress")]
-    assert directory_existed == [False]
+    assert seen == [(True, [])]
 
 
 def test_ticket_not_ready_is_not_moved(
@@ -522,7 +524,7 @@ def test_ticket_taken_by_a_run_is_refused_to_a_second_run_under_another_task_id(
     ]
 
 
-def test_ticket_the_tracker_cannot_move_fails_as_of_unknown_status_creating_nothing(
+def test_ticket_the_tracker_cannot_move_fails_as_of_unknown_status_journaling_nothing(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
@@ -544,8 +546,46 @@ def test_ticket_the_tracker_cannot_move_fails_as_of_unknown_status_creating_noth
         "twg failed while moving DEMO-1: timeout "
         "Its status is unknown and is to be read again in the tracker.",
     )
-    assert not instance.with_suffix("").exists()
     assert journal_lines(instance) == []
+    assert not (instance.with_suffix("") / run_journal.LOCK_FILE).exists()
+
+
+def test_ticket_is_not_moved_when_a_live_run_holds_the_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    live_run = {
+        "task_id": "old",
+        "ticket_key": "DEMO-7",
+        "start": datetime.now(UTC).isoformat(),
+        "pid": os.getpid(),
+    }
+    hold_lock(instance, json.dumps(live_run).encode())
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", "A run is already in progress")
+    assert stub.moves == []
+
+
+def test_ticket_is_not_moved_again_for_a_task_id_already_run(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    stdin = encode(valid_input())
+    run_mandate(monkeypatch, capsysbinary, stdin, instance=instance)
+    stub.answer = demo_ticket()
+
+    answer = run_mandate(monkeypatch, capsysbinary, stdin, instance=instance)
+
+    assert_failed(answer, "task-1", "Task 'task-1' has already been run.")
+    assert stub.moves == [("DEMO-1", "In Progress")]
 
 
 def test_make_tracker_returns_a_jira_tracker() -> None:
