@@ -127,11 +127,15 @@ class Workspace:
     def close(self, branch: str) -> None:
         """Remove the worktree, whatever it holds, then delete the local `branch` from the mirror.
 
-        The worktree's directory is deleted without reading its `.git` and without
-        following any symbolic link in it; the mirror then forgets it. Raises
-        `WorkspaceError` when the directory cannot be deleted or a git call fails.
+        The mirror's record of the worktree is deleted first, so a worktree only partly
+        deleted can no longer be rescued; then its directory is deleted without reading
+        its `.git` and without following any symbolic link in it. Raises
+        `WorkspaceError` when the mirror records no worktree there, when either
+        directory cannot be deleted, or when a git call fails.
         """
+        admin = self._worktree_admin()
         try:
+            shutil.rmtree(admin)
             shutil.rmtree(self.worktree)
         except OSError as error:
             raise WorkspaceError(f"the worktree cannot be deleted: {error}") from error

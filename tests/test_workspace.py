@@ -276,8 +276,36 @@ def test_open_that_fails_then_cannot_delete_its_branch_says_both(
 def test_close_fails_naming_why_when_no_worktree_is_open(space: Workspace) -> None:
     space.refresh()
 
-    with pytest.raises(WorkspaceError, match="^the worktree cannot be deleted: "):
+    with pytest.raises(WorkspaceError, match="^the mirror records no worktree at "):
         space.close(BRANCH)
+
+
+def test_close_that_deletes_the_worktree_partly_leaves_no_branch_to_rescue(
+    space: Workspace, work: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (work / "tracked.txt").write_text("committed", encoding="utf-8")
+    git("-C", work, "add", "tracked.txt")
+    commit(work, "tracked")
+    git("-C", work, "push", "--quiet", "origin", "main")
+    space.refresh()
+    path = space.open(BRANCH)
+    tracked = path / "tracked.txt"
+    assert tracked.exists()
+    rmtree = shutil.rmtree
+
+    def delete_partly(target: Any, *arguments: Any, **options: Any) -> None:
+        if Path(target) == path:
+            tracked.unlink()
+            raise OSError("permission denied")
+        rmtree(target, *arguments, **options)
+
+    monkeypatch.setattr(workspace_module.shutil, "rmtree", delete_partly)
+
+    with pytest.raises(WorkspaceError):
+        space.close(BRANCH)
+
+    with pytest.raises(WorkspaceError, match="the mirror records no worktree"):
+        space.left_branch()
 
 
 def failing_git(monkeypatch: pytest.MonkeyPatch, failing: str) -> list[list[str]]:
