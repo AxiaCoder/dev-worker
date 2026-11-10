@@ -301,7 +301,9 @@ def test_close_that_deletes_the_worktree_partly_leaves_no_branch_to_rescue(
 
     monkeypatch.setattr(workspace_module.shutil, "rmtree", delete_partly)
 
-    with pytest.raises(WorkspaceError):
+    with pytest.raises(
+        WorkspaceError, match="^the worktree cannot be deleted: permission denied$"
+    ):
         space.close(BRANCH)
 
     with pytest.raises(WorkspaceError, match="the mirror records no worktree"):
