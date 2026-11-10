@@ -2,8 +2,10 @@
 
 A run starts one container with `docker run --rm`, the worktree bind-mounted at
 `WORKDIR` and nothing else mounted. The container is named, so that a run reaching its
-duration ceiling can kill it; `--rm` then has Docker remove it. Every other docker call
-is bounded by `DOCKER_TIMEOUT_SECONDS` (60 seconds).
+duration ceiling can kill it; `--rm` then has Docker remove it. It is labelled
+`OWNER_LABEL` with the instance that started it, so that the running containers of an
+instance can be listed and killed. Every other docker call is bounded by
+`DOCKER_TIMEOUT_SECONDS` (60 seconds).
 """
 
 import csv
@@ -19,6 +21,7 @@ DOCKER_TIMEOUT_SECONDS = 60.0
 WORKDIR = "/workspace"
 RUN_COMMAND = ("true",)
 NAME_PREFIX = "dev-worker-"
+OWNER_LABEL = "dev-worker.instance"
 
 
 class ContainerError(Exception):
@@ -42,19 +45,22 @@ def mount_option(source: Path) -> str:
 
 
 class Container:
-    """The container a run starts from `image`."""
+    """The container a run of the instance `owner` starts from `image`."""
 
     def __init__(
         self,
         image: str,
+        owner: str,
         command: Sequence[str] = ("docker",),
         timeout: float = DOCKER_TIMEOUT_SECONDS,
     ) -> None:
         """Keep what later calls need; nothing is run yet.
 
-        `timeout` bounds, in seconds, each docker call other than the run itself.
+        `owner` names the instance, and is the value of `OWNER_LABEL` on the containers
+        it runs. `timeout` bounds, in seconds, each docker call other than the run itself.
         """
         self._image = image
+        self._owner = owner
         self._command = tuple(command)
         self._timeout = timeout
 
@@ -82,6 +88,8 @@ class Container:
                 "--rm",
                 "--name",
                 name,
+                "--label",
+                f"{OWNER_LABEL}={self._owner}",
                 "--mount",
                 mount_option(worktree),
                 "--workdir",
@@ -112,6 +120,43 @@ class Container:
                     f"the container {name} could not be killed: {kill_error}"
                 )
             raise
+
+    def running(self) -> list[str]:
+        """Return the names of the containers of the owner still running, in Docker's order.
+
+        Raises `ContainerError` when docker cannot list them.
+        """
+        listed = self._docker(
+            "listing the containers of the instance",
+            "ps",
+            "--filter",
+            f"label={OWNER_LABEL}={self._owner}",
+            "--format",
+            "{{.Names}}",
+        )
+        return listed.split()
+
+    def check_none_running(self) -> None:
+        """Raise `ContainerError` naming them when containers of the owner are running.
+
+        Also raises `ContainerError` when docker cannot list them.
+        """
+        names = self.running()
+        if names:
+            raise ContainerError(
+                f"the container {', '.join(names)} of the instance is still running"
+                if len(names) == 1
+                else f"the containers {', '.join(names)} of the instance are still running"
+            )
+
+    def kill_running(self) -> None:
+        """Kill each container of the owner still running.
+
+        Raises `ContainerError` when docker cannot list them or kill one; the
+        containers listed after it are then left running.
+        """
+        for name in self.running():
+            self._kill(name)
 
     def _kill(self, name: str) -> None:
         """Kill the container `name`; raise `ContainerError` when docker cannot."""

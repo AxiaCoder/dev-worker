@@ -12,6 +12,7 @@ from dev_worker.container import Container, ContainerError, mount_option
 FAKE_DOCKER = Path(__file__).with_name("fake_docker.py")
 IMAGE = "example/agent:1.0.0"
 NAME = re.compile(r"dev-worker-[0-9a-f]{32}")
+OWNER = "/srv/instances/demo"
 
 
 @pytest.fixture
@@ -25,18 +26,22 @@ def answer(
     monkeypatch: pytest.MonkeyPatch,
     subcommand: str,
     *,
+    stdout: str = "",
     stderr: str = "",
     code: int = 0,
     sleep: float = 0,
 ) -> None:
     prefix = f"FAKE_DOCKER_{subcommand.upper()}_"
+    monkeypatch.setenv(f"{prefix}STDOUT", stdout)
     monkeypatch.setenv(f"{prefix}STDERR", stderr)
     monkeypatch.setenv(f"{prefix}EXIT", str(code))
     monkeypatch.setenv(f"{prefix}SLEEP", str(sleep))
 
 
 def container(timeout: float = 60) -> Container:
-    return Container(IMAGE, command=[sys.executable, str(FAKE_DOCKER)], timeout=timeout)
+    return Container(
+        IMAGE, OWNER, command=[sys.executable, str(FAKE_DOCKER)], timeout=timeout
+    )
 
 
 def calls(record: Path) -> list[list[str]]:
@@ -63,7 +68,7 @@ def test_a_daemon_that_cannot_be_reached_raises_naming_why(
 
 
 def test_docker_that_cannot_be_started_raises(tmp_path: Path) -> None:
-    absent = Container(IMAGE, command=[str(tmp_path / "no-docker")])
+    absent = Container(IMAGE, OWNER, command=[str(tmp_path / "no-docker")])
 
     with pytest.raises(ContainerError) as raised:
         absent.check_access()
@@ -84,7 +89,7 @@ def test_docker_that_does_not_answer_raises(
     )
 
 
-def test_run_starts_one_named_disposable_container_with_only_the_worktree_mounted(
+def test_run_starts_one_named_disposable_container_of_its_owner_with_only_the_worktree_mounted(
     record: Path, tmp_path: Path
 ) -> None:
     worktree = tmp_path / "worktree"
@@ -95,6 +100,8 @@ def test_run_starts_one_named_disposable_container_with_only_the_worktree_mounte
     assert call[:3] == ["run", "--rm", "--name"]
     assert NAME.fullmatch(call[3])
     assert call[4:] == [
+        "--label",
+        f"dev-worker.instance={OWNER}",
         "--mount",
         f"type=bind,source={worktree},target=/workspace",
         "--workdir",
@@ -206,3 +213,94 @@ def test_an_interrupted_run_whose_container_cannot_be_killed_notes_why(
         f"the container {name}: No such container"
     )
     assert raised.value.__notes__ == [note]
+
+
+PS = ["ps", "--filter", f"label=dev-worker.instance={OWNER}", "--format", "{{.Names}}"]
+
+
+def test_running_lists_the_containers_of_the_owner_by_name(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, "ps", stdout="dev-worker-a\ndev-worker-b\n")
+
+    assert container().running() == ["dev-worker-a", "dev-worker-b"]
+    assert calls(record) == [PS]
+
+
+def test_check_none_running_passes_when_no_container_of_the_owner_runs(
+    record: Path,
+) -> None:
+    container().check_none_running()
+
+    assert calls(record) == [PS]
+
+
+@pytest.mark.parametrize(
+    ("listed", "message"),
+    [
+        (
+            "dev-worker-a\n",
+            "the container dev-worker-a of the instance is still running",
+        ),
+        (
+            "dev-worker-a\ndev-worker-b\n",
+            "the containers dev-worker-a, dev-worker-b of the instance are still running",
+        ),
+    ],
+)
+def test_check_none_running_raises_naming_the_containers_still_running(
+    record: Path, monkeypatch: pytest.MonkeyPatch, listed: str, message: str
+) -> None:
+    answer(monkeypatch, "ps", stdout=listed)
+
+    with pytest.raises(ContainerError) as raised:
+        container().check_none_running()
+
+    assert str(raised.value) == message
+
+
+def test_containers_that_cannot_be_listed_raise_naming_why(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, "ps", stderr="Cannot connect to the daemon\n", code=1)
+
+    with pytest.raises(ContainerError) as raised:
+        container().check_none_running()
+
+    assert str(raised.value) == (
+        "docker failed while listing the containers of the instance: "
+        "Cannot connect to the daemon"
+    )
+
+
+def test_kill_running_kills_each_container_of_the_owner_still_running(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, "ps", stdout="dev-worker-a\ndev-worker-b\n")
+
+    container().kill_running()
+
+    assert calls(record) == [PS, ["kill", "dev-worker-a"], ["kill", "dev-worker-b"]]
+
+
+def test_kill_running_raises_on_the_first_container_it_cannot_kill(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, "ps", stdout="dev-worker-a\ndev-worker-b\n")
+    answer(monkeypatch, "kill", stderr="permission denied\n", code=1)
+
+    with pytest.raises(ContainerError) as raised:
+        container().kill_running()
+
+    assert str(raised.value) == (
+        "docker failed while killing the container dev-worker-a: permission denied"
+    )
+    assert calls(record) == [PS, ["kill", "dev-worker-a"]]
+
+
+def test_kill_running_kills_nothing_when_no_container_of_the_owner_runs(
+    record: Path,
+) -> None:
+    container().kill_running()
+
+    assert calls(record) == [PS]

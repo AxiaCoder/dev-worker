@@ -155,15 +155,21 @@ def make_workspace(repository: Repository, directory: Path) -> Workspace:
     return Workspace(repository, directory)
 
 
-def make_container(image: str) -> Container:
-    """Return the container a run starts from `image`."""
-    return Container(image)
+def make_container(image: str, directory: Path) -> Container:
+    """Return the container a run of the instance kept in `directory` starts from `image`.
+
+    The instance is named by the absolute path of `directory` (see `Container`).
+    """
+    return Container(image, str(directory.absolute()))
 
 
-def unreachable_docker(instance: Instance) -> str | None:
-    """Return why the Docker daemon cannot be reached, `None` when it can. Never raises."""
+def unreachable_docker(instance: Instance, directory: Path) -> str | None:
+    """Return why the Docker daemon cannot be reached, `None` when it can. Never raises.
+
+    `directory` is the instance directory of `instance`.
+    """
     try:
-        make_container(instance.container.image).check_access()
+        make_container(instance.container.image, directory).check_access()
     except ContainerError as error:
         return f"Docker cannot be reached: {error}"
     return None
@@ -381,16 +387,21 @@ def run_under_lock(
     return output
 
 
-def end_worktree(workspace: Workspace, branch: str, instance: Instance) -> str | None:
+def end_worktree(
+    workspace: Workspace, branch: str, instance: Instance, directory: Path
+) -> str | None:
     """Rescue then close the worktree of `workspace` on `branch`; return why it failed, or None.
 
-    The rescue commits with the git identity of `instance` (see `Workspace.rescue`). A
-    worktree whose rescue fails is not closed: it stays on the host, with its local
-    branch, for the next run to rescue.
+    The rescue commits with the git identity of `instance` (see `Workspace.rescue`). It
+    fails while a container of the instance kept in `directory` is running, or when
+    Docker cannot tell (see `Container.check_none_running`). A worktree whose rescue
+    fails is not closed: it stays on the host, with its local branch, for the next run
+    to rescue.
     """
     try:
+        make_container(instance.container.image, directory).check_none_running()
         workspace.rescue(branch, instance.git)
-    except WorkspaceError as error:
+    except (ContainerError, WorkspaceError) as error:
         return f"The work of the run cannot be rescued, its worktree is kept: {error}"
     try:
         workspace.close(branch)
@@ -405,8 +416,9 @@ def rescue_left_worktree(instance: Instance, directory: Path) -> str | None:
     When no worktree is left, the local branches earlier runs left in the mirror are
     deleted when the remote holds their tip, and kept otherwise (see
     `Workspace.drop_left_branches`). Otherwise the branch of the worktree is read from
-    the mirror's record of it (see `Workspace.left_branch`), the mirror is refreshed,
-    and the worktree is ended as a run ends its own (see `end_worktree`).
+    the mirror's record of it (see `Workspace.left_branch`), the containers of the
+    instance still running are killed (see `Container.kill_running`), the mirror is
+    refreshed, and the worktree is ended as a run ends its own (see `end_worktree`).
     """
     workspace = make_workspace(instance.repository, directory)
     try:
@@ -414,18 +426,22 @@ def rescue_left_worktree(instance: Instance, directory: Path) -> str | None:
         if branch is None:
             workspace.drop_left_branches()
             return None
+        make_container(instance.container.image, directory).kill_running()
         workspace.refresh()
-    except WorkspaceError as error:
+    except (ContainerError, WorkspaceError) as error:
         return f"The worktree left by an earlier run cannot be rescued: {error}"
-    reason = end_worktree(workspace, branch, instance)
+    reason = end_worktree(workspace, branch, instance, directory)
     if reason is None:
         return None
     return f"The worktree left by an earlier run on the branch {branch}: {reason}"
 
 
-def run_container(instance: Instance, worktree: Path, began: float) -> str | None:
+def run_container(
+    instance: Instance, directory: Path, worktree: Path, began: float
+) -> str | None:
     """Run the container of `instance` on `worktree` for the time left in the run; return why it failed, or None.
 
+    `directory` is the instance directory of `instance`.
     `began` is the `time.monotonic()` reading taken when the run started; the time left
     is `run_timeout_seconds` minus the seconds elapsed since. None left: the container
     is not started.
@@ -438,7 +454,7 @@ def run_container(instance: Instance, worktree: Path, began: float) -> str | Non
             "was reached before it."
         )
     try:
-        make_container(instance.container.image).run(worktree, left)
+        make_container(instance.container.image, directory).run(worktree, left)
     except ContainerError as error:
         return f"The container failed: {error}"
     return None
@@ -479,17 +495,17 @@ def run_in_worktree(
     except WorkspaceError as error:
         return failed(mandate.task_id, f"The worktree cannot be prepared: {error}")
     try:
-        container_error = run_container(instance, workspace.worktree, began)
+        container_error = run_container(instance, directory, workspace.worktree, began)
         if container_error is not None:
             output = failed(mandate.task_id, container_error)
         else:
             output = handler(mandate, instance)
     except BaseException as error:
-        end_error = end_worktree(workspace, branch, instance)
+        end_error = end_worktree(workspace, branch, instance, directory)
         if end_error is not None:
             error.add_note(end_error)
         raise
-    end_error = end_worktree(workspace, branch, instance)
+    end_error = end_worktree(workspace, branch, instance, directory)
     if end_error is not None:
         return output.model_copy(
             update={"errors": [*output.errors, writable_text(end_error)]}
@@ -881,7 +897,7 @@ def read_health(instance_path: Path) -> Health:
     unreachable = unreachable_connector(instance)
     if unreachable is not None:
         return Health(status="down", reason=writable_text(unreachable), active=True)
-    no_docker = unreachable_docker(instance)
+    no_docker = unreachable_docker(instance, directory)
     if no_docker is not None:
         return Health(status="down", reason=writable_text(no_docker), active=True)
     lock = read_lock(directory)
