@@ -404,9 +404,9 @@ def rescue_left_worktree(instance: Instance, directory: Path) -> str | None:
 
     When no worktree is left, the local branches earlier runs left in the mirror are
     deleted when the remote holds their tip, and kept otherwise (see
-    `Workspace.drop_left_branches`). Otherwise the
-    branch of the worktree is read from it, the mirror is refreshed, and the worktree is
-    ended as a run ends its own (see `end_worktree`).
+    `Workspace.drop_left_branches`). Otherwise the branch of the worktree is read from
+    the mirror's record of it (see `Workspace.left_branch`), the mirror is refreshed,
+    and the worktree is ended as a run ends its own (see `end_worktree`).
     """
     workspace = make_workspace(instance.repository, directory)
     try:

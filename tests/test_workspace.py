@@ -1,3 +1,4 @@
+import os
 import shutil
 import subprocess
 import sys
@@ -453,7 +454,9 @@ def test_left_branch_is_none_without_a_worktree(space: Workspace) -> None:
     assert space.left_branch() is None
 
 
-def test_left_branch_is_read_from_the_worktree(space: Workspace) -> None:
+def test_left_branch_is_read_from_the_mirror_record_of_the_worktree(
+    space: Workspace,
+) -> None:
     space.refresh()
     (space.mirror / "worktrees" / "stale").mkdir(parents=True)
     elsewhere = space.mirror / "worktrees" / "elsewhere"
@@ -464,6 +467,19 @@ def test_left_branch_is_read_from_the_worktree(space: Workspace) -> None:
     space.open("agent/OLD-7")
 
     assert space.left_branch() == "agent/OLD-7"
+
+
+def test_left_branch_takes_a_relative_gitdir_from_its_admin_directory(
+    space: Workspace, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    space.refresh()
+    space.open(BRANCH)
+    [admin] = (space.mirror / "worktrees").iterdir()
+    relative = os.path.relpath(space.worktree / ".git", admin)
+    (admin / "gitdir").write_text(Path(relative).as_posix(), encoding="utf-8")
+    monkeypatch.chdir(tmp_path / "work")
+
+    assert space.left_branch() == BRANCH
 
 
 def test_left_branch_of_a_detached_worktree_fails_naming_why(

@@ -260,8 +260,9 @@ class Workspace:
         """Return the directory where the mirror keeps the worktree's git data.
 
         It is found among the mirror's `worktrees/*` by the worktree path each records in
-        its `gitdir` file; the worktree's own `.git` is never read. Raises
-        `WorkspaceError` when the mirror records no such directory.
+        its `gitdir` file, a relative one being taken from that admin directory; the
+        worktree's own `.git` is never read. Raises `WorkspaceError` when the mirror
+        records no such directory.
         """
         worktree = self.worktree.resolve()
         admins = self.mirror / "worktrees"
@@ -270,7 +271,7 @@ class Workspace:
                 recorded = (admin / "gitdir").read_text(encoding="utf-8").strip()
             except OSError:
                 continue
-            if Path(recorded).parent.resolve() == worktree:
+            if (admin / recorded).parent.resolve() == worktree:
                 return admin
         raise WorkspaceError(
             f"the mirror records no worktree at '{self.worktree}'; "
