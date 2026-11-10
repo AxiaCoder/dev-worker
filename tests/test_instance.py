@@ -31,6 +31,12 @@ repository:
   type: github
   name: example/project
   token_env: GITHUB_TOKEN
+branch: agent/{key}
+container:
+  image: python:3.12-slim
+git:
+  name: Worker
+  email: worker@users.noreply.github.com
 hold_merge_label: hold-merge
 statuses:
   ready: To Do
@@ -465,3 +471,156 @@ def test_instance_not_in_utf8_is_refused(tmp_path: Path) -> None:
 def test_instance_nested_too_deeply_is_refused(tmp_path: Path) -> None:
     with pytest.raises(InstanceError):
         load(tmp_path, "tracker: " + "[" * 5000 + "\n")
+
+
+def test_run_keys_are_exposed(tmp_path: Path) -> None:
+    instance = load(tmp_path, VALID)
+
+    assert instance.branch == "agent/{key}"
+    assert instance.container.image == "python:3.12-slim"
+    assert instance.git.name == "Worker"
+    assert instance.git.email == "worker@users.noreply.github.com"
+
+
+@pytest.mark.parametrize("branch", ["agent/{key}", "{key}", "feat/{key}-run"])
+def test_branch_containing_the_key_is_accepted(tmp_path: Path, branch: str) -> None:
+    instance = load(
+        tmp_path, VALID.replace("branch: agent/{key}", f"branch: '{branch}'")
+    )
+
+    assert instance.branch == branch
+
+
+@pytest.mark.parametrize("branch", ["agent/main", "agent/{KEY}", "agent/key", ""])
+def test_branch_without_the_key_is_refused_with_its_reason(
+    tmp_path: Path, branch: str
+) -> None:
+    with pytest.raises(
+        InstanceError,
+        match=r"invalid instance file: branch: .*must contain \{key\}, which the "
+        r"ticket key replaces, e\.g\. agent/\{key\}",
+    ):
+        load(tmp_path, VALID.replace("branch: agent/{key}", f"branch: '{branch}'"))
+
+
+DIGEST = "sha256:" + "0123456789abcdef" * 4
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        "python:3.12-slim",
+        "python:3",
+        "ghcr.io/example-org/app:1.0.0",
+        "localhost:5000/app:1.0",
+        f"python@{DIGEST}",
+        f"ghcr.io/example-org/app@{DIGEST}",
+        f"python:latest@{DIGEST}",
+    ],
+)
+def test_pinned_image_is_accepted(tmp_path: Path, image: str) -> None:
+    text = VALID.replace("image: python:3.12-slim", f"image: '{image}'")
+
+    assert load(tmp_path, text).container.image == image
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        "python",
+        "python:latest",
+        "python:",
+        ":1.0",
+        "ghcr.io/example-org/app",
+        "ghcr.io/example-org/app:latest",
+        "localhost:5000/app",
+        "registry:5000/app",
+        "python@",
+        "@sha256:abc",
+        "python:latest@",
+        "python: 3",
+        "python:1.0 ",
+        "python@sha256:xyz",
+    ],
+)
+def test_unpinned_image_is_refused_with_its_reason(tmp_path: Path, image: str) -> None:
+    text = VALID.replace("image: python:3.12-slim", f"image: '{image}'")
+
+    with pytest.raises(
+        InstanceError,
+        match=r"invalid instance file: container\.image: .*must pin a version, with a "
+        r"tag other than latest or a digest, e\.g\. python:3\.12-slim",
+    ):
+        load(tmp_path, text)
+
+
+@pytest.mark.parametrize(
+    ("old", "location"),
+    [
+        ("image: python:3.12-slim", "container.image"),
+        ("name: Worker", "git.name"),
+        ("email: worker@users.noreply.github.com", "git.email"),
+    ],
+)
+@pytest.mark.parametrize("blank", ["''", '" "', '"\t"'])
+def test_blank_run_key_is_refused(
+    tmp_path: Path, old: str, location: str, blank: str
+) -> None:
+    key = old.split(":")[0]
+
+    with pytest.raises(
+        InstanceError, match=f"invalid instance file: {location}: .*blank"
+    ):
+        load(tmp_path, VALID.replace(old, f"{key}: {blank}"))
+
+
+@pytest.mark.parametrize(
+    ("text", "location"),
+    [
+        (VALID.replace("branch: agent/{key}\n", ""), "branch: Field required"),
+        (
+            VALID.replace("container:\n  image: python:3.12-slim\n", ""),
+            "container: Field required",
+        ),
+        (
+            VALID.replace("  image: python:3.12-slim\n", "  tag: x\n"),
+            "container.image: Field required",
+        ),
+        (
+            VALID.replace(
+                "  image: python:3.12-slim\n", "  image: python:3\n  pull: x\n"
+            ),
+            "container.pull: Extra inputs",
+        ),
+        (
+            VALID.replace(
+                "git:\n  name: Worker\n  email: worker@users.noreply.github.com\n", ""
+            ),
+            "git: Field required",
+        ),
+        (VALID.replace("  name: Worker\n", ""), "git.name: Field required"),
+        (
+            VALID.replace("  email: worker@users.noreply.github.com\n", ""),
+            "git.email: Field required",
+        ),
+        (
+            VALID.replace("  name: Worker\n", "  name: Worker\n  signing: x\n"),
+            "git.signing: Extra inputs",
+        ),
+    ],
+)
+def test_missing_or_extra_run_key_is_refused(
+    tmp_path: Path, text: str, location: str
+) -> None:
+    with pytest.raises(InstanceError, match=f"invalid instance file: .*{location}"):
+        load(tmp_path, text)
+
+
+def test_unpinned_image_is_refused_without_echo(tmp_path: Path) -> None:
+    text = VALID.replace("image: python:3.12-slim", f"image: {SECRET}")
+
+    with pytest.raises(InstanceError, match="container.image") as caught:
+        load(tmp_path, text)
+
+    assert SECRET not in str(caught.value)
+    assert "(got" not in str(caught.value)
