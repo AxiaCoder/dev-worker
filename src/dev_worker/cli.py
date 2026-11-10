@@ -225,11 +225,11 @@ def run_journaled(
     taken over from a run that is gone (see `take_over_lock`); a task_id already in the
     journal is refused, otherwise the ticket is moved to the real status of the
     `in_progress` key (see `take_ticket`) before the run is journaled.
-    A refused run, or one whose ticket cannot be moved, is not journaled. The lock is released only if no other run has
-    taken it over meanwhile. Every file error becomes a failed output naming the
-    reason, except a lock that cannot be removed: the run keeps its status and the
-    reason is added to `errors`. An exception raised by `handler` propagates once the
-    lock is released.
+    A refused run, or one whose ticket cannot be moved, is not journaled. The lock is
+    released only if no other run has taken it over meanwhile. Every file error
+    becomes a failed output naming the reason, except a lock that cannot be removed:
+    the run keeps its status and the reason is added to `errors`. An exception raised
+    by `handler` propagates once the lock is released.
     """
     task_id = mandate.task_id
     refusal = check_ticket_key(mandate, instance)
@@ -296,12 +296,12 @@ def run_under_lock(
 
     Before anything is journaled, the ticket is moved through `tracker` to the real
     status of the `in_progress` key; a run whose ticket cannot be moved fails without
-    being journaled. A `running` line is appended before `handler` runs, so that the task is never run
-    again even if its final line, appended once `handler` returns, cannot be written;
-    the output is then kept, with the journal error added to `errors`. A run whose
-    `running` line cannot be written fails without running `handler`. `start` is the
-    ISO 8601 UTC start of the run, written as is in both lines. A torn last journal
-    line is first set aside in the torn file.
+    being journaled. A `running` line is appended before `handler` runs, so that the
+    task is never run again even if its final line, appended once `handler` returns,
+    cannot be written; the output is then kept, with the journal error added to
+    `errors`. A run whose `running` line cannot be written fails without running
+    `handler`. `start` is the ISO 8601 UTC start of the run, written as is in both
+    lines. A torn last journal line is first set aside in the torn file.
     """
     task_id = mandate.task_id
     try:
