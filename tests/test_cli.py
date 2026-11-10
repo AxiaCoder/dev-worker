@@ -1509,26 +1509,44 @@ def test_container_left_that_cannot_be_stopped_fails_the_run_without_taking_the_
     assert journal_lines(instance) == []
 
 
-@pytest.mark.parametrize("relative", [False, True])
-def test_containers_of_an_instance_are_labelled_with_its_absolute_directory(
+def spell_instance_path(
+    instance: Path, spelling: str, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Return another path to the instance file, written the way `spelling` names."""
+    if spelling == "relative":
+        monkeypatch.chdir(instance.parent)
+        return Path(instance.name)
+    if spelling == "parent-step":
+        (instance.parent / "elsewhere").mkdir()
+        return instance.parent / "elsewhere" / ".." / instance.name
+    if spelling == "symlink":
+        link = instance.parent / "link"
+        try:
+            link.symlink_to(instance.parent, target_is_directory=True)
+        except OSError as error:
+            pytest.skip(f"symbolic links cannot be created here: {error}")
+        return link / instance.name
+    return instance
+
+
+@pytest.mark.parametrize("spelling", ["absolute", "relative", "parent-step", "symlink"])
+def test_containers_of_an_instance_carry_one_label_whatever_the_path_spelling(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
     tmp_path: Path,
-    relative: bool,
+    spelling: str,
 ) -> None:
     record = fake_docker(monkeypatch, tmp_path)
-    if relative:
-        monkeypatch.chdir(instance.parent)
 
     run_mandate(
         monkeypatch,
         capsysbinary,
         encode(valid_input()),
-        instance=Path(instance.name) if relative else instance,
+        instance=spell_instance_path(instance, spelling, monkeypatch),
     )
 
-    owner = f"dev-worker.instance={instance.with_suffix('').absolute()}"
+    owner = f"dev-worker.instance={instance.with_suffix('').resolve()}"
     calls = [json.loads(line) for line in record.read_text("utf-8").splitlines()]
     [run_call] = [call for call in calls if call[0] == "run"]
     assert owner in run_call

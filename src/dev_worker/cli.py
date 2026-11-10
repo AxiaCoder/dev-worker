@@ -158,9 +158,10 @@ def make_workspace(repository: Repository, directory: Path) -> Workspace:
 def make_container(image: str, directory: Path) -> Container:
     """Return the container a run of the instance kept in `directory` starts from `image`.
 
-    The instance is named by the absolute path of `directory` (see `Container`).
+    The instance is named by the absolute path of `directory`, with its links and `..`
+    steps resolved, so that every spelling of it gives the same name (see `Container`).
     """
-    return Container(image, str(directory.absolute()))
+    return Container(image, str(directory.resolve()))
 
 
 def unreachable_docker(instance: Instance, directory: Path) -> str | None:
