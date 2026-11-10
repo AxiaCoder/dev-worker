@@ -199,7 +199,8 @@ class Workspace:
         git call fails, as when the remote branch has moved on.
 
         Before any git call, the worktree is searched, without following symbolic
-        links, for an entry named `.git` in any letter case below its root; when one is
+        links, for an entry named `.git` in any letter case other than the root `.git`
+        itself; when one is
         found, or a directory cannot be read, no git call is made and `WorkspaceError`
         names its path relative to the worktree.
         """
@@ -269,10 +270,11 @@ class Workspace:
 
     def _nested_git_entry(self) -> str | None:
         """Return the path, relative to the worktree and with `/`, of the first entry named
-        `.git` in any letter case below its root, or None when there is none.
+        `.git` in any letter case, or None when there is none.
 
-        Symbolic links are listed but never followed; directories that cannot be read
-        stop the search. The `.git` at the root is neither reported nor entered. Raises
+        The entry named exactly `.git` at the root is neither reported nor entered; any
+        other letter case of it at the root is reported. Symbolic links are listed but
+        never followed; directories that cannot be read stop the search. Raises
         `WorkspaceError` naming the relative path of a directory that cannot be read,
         and why.
         """
@@ -288,13 +290,13 @@ class Workspace:
         for directory, subdirectories, files in os.walk(self.worktree, onerror=refuse):
             here = Path(directory)
             if here == self.worktree:
-                subdirectories[:] = [
-                    name for name in subdirectories if name.casefold() != ".git"
-                ]
-                continue
+                subdirectories[:] = [name for name in subdirectories if name != ".git"]
             subdirectories.sort()
             for name in sorted([*subdirectories, *files]):
-                if name.casefold() == ".git":
+                if name.casefold() == ".git" and (here, name) != (
+                    self.worktree,
+                    ".git",
+                ):
                     return (here / name).relative_to(self.worktree).as_posix()
         return None
 

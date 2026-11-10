@@ -370,6 +370,20 @@ def test_rescue_refuses_a_nested_git_file_in_any_case(
         space.rescue(BRANCH, IDENTITY)
 
 
+def test_rescue_refuses_a_root_git_entry_in_another_letter_case(
+    space: Workspace, remote: Path
+) -> None:
+    space.refresh()
+    path = space.open(BRANCH)
+    (path / ".git").unlink()
+    (path / ".GIT").mkdir()
+
+    with pytest.raises(WorkspaceError, match="nested git entry at '.GIT'"):
+        space.rescue(BRANCH, IDENTITY)
+
+    assert remote_branch(remote) == ""
+
+
 def test_rescue_refuses_a_worktree_with_a_directory_it_cannot_read(
     monkeypatch: pytest.MonkeyPatch, space: Workspace, remote: Path
 ) -> None:
