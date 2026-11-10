@@ -10,6 +10,7 @@ raises `WorkspaceError`.
 """
 
 import os
+import shutil
 import subprocess
 from collections.abc import Sequence
 from pathlib import Path
@@ -126,11 +127,15 @@ class Workspace:
     def close(self, branch: str) -> None:
         """Remove the worktree, whatever it holds, then delete the local `branch` from the mirror.
 
-        Raises `WorkspaceError` when a git call fails.
+        The worktree's directory is deleted without reading its `.git` and without
+        following any symbolic link in it; the mirror then forgets it. Raises
+        `WorkspaceError` when the directory cannot be deleted or a git call fails.
         """
-        self._git_mirror(
-            "removing the worktree", "worktree", "remove", "--force", str(self.worktree)
-        )
+        try:
+            shutil.rmtree(self.worktree)
+        except OSError as error:
+            raise WorkspaceError(f"the worktree cannot be deleted: {error}") from error
+        self._git_mirror("forgetting the removed worktree", "worktree", "prune")
         self._git_mirror(
             f"deleting the local branch {branch}", "branch", "--quiet", "-D", branch
         )
