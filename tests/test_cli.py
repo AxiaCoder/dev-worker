@@ -1025,6 +1025,27 @@ def test_container_ceiling_is_the_time_left_once_the_worktree_is_ready(
     assert container.calls == [("run", workspace.worktree, 1200)]
 
 
+def test_container_ceiling_counts_the_time_spent_taking_the_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    container: FakeContainer,
+) -> None:
+    clock = [1000.0]
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock[0])
+
+    class SlowTransitionTracker(ReadyTracker):
+        def set_status(self, key: str, status: str) -> None:
+            clock[0] += 300
+
+    monkeypatch.setattr(cli, "make_tracker", lambda made: SlowTransitionTracker())
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert container.calls == [("run", workspace.worktree, 1500)]
+
+
 @pytest.mark.parametrize("seconds", [1800, 2400])
 def test_run_that_reached_its_ceiling_before_the_container_fails_without_starting_it(
     monkeypatch: pytest.MonkeyPatch,
