@@ -1,3 +1,4 @@
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -6,12 +7,14 @@ from typing import Any
 import pytest
 
 from dev_worker import workspace as workspace_module
-from dev_worker.instance import Repository
+from dev_worker.instance import GitIdentity, Repository
 from dev_worker.workspace import Workspace, WorkspaceError
 
 TOKEN = "s3cret-token-value"
 REPOSITORY = Repository(type="github", name="octo/widgets", token_env="GITHUB_TOKEN")
 BRANCH = "agent/DEMO-1"
+BRANCH_REF = f"refs/heads/{BRANCH}"
+IDENTITY = GitIdentity(name="Rescue Bot", email="bot@example.com")
 
 
 def git(*arguments: str | Path) -> str:
@@ -231,6 +234,162 @@ def test_close_fails_naming_why_when_no_worktree_is_open(space: Workspace) -> No
 
     with pytest.raises(WorkspaceError, match="git failed while removing the worktree"):
         space.close(BRANCH)
+
+
+def remote_branch(remote: Path) -> str:
+    """Return the commit `BRANCH` points to on `remote`, empty when it lacks the branch."""
+    return git("-C", remote, "for-each-ref", "--format=%(objectname)", BRANCH_REF)
+
+
+def test_rescue_with_nothing_to_commit_nor_beyond_the_default_branch_pushes_nothing(
+    space: Workspace, remote: Path, work: Path
+) -> None:
+    space.refresh()
+    path = space.open(BRANCH)
+
+    space.rescue(BRANCH, IDENTITY)
+
+    assert git("-C", path, "rev-parse", "HEAD") == git("-C", work, "rev-parse", "HEAD")
+    assert remote_branch(remote) == ""
+
+
+def test_rescue_commits_what_is_left_as_the_instance_then_pushes_the_branch(
+    space: Workspace, remote: Path, work: Path, tmp_path: Path
+) -> None:
+    (tmp_path / "gitconfig").write_text(
+        "[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = no-such-signer\n",
+        encoding="utf-8",
+    )
+    space.refresh()
+    path = space.open(BRANCH)
+    (path / "untracked.txt").write_text("new", encoding="utf-8")
+    git("-C", path, "commit", "--quiet", "--no-gpg-sign", "--allow-empty", "-m", "own")
+
+    space.rescue(BRANCH, IDENTITY)
+
+    head = git("-C", path, "rev-parse", "HEAD")
+    assert git("-C", path, "log", "-1", "--format=%an|%ae|%cn|%ce|%s") == (
+        "Rescue Bot|bot@example.com|Rescue Bot|bot@example.com|"
+        "chore: rescue of the work the run left uncommitted"
+    )
+    assert git("-C", path, "show", "--format=", "--name-only", head) == "untracked.txt"
+    assert git("-C", path, "status", "--porcelain") == ""
+    assert remote_branch(remote) == head
+
+
+def test_rescue_with_commits_but_nothing_left_pushes_without_committing(
+    space: Workspace, remote: Path
+) -> None:
+    space.refresh()
+    path = space.open(BRANCH)
+    own = commit(path, "own")
+
+    space.rescue(BRANCH, IDENTITY)
+
+    assert git("-C", path, "rev-parse", "HEAD") == own
+    assert remote_branch(remote) == own
+
+
+def test_rescue_of_a_branch_the_remote_has_pushes_it_forward(
+    space: Workspace, remote: Path, work: Path
+) -> None:
+    commit(work, "earlier run")
+    git("-C", work, "push", "--quiet", "origin", f"HEAD:{BRANCH}")
+    space.refresh()
+    path = space.open(BRANCH)
+    (path / "more.txt").write_text("more", encoding="utf-8")
+
+    space.rescue(BRANCH, IDENTITY)
+
+    assert remote_branch(remote) == git("-C", path, "rev-parse", "HEAD")
+
+
+def test_rescue_never_forces_a_remote_branch_that_moved_on(
+    space: Workspace, remote: Path, work: Path
+) -> None:
+    space.refresh()
+    path = space.open(BRANCH)
+    commit(path, "own")
+    elsewhere = commit(work, "pushed meanwhile")
+    git("-C", work, "push", "--quiet", "origin", f"HEAD:{BRANCH}")
+
+    with pytest.raises(
+        WorkspaceError, match=f"git failed while pushing the branch {BRANCH}: "
+    ):
+        space.rescue(BRANCH, IDENTITY)
+
+    assert remote_branch(remote) == elsewhere
+
+
+def test_drop_left_branches_without_a_mirror_does_nothing(space: Workspace) -> None:
+    space.drop_left_branches()
+
+    assert not space.mirror.exists()
+
+
+def test_drop_left_branches_without_any_leaves_the_mirror_as_it_is(
+    space: Workspace,
+) -> None:
+    space.refresh()
+    before = remote_refs(space.mirror)
+
+    space.drop_left_branches()
+
+    assert git("-C", space.mirror, "for-each-ref", "refs/heads") == ""
+    assert remote_refs(space.mirror) == before
+
+
+def test_branch_left_without_its_worktree_is_dropped_so_the_next_open_works(
+    space: Workspace,
+) -> None:
+    space.refresh()
+    space.open(BRANCH)
+    git("-C", space.mirror, "worktree", "remove", "--force", space.worktree)
+    git("-C", space.mirror, "branch", "agent/OTHER-2", "refs/remotes/origin/main")
+
+    space.drop_left_branches()
+
+    assert git("-C", space.mirror, "for-each-ref", "refs/heads") == ""
+    assert space.open(BRANCH) == space.worktree
+
+
+def test_drop_left_branches_forgets_a_worktree_deleted_from_the_host(
+    space: Workspace,
+) -> None:
+    space.refresh()
+    space.open(BRANCH)
+    shutil.rmtree(space.worktree)
+
+    space.drop_left_branches()
+
+    assert git("-C", space.mirror, "for-each-ref", "refs/heads") == ""
+    assert space.open(BRANCH) == space.worktree
+
+
+def test_left_branch_is_none_without_a_worktree(space: Workspace) -> None:
+    space.refresh()
+
+    assert space.left_branch() is None
+
+
+def test_left_branch_is_read_from_the_worktree(space: Workspace) -> None:
+    space.refresh()
+    space.open("agent/OLD-7")
+
+    assert space.left_branch() == "agent/OLD-7"
+
+
+def test_left_branch_of_a_detached_worktree_fails_naming_why(
+    space: Workspace,
+) -> None:
+    space.refresh()
+    path = space.open(BRANCH)
+    git("-C", path, "checkout", "--quiet", "--detach")
+
+    with pytest.raises(
+        WorkspaceError, match="git failed while reading the branch of the worktree"
+    ):
+        space.left_branch()
 
 
 def test_refresh_that_cannot_fetch_fails_with_the_token_masked(

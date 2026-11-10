@@ -2,7 +2,8 @@
 
 Both live in the instance directory. The mirror is a bare repository whose
 `refs/remotes/origin/*` follow the remote; a run only adds, then deletes, the local
-branch of its worktree. Every git call signs in through `gh` with the instance token,
+branch of its worktree, and before deleting it rescues its work to the remote (see
+`Workspace.rescue`). Every git call signs in through `gh` with the instance token,
 which is never written in an argument or in the mirror's configuration, and is bounded:
 one that has not answered within `GIT_TIMEOUT_SECONDS` (600 seconds) is stopped and
 raises `WorkspaceError`.
@@ -14,7 +15,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from dev_worker.github import REDACTED, failure_reason
-from dev_worker.instance import Repository
+from dev_worker.instance import GitIdentity, Repository
 
 GIT_TIMEOUT_SECONDS = 600.0
 MIRROR_DIRECTORY = "mirror.git"
@@ -23,10 +24,11 @@ REMOTE = "origin"
 FETCH_REFSPEC = f"+refs/heads/*:refs/remotes/{REMOTE}/*"
 DEFAULT_BRANCH_REF = f"refs/remotes/{REMOTE}/HEAD"
 CREDENTIAL_HELPER = "!gh auth git-credential"
+RESCUE_MESSAGE = "chore: rescue of the work the run left uncommitted"
 
 
 class WorkspaceError(Exception):
-    """Raised when the mirror cannot be refreshed or a worktree cannot be opened or removed.
+    """Raised when the mirror cannot be refreshed or a worktree cannot be read, opened, rescued or removed.
 
     The message is a sentence saying why; it never holds a token.
     """
@@ -133,6 +135,87 @@ class Workspace:
             f"deleting the local branch {branch}", "branch", "--quiet", "-D", branch
         )
 
+    def left_branch(self) -> str | None:
+        """Return the branch of the worktree left on the host, or None when there is no worktree.
+
+        The branch is read from the worktree itself. Raises `WorkspaceError` when the
+        worktree path exists but its branch cannot be read, as when it is not a worktree
+        or its HEAD is detached.
+        """
+        if not self.worktree.exists():
+            return None
+        return self._git_worktree(
+            "reading the branch of the worktree", "symbolic-ref", "--short", "HEAD"
+        ).strip()
+
+    def drop_left_branches(self) -> None:
+        """Forget worktrees gone from the host, then delete every local branch of the mirror.
+
+        Nothing is done when the mirror does not exist yet. Meant for when no worktree
+        is left: the local branches are then all from earlier runs. Raises
+        `WorkspaceError` when a git call fails.
+        """
+        if not self.mirror.exists():
+            return
+        self._git_mirror("forgetting the removed worktrees", "worktree", "prune")
+        left = self._git_mirror(
+            "listing the local branches",
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads",
+        ).split()
+        if left:
+            self._git_mirror(
+                "deleting the local branches left by earlier runs",
+                "branch",
+                "--quiet",
+                "-D",
+                *left,
+            )
+
+    def rescue(self, branch: str, identity: GitIdentity) -> None:
+        """Commit what the worktree holds uncommitted, then push `branch` when it is ahead.
+
+        Every change, untracked files included, goes into one commit with
+        `RESCUE_MESSAGE`, authored and committed by `identity`, unsigned and without
+        hooks; nothing is committed when there is no change. `branch` is then pushed to
+        `refs/heads/<branch>` on the remote, never forced, only when the worktree HEAD
+        holds commits the remote's default branch lacks. Raises `WorkspaceError` when a
+        git call fails, as when the remote branch has moved on.
+        """
+        self._git_worktree("staging the work left in the worktree", "add", "--all")
+        staged = self._git_worktree(
+            "listing the staged changes", "diff", "--cached", "--name-only"
+        )
+        if staged.strip():
+            self._git_worktree(
+                "committing the work left in the worktree",
+                "-c",
+                f"user.name={identity.name}",
+                "-c",
+                f"user.email={identity.email}",
+                "commit",
+                "--quiet",
+                "--no-verify",
+                "--no-gpg-sign",
+                "--message",
+                RESCUE_MESSAGE,
+            )
+        ahead = self._git_worktree(
+            "counting the commits beyond the default branch",
+            "rev-list",
+            "--count",
+            f"{DEFAULT_BRANCH_REF}..HEAD",
+        )
+        if int(ahead) > 0:
+            self._git_worktree(
+                f"pushing the branch {branch}",
+                "push",
+                "--quiet",
+                REMOTE,
+                f"HEAD:refs/heads/{branch}",
+            )
+
     def _delete_ref_after(self, error: WorkspaceError, ref: str) -> None:
         """Delete `ref` from the mirror, if it exists, after `error` made an `open` fail.
 
@@ -157,6 +240,10 @@ class Workspace:
     def _git_mirror(self, action: str, *arguments: str) -> str:
         """Run git with `arguments` in the mirror and return what it wrote to stdout; see `_git`."""
         return self._git(action, "-C", str(self.mirror), *arguments)
+
+    def _git_worktree(self, action: str, *arguments: str) -> str:
+        """Run git with `arguments` in the worktree and return what it wrote to stdout; see `_git`."""
+        return self._git(action, "-C", str(self.worktree), *arguments)
 
     def _git(self, action: str, *arguments: str) -> str:
         """Run git with `arguments` and return what it wrote to stdout.
