@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from dev_worker import cli, run_journal
+from dev_worker.container import Container, ContainerError
 from dev_worker.contract import MandateInput, MandateOutput
 from dev_worker.github import GitHubRepository
 from dev_worker.header import HeaderError
@@ -31,6 +32,7 @@ TORN_FILE = "journal.torn"
 MAKE_TRACKER = cli.make_tracker
 MAKE_REPOSITORY = cli.make_repository
 MAKE_WORKSPACE = cli.make_workspace
+MAKE_CONTAINER = cli.make_container
 
 
 def valid_input(**overrides: object) -> dict[str, object]:
@@ -101,6 +103,7 @@ class FakeWorkspace:
     def __init__(self, fail: str | None = None) -> None:
         self.fail = fail
         self.calls: list[tuple[str, ...]] = []
+        self.worktree = Path("worktree")
 
     def _step(self, *call: str) -> None:
         self.calls.append(call)
@@ -126,6 +129,41 @@ def workspace(monkeypatch: pytest.MonkeyPatch) -> FakeWorkspace:
     """Make `run` use a `FakeWorkspace` instead of a git mirror; return it."""
     fake = FakeWorkspace()
     monkeypatch.setattr(cli, "make_workspace", lambda repository, directory: fake)
+    return fake
+
+
+class FakeContainer:
+    """A container that records its calls and raises `error`, when set, from each of them."""
+
+    def __init__(self, error: ContainerError | None = None) -> None:
+        self.error = error
+        self.images: list[str] = []
+        self.calls: list[tuple[object, ...]] = []
+
+    def make(self, image: str) -> "FakeContainer":
+        """Record `image` and return this fake, in place of `cli.make_container`."""
+        self.images.append(image)
+        return self
+
+    def _step(self, *call: object) -> None:
+        self.calls.append(call)
+        if self.error is not None:
+            raise self.error
+
+    def check_access(self) -> None:
+        """Record the check."""
+        self._step("check_access")
+
+    def run(self, worktree: Path, time_left: float) -> None:
+        """Record the run on `worktree` with `time_left` seconds left."""
+        self._step("run", worktree, time_left)
+
+
+@pytest.fixture(autouse=True)
+def container(monkeypatch: pytest.MonkeyPatch) -> FakeContainer:
+    """Make `run` and `health` use a `FakeContainer` instead of Docker; return it."""
+    fake = FakeContainer()
+    monkeypatch.setattr(cli, "make_container", fake.make)
     return fake
 
 
@@ -723,7 +761,7 @@ def test_journal_records_the_duration_of_the_mandate_in_seconds(
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
 ) -> None:
-    clock = [100.0, 102.5]
+    clock = [90.0, 100.0, 101.0, 102.5]
     monkeypatch.setattr(cli.time, "monotonic", lambda: clock.pop(0))
 
     run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
@@ -909,6 +947,173 @@ def test_workspace_that_cannot_be_prepared_fails_naming_why_and_journals_it(
         "running",
         "failed",
     ]
+
+
+def test_container_runs_from_the_instance_image_on_the_worktree_before_the_mandate(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    container: FakeContainer,
+) -> None:
+    seen: list[tuple[list[tuple[str, ...]], list[tuple[object, ...]]]] = []
+
+    def peek(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+        seen.append((list(workspace.calls), list(container.calls)))
+        return cli.deliver_ticket(mandate, resolved)
+
+    monkeypatch.setitem(cli.MANDATES, "deliver_ticket", peek)
+    slow_refresh(monkeypatch, workspace, 0)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed"
+    assert container.images == ["ghcr.io/example-org/example-app-agent:1.0.0"]
+    assert seen == [
+        (
+            [("refresh",), ("open", "agent/DEMO-1")],
+            [("run", workspace.worktree, 1800)],
+        )
+    ]
+
+
+def test_container_runs_under_the_run_timeout_of_the_instance(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+) -> None:
+    with instance.open("a", encoding="utf-8") as file:
+        file.write("  run_timeout_seconds: 5\n")
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    [(step, worktree, time_left)] = container.calls
+    assert (step, worktree) == ("run", Path("worktree"))
+    assert isinstance(time_left, float)
+    assert 4 < time_left <= 5
+
+
+def slow_refresh(
+    monkeypatch: pytest.MonkeyPatch, workspace: FakeWorkspace, seconds: float
+) -> None:
+    """Make the clock of `cli` stand still, except during the refresh, which takes `seconds`."""
+    clock = [1000.0]
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock[0])
+    refresh = workspace.refresh
+
+    def slow() -> None:
+        refresh()
+        clock[0] += seconds
+
+    monkeypatch.setattr(workspace, "refresh", slow)
+
+
+def test_container_is_given_the_time_left_once_the_worktree_is_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    container: FakeContainer,
+) -> None:
+    slow_refresh(monkeypatch, workspace, 600)
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert container.calls == [("run", workspace.worktree, 1200)]
+
+
+def test_container_time_left_counts_the_time_spent_taking_the_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    container: FakeContainer,
+) -> None:
+    clock = [1000.0]
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock[0])
+
+    class SlowTransitionTracker(ReadyTracker):
+        def set_status(self, key: str, status: str) -> None:
+            clock[0] += 300
+
+    monkeypatch.setattr(cli, "make_tracker", lambda made: SlowTransitionTracker())
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert container.calls == [("run", workspace.worktree, 1500)]
+
+
+@pytest.mark.parametrize("seconds", [1800, 2400])
+def test_run_that_reached_its_ceiling_before_the_container_fails_without_starting_it(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    container: FakeContainer,
+    seconds: float,
+) -> None:
+    ran: list[str] = []
+
+    def record(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+        ran.append(mandate.task_id)
+        return cli.deliver_ticket(mandate, resolved)
+
+    monkeypatch.setitem(cli.MANDATES, "deliver_ticket", record)
+    slow_refresh(monkeypatch, workspace, seconds)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(
+        answer,
+        "task-1",
+        "The container was not started: the run ceiling of 1800 seconds "
+        "was reached before it.",
+    )
+    assert container.calls == []
+    assert ran == []
+    assert workspace.calls[-1] == ("close", "agent/DEMO-1")
+
+
+def test_container_that_fails_fails_the_run_naming_why_without_the_mandate(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    container: FakeContainer,
+) -> None:
+    ran: list[str] = []
+
+    def record(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+        ran.append(mandate.task_id)
+        return cli.deliver_ticket(mandate, resolved)
+
+    monkeypatch.setitem(cli.MANDATES, "deliver_ticket", record)
+    container.error = ContainerError("docker failed while running the container: no")
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(
+        answer,
+        "task-1",
+        "The container failed: docker failed while running the container: no",
+    )
+    assert ran == []
+    assert workspace.calls[-1] == ("close", "agent/DEMO-1")
+    assert [line["status"] for line in journal_lines(instance)] == [
+        "running",
+        "failed",
+    ]
+
+
+def test_make_container_returns_a_container() -> None:
+    assert isinstance(MAKE_CONTAINER("example/image:1.0"), Container)
 
 
 def test_worktree_is_closed_when_the_mandate_fails(
@@ -3642,3 +3847,37 @@ def test_health_is_degraded_when_both_connectors_can_be_reached(
     monkeypatch.setattr(cli, "make_repository", lambda made: repository)
 
     assert health(monkeypatch, capsysbinary, instance)["status"] == "degraded"
+
+
+def test_health_is_down_when_docker_cannot_be_reached(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+) -> None:
+    container.error = ContainerError("docker could not be started: not found")
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert answer == {
+        "status": "down",
+        "reason": "Docker cannot be reached: docker could not be started: not found",
+        "active": True,
+    }
+    assert container.images == ["ghcr.io/example-org/example-app-agent:1.0.0"]
+    assert container.calls == [("check_access",)]
+
+
+def test_health_does_not_check_docker_when_a_connector_cannot_be_reached(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+) -> None:
+    monkeypatch.setattr(
+        cli, "make_tracker", lambda made: Unreachable(TrackerError("refused"))
+    )
+
+    health(monkeypatch, capsysbinary, instance)
+
+    assert container.calls == []

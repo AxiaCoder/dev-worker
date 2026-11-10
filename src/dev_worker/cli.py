@@ -18,6 +18,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from dev_worker.container import Container, ContainerError
 from dev_worker.contract import (
     CONTRACT_VERSION,
     Health,
@@ -154,6 +155,20 @@ def make_workspace(repository: Repository, directory: Path) -> Workspace:
     return Workspace(repository, directory)
 
 
+def make_container(image: str) -> Container:
+    """Return the container a run starts from `image`."""
+    return Container(image)
+
+
+def unreachable_docker(instance: Instance) -> str | None:
+    """Return why the Docker daemon cannot be reached, `None` when it can. Never raises."""
+    try:
+        make_container(instance.container.image).check_access()
+    except ContainerError as error:
+        return f"Docker cannot be reached: {error}"
+    return None
+
+
 def unreachable_connector(instance: Instance) -> str | None:
     """Return why the tracker or then the repository of `instance` cannot be reached, `None` when both can.
 
@@ -259,6 +274,7 @@ def run_journaled(
             f"Instance directory '{directory}' cannot be created: {os_reason(error)}",
         )
     start = datetime.now(UTC).isoformat()
+    began = time.monotonic()
     record = {
         "task_id": task_id,
         "ticket_key": ticket_key,
@@ -277,7 +293,9 @@ def run_journaled(
         return failed(task_id, taken)
     lock = taken
     try:
-        output = run_under_lock(handler, mandate, instance, tracker, directory, start)
+        output = run_under_lock(
+            handler, mandate, instance, tracker, directory, start, began
+        )
     finally:
         try:
             release_lock(lock, record)
@@ -297,6 +315,7 @@ def run_under_lock(
     tracker: TicketTracker,
     directory: Path,
     start: str,
+    began: float,
 ) -> MandateOutput:
     """Run `handler` unless its task_id is already journaled, journaling the run twice.
 
@@ -306,9 +325,10 @@ def run_under_lock(
     task is never run again even if its final line, appended once `handler` returns,
     cannot be written; the output is then kept, with the journal error added to
     `errors`. A run whose `running` line cannot be written fails without running
-    `handler`. Once the `running` line is written, `handler` runs in a fresh worktree
-    (see `run_in_worktree`). `start` is the ISO 8601 UTC start of the run, written as is in both
-    lines. A torn last journal line is first set aside in the torn file.
+    `handler`. Once the `running` line is written, `handler` runs in a fresh worktree,
+    after a disposable container (see `run_in_worktree`). `start` is the ISO 8601 UTC
+    start of the run, written as is in both lines, and `began` the `time.monotonic()`
+    reading taken with it. A torn last journal line is first set aside in the torn file.
     """
     task_id = mandate.task_id
     try:
@@ -342,9 +362,9 @@ def run_under_lock(
         return failed(
             task_id, f"Journal in '{directory}' cannot be written: {os_reason(error)}"
         )
-    began = time.monotonic()
-    output = run_in_worktree(handler, mandate, instance, directory)
-    entry |= {"status": output.status, "duration": time.monotonic() - began}
+    mandate_began = time.monotonic()
+    output = run_in_worktree(handler, mandate, instance, directory, began)
+    entry |= {"status": output.status, "duration": time.monotonic() - mandate_began}
     try:
         append_entry(directory, entry)
     except OSError as error:
@@ -366,11 +386,33 @@ def close_worktree(workspace: Workspace, branch: str) -> str | None:
     return None
 
 
+def run_container(instance: Instance, worktree: Path, began: float) -> str | None:
+    """Run the container of `instance` on `worktree` for the time left in the run; return why it failed, or None.
+
+    `began` is the `time.monotonic()` reading taken when the run started; the time left
+    is `run_timeout_seconds` minus the seconds elapsed since. None left: the container
+    is not started.
+    """
+    ceiling = instance.limits["run_timeout_seconds"]
+    left = ceiling - (time.monotonic() - began)
+    if left <= 0:
+        return (
+            f"The container was not started: the run ceiling of {ceiling} seconds "
+            "was reached before it."
+        )
+    try:
+        make_container(instance.container.image).run(worktree, left)
+    except ContainerError as error:
+        return f"The container failed: {error}"
+    return None
+
+
 def run_in_worktree(
     handler: Callable[[MandateInput, Instance], MandateOutput],
     mandate: MandateInput,
     instance: Instance,
     directory: Path,
+    began: float,
 ) -> MandateOutput:
     """Run `handler` once the mirror in `directory` is refreshed and a fresh worktree opened.
 
@@ -380,6 +422,14 @@ def run_in_worktree(
     `handler`. Once opened, the worktree and its local branch are removed whatever
     `handler` returns or raises; a removal that fails keeps the output, with the reason
     added to `errors`, or the exception `handler` raised, with the reason added as a note.
+
+    Before `handler`, one disposable container is run from the image of `instance`
+    with only the worktree mounted (see `Container.run`), and is gone once it ends or
+    is killed when the run reaches its `run_timeout_seconds` limit, counted from
+    `began`, the `time.monotonic()` reading taken when the run started (see
+    `run_container`); a container that cannot be run, that reaches that limit, or that
+    the run reached it before, gives a failed output naming the reason, without
+    running `handler`.
     """
     ticket_key = mandate.params["ticket_key"]
     assert isinstance(ticket_key, str)
@@ -391,7 +441,11 @@ def run_in_worktree(
     except WorkspaceError as error:
         return failed(mandate.task_id, f"The worktree cannot be prepared: {error}")
     try:
-        output = handler(mandate, instance)
+        container_error = run_container(instance, workspace.worktree, began)
+        if container_error is not None:
+            output = failed(mandate.task_id, container_error)
+        else:
+            output = handler(mandate, instance)
     except BaseException as error:
         close_error = close_worktree(workspace, branch)
         if close_error is not None:
@@ -764,7 +818,8 @@ def read_health(instance_path: Path) -> Health:
     the journal cannot be read the way a run reads it (see `unreadable_journal`), or
     its torn last line cannot be set aside (see `unsettable_torn_line`), or the
     tracker or the repository cannot be reached with the instance credentials (see
-    `unreachable_connector`); `degraded`
+    `unreachable_connector`), or the Docker daemon cannot be reached (see
+    `unreachable_docker`); `degraded`
     when the run holding the lock is gone (see `gone_reason`), which the next run mends
     by taking the lock over, or the journal holds a torn line (see
     `torn_journal_line`); `ok` otherwise. Writes nothing and never raises.
@@ -788,6 +843,9 @@ def read_health(instance_path: Path) -> Health:
     unreachable = unreachable_connector(instance)
     if unreachable is not None:
         return Health(status="down", reason=writable_text(unreachable), active=True)
+    no_docker = unreachable_docker(instance)
+    if no_docker is not None:
+        return Health(status="down", reason=writable_text(no_docker), active=True)
     lock = read_lock(directory)
     timeout = instance.limits["run_timeout_seconds"]
     gone = None if lock is None else gone_reason(directory, lock, timeout)
