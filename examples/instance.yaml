@@ -15,6 +15,19 @@ repository:
   name: example-org/example-app
   token_env: GITHUB_TOKEN
 
+# The name of the branch a run works on; {key} is replaced by the ticket key.
+branch: agent/{key}
+
+# The image a run starts, pinned by a tag other than latest or by a digest.
+container:
+  image: ghcr.io/example-org/example-app-agent:1.0.0
+
+# The identity of the commits the worker's code makes. Use the account's noreply address,
+# so that a push is not refused for exposing a private email.
+git:
+  name: Example Worker
+  email: 12345678+example-worker@users.noreply.github.com
+
 # Every status key of the header, mapped to the status name your tracker really uses.
 statuses:
   ready: To Do

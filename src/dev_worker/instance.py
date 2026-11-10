@@ -20,6 +20,13 @@ from dev_worker.header import (
 )
 
 ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]*")
+_PATH_COMPONENT = r"[a-z0-9]+(?:[._-]+[a-z0-9]+)*"
+IMAGE_REFERENCE = re.compile(
+    r"(?:[A-Za-z0-9.-]+(?::[0-9]+)?/)?"
+    rf"{_PATH_COMPONENT}(?:/{_PATH_COMPONENT})*"
+    r"(?::(?P<tag>[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}))?"
+    r"(?:@(?P<digest>[A-Za-z][A-Za-z0-9]*:[0-9a-fA-F]{32,}))?"
+)
 
 
 class InstanceError(ValueError):
@@ -49,6 +56,42 @@ def _check_env_name(value: str) -> str:
 EnvName = Annotated[str, AfterValidator(_check_env_name)]
 
 
+def _check_branch_template(value: str) -> str:
+    """Return `value` when it contains `{key}` and no other brace; raise `ValueError` otherwise."""
+    rest = value.replace("{key}", "")
+    if rest == value or "{" in rest or "}" in rest:
+        raise ValueError(
+            "must contain {key}, which the ticket key replaces, and no other brace,"
+            " e.g. agent/{key}"
+        )
+    return value
+
+
+BranchTemplate = Annotated[str, AfterValidator(_check_branch_template)]
+
+
+def _check_pinned_image(value: str) -> str:
+    """Return `value` when it names an image by digest or by a tag other than `latest`.
+
+    The reference reads `[host[:port]/]path[:tag][@digest]`: path components in lowercase
+    ASCII, a tag in ASCII, a digest `<algorithm>:<hex>` with at least 32 hex digits. Raises
+    `ValueError` otherwise.
+    """
+    match = IMAGE_REFERENCE.fullmatch(value)
+    pinned = bool(match) and bool(
+        match["digest"] or match["tag"] not in (None, "latest")
+    )
+    if not pinned:
+        raise ValueError(
+            "must pin a version, with a tag other than latest or a digest,"
+            " e.g. python:3.12-slim"
+        )
+    return value
+
+
+Image = Annotated[Name, AfterValidator(_check_pinned_image)]
+
+
 class Tracker(BaseModel):
     """The ticket tracker of an instance, its account and the variable holding its token.
 
@@ -74,6 +117,23 @@ class Repository(BaseModel):
     token_env: EnvName
 
 
+class Container(BaseModel):
+    """The container a run starts: `image` is its image, pinned by a tag or a digest."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    image: Image
+
+
+class GitIdentity(BaseModel):
+    """The author name and email of the commits the worker's code makes."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    name: Name
+    email: Name
+
+
 class _InstanceData(BaseModel):
     """An instance file as written, before it is checked against a header."""
 
@@ -81,6 +141,9 @@ class _InstanceData(BaseModel):
 
     tracker: Tracker
     repository: Repository
+    branch: BranchTemplate
+    container: Container
+    git: GitIdentity
     statuses: Mapping[StatusKey, Name]
     hold_merge_label: Name
     limits: Mapping[CeilingName, Ceiling] = Field(default_factory=dict)
@@ -90,6 +153,7 @@ class _InstanceData(BaseModel):
 class Instance:
     """A validated instance, resolved against its header.
 
+    `branch` is the branch name template, in which `{key}` stands for the ticket key.
     `statuses` maps every status key of the header to the tracker's real status name.
     `hold_merge_label` is the ticket label that holds a merge back.
     `limits` maps every ceiling name of the header to its effective value: the instance's
@@ -98,6 +162,9 @@ class Instance:
 
     tracker: Tracker
     repository: Repository
+    branch: str
+    container: Container
+    git: GitIdentity
     statuses: Mapping[str, str]
     hold_merge_label: str
     limits: Mapping[str, int]
@@ -203,6 +270,9 @@ def load_instance(path: Path, header: Header) -> Instance:
     return Instance(
         tracker=data.tracker,
         repository=data.repository,
+        branch=data.branch,
+        container=data.container,
+        git=data.git,
         statuses=MappingProxyType(
             {key: data.statuses[key] for key in header.status_keys}
         ),
