@@ -199,9 +199,9 @@ class GitHubRepository:
         and this returns as if it were merged.
 
         Raises `RepositoryError` when the token variable is not set or `gh` fails; when the
-        refusal is GitHub's for a moved head, it raises `HeadMovedError`. After a timeout the
-        merge may still have happened: the pull request is to be read again, not assumed
-        open.
+        refusal is GitHub's for a moved head, it raises `HeadMovedError`, and nothing was
+        merged. After any other `RepositoryError` the merge may still have happened: the
+        pull request is to be read again, not assumed open.
         """
         number = pull_request.number
         try:
