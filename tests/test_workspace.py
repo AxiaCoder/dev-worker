@@ -277,6 +277,23 @@ def test_rescue_commits_what_is_left_as_the_instance_then_pushes_the_branch(
     assert remote_branch(remote) == head
 
 
+def test_rescue_commits_past_a_hook_that_refuses_every_commit(
+    space: Workspace, remote: Path
+) -> None:
+    space.refresh()
+    hook = space.mirror / "hooks" / "pre-commit"
+    hook.parent.mkdir(exist_ok=True)
+    hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8", newline="\n")
+    hook.chmod(0o755)
+    path = space.open(BRANCH)
+    (path / "left.txt").write_text("left", encoding="utf-8")
+
+    space.rescue(BRANCH, IDENTITY)
+
+    assert git("-C", path, "status", "--porcelain") == ""
+    assert remote_branch(remote) == git("-C", path, "rev-parse", "HEAD")
+
+
 def test_rescue_with_commits_but_nothing_left_pushes_without_committing(
     space: Workspace, remote: Path
 ) -> None:
