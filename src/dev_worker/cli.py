@@ -402,8 +402,9 @@ def end_worktree(workspace: Workspace, branch: str, instance: Instance) -> str |
 def rescue_left_worktree(instance: Instance, directory: Path) -> str | None:
     """Rescue then remove a worktree an earlier run left in `directory`; return why it failed, or None.
 
-    When no worktree is left, the local branches an earlier run left in the mirror,
-    already rescued, are deleted (see `Workspace.drop_left_branches`). Otherwise the
+    When no worktree is left, the local branches earlier runs left in the mirror are
+    deleted when the remote holds their tip, and kept otherwise (see
+    `Workspace.drop_left_branches`). Otherwise the
     branch of the worktree is read from it, the mirror is refreshed, and the worktree is
     ended as a run ends its own (see `end_worktree`).
     """

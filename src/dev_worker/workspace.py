@@ -138,9 +138,10 @@ class Workspace:
     def left_branch(self) -> str | None:
         """Return the branch of the worktree left on the host, or None when there is no worktree.
 
-        The branch is read from the worktree itself. Raises `WorkspaceError` when the
-        worktree path exists but its branch cannot be read, as when it is not a worktree
-        or its HEAD is detached.
+        The branch is read from the mirror's record of the worktree, not from the
+        template. Raises `WorkspaceError` when the worktree path exists but its branch
+        cannot be read, as when the mirror records no worktree there or its HEAD is
+        detached.
         """
         if not self.worktree.exists():
             return None
@@ -149,21 +150,35 @@ class Workspace:
         ).strip()
 
     def drop_left_branches(self) -> None:
-        """Forget worktrees gone from the host, then delete every local branch of the mirror.
+        """Forget worktrees gone from the host, then delete the local branches the remote holds.
 
-        Nothing is done when the mirror does not exist yet. Meant for when no worktree
-        is left: the local branches are then all from earlier runs. Raises
-        `WorkspaceError` when a git call fails.
+        A local branch is deleted only when its tip is in a `refs/remotes/origin/*` ref
+        of the mirror; one holding a commit the remote lacks is kept. Nothing is done
+        when the mirror does not exist yet. Meant for when no worktree is left: the
+        local branches are then all from earlier runs. Raises `WorkspaceError` when a
+        git call fails.
         """
         if not self.mirror.exists():
             return
         self._git_mirror("forgetting the removed worktrees", "worktree", "prune")
-        left = self._git_mirror(
+        branches = self._git_mirror(
             "listing the local branches",
             "for-each-ref",
             "--format=%(refname:short)",
             "refs/heads",
         ).split()
+        left = [
+            branch
+            for branch in branches
+            if self._git_mirror(
+                f"looking for the branch {branch} on the remote",
+                "for-each-ref",
+                "--count=1",
+                "--contains",
+                f"refs/heads/{branch}",
+                f"refs/remotes/{REMOTE}",
+            ).strip()
+        ]
         if left:
             self._git_mirror(
                 "deleting the local branches left by earlier runs",
@@ -241,9 +256,40 @@ class Workspace:
         """Run git with `arguments` in the mirror and return what it wrote to stdout; see `_git`."""
         return self._git(action, "-C", str(self.mirror), *arguments)
 
+    def _worktree_admin(self) -> Path:
+        """Return the directory where the mirror keeps the worktree's git data.
+
+        It is found among the mirror's `worktrees/*` by the worktree path each records in
+        its `gitdir` file; the worktree's own `.git` is never read. Raises
+        `WorkspaceError` when the mirror records no such directory.
+        """
+        worktree = self.worktree.resolve()
+        admins = self.mirror / "worktrees"
+        for admin in sorted(admins.iterdir()) if admins.is_dir() else []:
+            try:
+                recorded = (admin / "gitdir").read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+            if Path(recorded).parent.resolve() == worktree:
+                return admin
+        raise WorkspaceError(
+            f"the mirror records no worktree at '{self.worktree}'; "
+            "it was not made by a run"
+        )
+
     def _git_worktree(self, action: str, *arguments: str) -> str:
-        """Run git with `arguments` in the worktree and return what it wrote to stdout; see `_git`."""
-        return self._git(action, "-C", str(self.worktree), *arguments)
+        """Run git with `arguments` on the worktree and return what it wrote to stdout; see `_git`.
+
+        Git reads the repository from the mirror (see `_worktree_admin`), never through
+        the worktree's `.git`, which the container may have rewritten.
+        """
+        admin = self._worktree_admin()
+        return self._git(
+            action,
+            f"--git-dir={admin}",
+            f"--work-tree={self.worktree}",
+            *arguments,
+        )
 
     def _git(self, action: str, *arguments: str) -> str:
         """Run git with `arguments` and return what it wrote to stdout.
