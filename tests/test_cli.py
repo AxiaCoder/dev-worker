@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from importlib.metadata import entry_points
 from pathlib import Path
@@ -224,13 +225,19 @@ def test_refused_ticket_key_fails_without_journaling(
 class StubTracker:
     """A tracker that answers every read with `answer`, raising it when it is an error.
 
-    `reads` records each key read and `trackers` each instance tracker it was made for.
+    A status change raises `move_error` when one is given; otherwise it becomes the
+    status of the ticket later reads answer. `reads` records each key read, `moves` each
+    status change asked and `trackers` each instance tracker it was made for.
     """
 
-    def __init__(self, answer: Ticket | TrackerError) -> None:
-        """Keep `answer` for every later read."""
+    def __init__(
+        self, answer: Ticket | TrackerError, move_error: TrackerError | None = None
+    ) -> None:
+        """Keep `answer` for every later read and `move_error` for every status change."""
         self.answer = answer
+        self.move_error = move_error
         self.reads: list[str] = []
+        self.moves: list[tuple[str, str]] = []
         self.trackers: list[Tracker] = []
 
     def make(self, tracker: Tracker) -> "StubTracker":
@@ -246,17 +253,24 @@ class StubTracker:
         return self.answer
 
     def set_status(self, key: str, status: str) -> None:
-        """Change nothing."""
+        """Record the change, then raise `move_error` or give the answer `status`."""
+        self.moves.append((key, status))
+        if self.move_error is not None:
+            raise self.move_error
+        if isinstance(self.answer, Ticket):
+            self.answer = replace(self.answer, status=status)
 
     def check_access(self) -> None:
         """Grant access."""
 
 
 def serve(
-    monkeypatch: pytest.MonkeyPatch, answer: Ticket | TrackerError
+    monkeypatch: pytest.MonkeyPatch,
+    answer: Ticket | TrackerError,
+    move_error: TrackerError | None = None,
 ) -> StubTracker:
-    """Make `run` read every ticket from a `StubTracker` answering `answer`."""
-    stub = StubTracker(answer)
+    """Make `run` use a `StubTracker` answering `answer` and raising `move_error`."""
+    stub = StubTracker(answer, move_error)
     monkeypatch.setattr(cli, "make_tracker", stub.make)
     return stub
 
@@ -431,6 +445,107 @@ def test_ticket_not_ready_is_refused_before_the_lock_and_leaves_the_journal(
     assert lock.read_bytes() == b"held by another run"
     assert (directory / run_journal.JOURNAL_FILE).read_bytes() == journal
     assert sorted(directory.iterdir()) == files
+
+
+def test_ready_ticket_is_moved_to_in_progress_once_before_any_file_is_created(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    directory = instance.with_suffix("")
+    directory_existed: list[bool] = []
+    move = stub.set_status
+
+    def spy(key: str, status: str) -> None:
+        directory_existed.append(directory.exists())
+        move(key, status)
+
+    monkeypatch.setattr(stub, "set_status", spy)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed"
+    assert stub.moves == [("DEMO-1", "In Progress")]
+    assert directory_existed == [False]
+
+
+def test_ticket_not_ready_is_not_moved(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket("Done"))
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", "is in status 'Done', not 'To Do'.")
+    assert stub.moves == []
+
+
+def test_ticket_the_tracker_cannot_read_is_not_moved(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = serve(monkeypatch, TrackerError("twg failed while reading DEMO-1: timeout"))
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert stub.moves == []
+
+
+def test_ticket_taken_by_a_run_is_refused_to_a_second_run_under_another_task_id(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    answer = run_mandate(
+        monkeypatch,
+        capsysbinary,
+        encode(valid_input(task_id="task-2")),
+        instance=instance,
+    )
+
+    assert_failed(answer, "task-2", "is in status 'In Progress', not 'To Do'.")
+    assert stub.moves == [("DEMO-1", "In Progress")]
+    assert [line["task_id"] for line in journal_lines(instance)] == [
+        "task-1",
+        "task-1",
+    ]
+
+
+def test_ticket_the_tracker_cannot_move_fails_as_of_unknown_status_creating_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    serve(
+        monkeypatch,
+        demo_ticket(),
+        TrackerError("twg failed while moving DEMO-1: timeout"),
+    )
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(
+        answer,
+        "task-1",
+        "Ticket 'DEMO-1' cannot be moved to 'In Progress': "
+        "twg failed while moving DEMO-1: timeout "
+        "Its status is unknown and is to be read again in the tracker.",
+    )
+    assert not instance.with_suffix("").exists()
+    assert journal_lines(instance) == []
 
 
 def test_make_tracker_returns_a_jira_tracker() -> None:
