@@ -172,6 +172,49 @@ def test_close_removes_the_worktree_and_its_branch_leaving_the_remote_refs(
     assert remote_refs(space.mirror) == before
 
 
+@pytest.mark.parametrize(
+    "rewritten", ["gitdir: /elsewhere\n", "not a gitdir line at all\n"]
+)
+def test_close_removes_the_worktree_and_its_branch_when_its_git_file_was_rewritten(
+    space: Workspace, rewritten: str
+) -> None:
+    space.refresh()
+    before = remote_refs(space.mirror)
+    path = space.open(BRANCH)
+    (path / ".git").unlink()
+    (path / ".git").write_text(rewritten, encoding="utf-8")
+
+    space.close(BRANCH)
+
+    assert not path.exists()
+    assert git("-C", space.mirror, "for-each-ref", "refs/heads") == ""
+    assert (
+        git("-C", space.mirror, "worktree", "list", "--porcelain").count("worktree ")
+        == 1
+    )
+    assert remote_refs(space.mirror) == before
+
+
+def test_close_leaves_the_target_of_a_link_out_of_the_worktree_untouched(
+    space: Workspace, tmp_path: Path
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    kept = outside / "kept.txt"
+    kept.write_text("not the worktree's", encoding="utf-8")
+    space.refresh()
+    path = space.open(BRANCH)
+    try:
+        (path / "link").symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symbolic links cannot be created here: {error}")
+
+    space.close(BRANCH)
+
+    assert not path.exists()
+    assert kept.read_text(encoding="utf-8") == "not the worktree's"
+
+
 def test_open_fails_naming_why_when_a_worktree_is_left(space: Workspace) -> None:
     space.refresh()
     space.open(BRANCH)
@@ -233,8 +276,93 @@ def test_open_that_fails_then_cannot_delete_its_branch_says_both(
 def test_close_fails_naming_why_when_no_worktree_is_open(space: Workspace) -> None:
     space.refresh()
 
-    with pytest.raises(WorkspaceError, match="git failed while removing the worktree"):
+    with pytest.raises(WorkspaceError, match="^the mirror records no worktree at "):
         space.close(BRANCH)
+
+
+def test_close_that_deletes_the_worktree_partly_leaves_no_branch_to_rescue(
+    space: Workspace, work: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (work / "tracked.txt").write_text("committed", encoding="utf-8")
+    git("-C", work, "add", "tracked.txt")
+    commit(work, "tracked")
+    git("-C", work, "push", "--quiet", "origin", "main")
+    space.refresh()
+    path = space.open(BRANCH)
+    tracked = path / "tracked.txt"
+    assert tracked.exists()
+    rmtree = shutil.rmtree
+
+    def delete_partly(target: Any, *arguments: Any, **options: Any) -> None:
+        if Path(target) == path:
+            tracked.unlink()
+            raise OSError("permission denied")
+        rmtree(target, *arguments, **options)
+
+    monkeypatch.setattr(workspace_module.shutil, "rmtree", delete_partly)
+
+    with pytest.raises(
+        WorkspaceError, match="^the worktree cannot be deleted: permission denied$"
+    ):
+        space.close(BRANCH)
+
+    with pytest.raises(WorkspaceError, match="the mirror records no worktree"):
+        space.left_branch()
+
+
+def failing_git(monkeypatch: pytest.MonkeyPatch, failing: str) -> list[list[str]]:
+    """Make the git call holding `failing` fail, let the others run; return every call."""
+    calls: list[list[str]] = []
+    run = subprocess.run
+
+    def answer(
+        arguments: list[str], **options: Any
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(arguments)
+        if failing in arguments:
+            return subprocess.CompletedProcess(arguments, 1, "", "refused\n")
+        return run(arguments, **options)
+
+    monkeypatch.setattr(workspace_module.subprocess, "run", answer)
+    return calls
+
+
+def test_close_that_cannot_prune_fails_naming_why_and_keeps_the_branch(
+    space: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    space.refresh()
+    path = space.open(BRANCH)
+    calls = failing_git(monkeypatch, "prune")
+
+    with pytest.raises(WorkspaceError) as caught:
+        space.close(BRANCH)
+
+    assert str(caught.value) == (
+        "git failed while forgetting the removed worktree: refused"
+    )
+    assert not path.exists()
+    assert not any("-D" in call for call in calls)
+    assert git("-C", space.mirror, "for-each-ref", "refs/heads") != ""
+
+
+def test_close_that_cannot_delete_the_branch_fails_naming_it(
+    space: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    space.refresh()
+    path = space.open(BRANCH)
+    failing_git(monkeypatch, "-D")
+
+    with pytest.raises(WorkspaceError) as caught:
+        space.close(BRANCH)
+
+    assert str(caught.value) == (
+        f"git failed while deleting the local branch {BRANCH}: refused"
+    )
+    assert not path.exists()
+    assert (
+        git("-C", space.mirror, "worktree", "list", "--porcelain").count("worktree ")
+        == 1
+    )
 
 
 def remote_branch(remote: Path) -> str:
