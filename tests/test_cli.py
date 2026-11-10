@@ -23,12 +23,14 @@ from dev_worker.instance import Instance, Repository, Tracker
 from dev_worker.jira import JiraTracker
 from dev_worker.repositories import RepositoryError
 from dev_worker.tickets import Blocker, Ticket, TrackerError
+from dev_worker.workspace import Workspace, WorkspaceError
 
 ROOT = Path(__file__).resolve().parent.parent
 INSTANCE = ROOT / "examples" / "instance.yaml"
 TORN_FILE = "journal.torn"
 MAKE_TRACKER = cli.make_tracker
 MAKE_REPOSITORY = cli.make_repository
+MAKE_WORKSPACE = cli.make_workspace
 
 
 def valid_input(**overrides: object) -> dict[str, object]:
@@ -91,6 +93,40 @@ def reachable_repository(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         cli, "make_repository", lambda repository: ReachableRepository()
     )
+
+
+class FakeWorkspace:
+    """A workspace that records its calls and raises `WorkspaceError` at the step named in `fail`."""
+
+    def __init__(self, fail: str | None = None) -> None:
+        self.fail = fail
+        self.calls: list[tuple[str, ...]] = []
+
+    def _step(self, *call: str) -> None:
+        self.calls.append(call)
+        if call[0] == self.fail:
+            raise WorkspaceError(f"{call[0]} broke")
+
+    def refresh(self) -> None:
+        """Record the refresh."""
+        self._step("refresh")
+
+    def open(self, branch: str) -> Path:
+        """Record the opening on `branch`."""
+        self._step("open", branch)
+        return Path("worktree")
+
+    def close(self, branch: str) -> None:
+        """Record the closing of `branch`."""
+        self._step("close", branch)
+
+
+@pytest.fixture(autouse=True)
+def workspace(monkeypatch: pytest.MonkeyPatch) -> FakeWorkspace:
+    """Make `run` use a `FakeWorkspace` instead of a git mirror; return it."""
+    fake = FakeWorkspace()
+    monkeypatch.setattr(cli, "make_workspace", lambda repository, directory: fake)
+    return fake
 
 
 def journal_lines(instance: Path) -> list[dict[str, object]]:
@@ -755,6 +791,152 @@ def test_lock_is_released_when_the_mandate_raises(
 
     assert not (instance.with_suffix("") / run_journal.LOCK_FILE).exists()
     assert [line["status"] for line in journal_lines(instance)] == ["running"]
+
+
+def test_mandate_runs_in_a_worktree_on_the_ticket_branch_closed_afterwards(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+) -> None:
+    seen: list[list[tuple[str, ...]]] = []
+
+    def peek(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+        seen.append(list(workspace.calls))
+        return cli.deliver_ticket(mandate, resolved)
+
+    monkeypatch.setitem(cli.MANDATES, "deliver_ticket", peek)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed"
+    assert seen == [[("refresh",), ("open", "agent/DEMO-1")]]
+    assert workspace.calls == [
+        ("refresh",),
+        ("open", "agent/DEMO-1"),
+        ("close", "agent/DEMO-1"),
+    ]
+
+
+def test_make_workspace_keeps_the_mirror_and_worktree_in_the_instance_directory(
+    tmp_path: Path,
+) -> None:
+    repository = Repository(type="github", name="octo/widgets", token_env="T")
+
+    made = MAKE_WORKSPACE(repository, tmp_path)
+
+    assert isinstance(made, Workspace)
+    assert made.mirror == tmp_path / "mirror.git"
+    assert made.worktree == tmp_path / "worktree"
+
+
+@pytest.mark.parametrize("step", ["refresh", "open"])
+def test_workspace_that_cannot_be_prepared_fails_naming_why_and_journals_it(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    step: str,
+) -> None:
+    ran: list[str] = []
+
+    def record(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+        ran.append(mandate.task_id)
+        return cli.deliver_ticket(mandate, resolved)
+
+    monkeypatch.setitem(cli.MANDATES, "deliver_ticket", record)
+    workspace.fail = step
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", f"The worktree cannot be prepared: {step} broke")
+    assert ran == []
+    assert ("close", "agent/DEMO-1") not in workspace.calls
+    assert [line["status"] for line in journal_lines(instance)] == [
+        "running",
+        "failed",
+    ]
+
+
+def test_worktree_is_closed_when_the_mandate_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+) -> None:
+    def refuse(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+        return cli.failed(mandate.task_id, "refused")
+
+    monkeypatch.setitem(cli.MANDATES, "deliver_ticket", refuse)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["errors"] == ["refused"]
+    assert workspace.calls[-1] == ("close", "agent/DEMO-1")
+
+
+def test_worktree_is_closed_when_the_mandate_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+) -> None:
+    def explode(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+        raise RuntimeError("boom")
+
+    monkeypatch.setitem(cli.MANDATES, "deliver_ticket", explode)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert workspace.calls[-1] == ("close", "agent/DEMO-1")
+
+
+def test_worktree_that_cannot_be_removed_keeps_the_output_and_reports_it(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+) -> None:
+    def refuse(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+        return cli.failed(mandate.task_id, "refused")
+
+    monkeypatch.setitem(cli.MANDATES, "deliver_ticket", refuse)
+    workspace.fail = "close"
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "failed"
+    assert answer["errors"] == [
+        "refused",
+        "The worktree cannot be removed: close broke",
+    ]
+
+
+def test_worktree_that_cannot_be_removed_after_the_mandate_raised_lets_it_propagate(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+) -> None:
+    def explode(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+        raise RuntimeError("boom")
+
+    monkeypatch.setitem(cli.MANDATES, "deliver_ticket", explode)
+    workspace.fail = "close"
+
+    with pytest.raises(RuntimeError, match="boom"):
+        run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert workspace.calls[-1] == ("close", "agent/DEMO-1")
 
 
 def test_instance_directory_that_cannot_be_created_fails_naming_it(

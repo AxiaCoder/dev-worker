@@ -59,6 +59,7 @@ from dev_worker.run_journal import (
 )
 from dev_worker.tickets import TicketTracker, TrackerError
 from dev_worker.validation import describe_validation_error
+from dev_worker.workspace import Workspace, WorkspaceError
 
 TICKET_KEY = re.compile(r"(.+)-([1-9][0-9]*)")
 RECENT_RUNS = 10
@@ -146,6 +147,11 @@ def make_tracker(tracker: Tracker) -> TicketTracker:
 def make_repository(repository: Repository) -> CodeRepository:
     """Return the code repository that `repository` of an instance describes."""
     return GitHubRepository(repository)
+
+
+def make_workspace(repository: Repository, directory: Path) -> Workspace:
+    """Return the workspace of `repository` kept in the instance directory `directory`."""
+    return Workspace(repository, directory)
 
 
 def unreachable_connector(instance: Instance) -> str | None:
@@ -300,7 +306,8 @@ def run_under_lock(
     task is never run again even if its final line, appended once `handler` returns,
     cannot be written; the output is then kept, with the journal error added to
     `errors`. A run whose `running` line cannot be written fails without running
-    `handler`. `start` is the ISO 8601 UTC start of the run, written as is in both
+    `handler`. Once the `running` line is written, `handler` runs in a fresh worktree
+    (see `run_in_worktree`). `start` is the ISO 8601 UTC start of the run, written as is in both
     lines. A torn last journal line is first set aside in the torn file.
     """
     task_id = mandate.task_id
@@ -336,7 +343,7 @@ def run_under_lock(
             task_id, f"Journal in '{directory}' cannot be written: {os_reason(error)}"
         )
     began = time.monotonic()
-    output = handler(mandate, instance)
+    output = run_in_worktree(handler, mandate, instance, directory)
     entry |= {"status": output.status, "duration": time.monotonic() - began}
     try:
         append_entry(directory, entry)
@@ -346,6 +353,46 @@ def run_under_lock(
         )
         return output.model_copy(
             update={"errors": [*output.errors, writable_text(journal_error)]}
+        )
+    return output
+
+
+def run_in_worktree(
+    handler: Callable[[MandateInput, Instance], MandateOutput],
+    mandate: MandateInput,
+    instance: Instance,
+    directory: Path,
+) -> MandateOutput:
+    """Run `handler` once the mirror in `directory` is refreshed and a fresh worktree opened.
+
+    The worktree is on the branch the `branch` template of `instance` names for the
+    ticket (see `Workspace.open`). A mirror that cannot be refreshed or a worktree that
+    cannot be opened gives a failed output naming the reason, without running
+    `handler`. Once opened, the worktree and its local branch are removed whatever
+    `handler` returns or raises; a removal that fails keeps the output, with the reason
+    added to `errors`.
+    """
+    ticket_key = mandate.params["ticket_key"]
+    assert isinstance(ticket_key, str)
+    branch = instance.branch.replace("{key}", ticket_key)
+    workspace = make_workspace(instance.repository, directory)
+    try:
+        workspace.refresh()
+        workspace.open(branch)
+    except WorkspaceError as error:
+        return failed(mandate.task_id, f"The worktree cannot be prepared: {error}")
+    try:
+        output = handler(mandate, instance)
+    finally:
+        try:
+            workspace.close(branch)
+        except WorkspaceError as error:
+            close_error = f"The worktree cannot be removed: {error}"
+        else:
+            close_error = None
+    if close_error is not None:
+        return output.model_copy(
+            update={"errors": [*output.errors, writable_text(close_error)]}
         )
     return output
 
