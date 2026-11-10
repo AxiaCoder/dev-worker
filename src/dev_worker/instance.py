@@ -20,8 +20,11 @@ from dev_worker.header import (
 )
 
 ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]*")
+_PATH_COMPONENT = r"[a-z0-9]+(?:[._-]+[a-z0-9]+)*"
 IMAGE_REFERENCE = re.compile(
-    r"[^\s@]+?(?::(?P<tag>\w[\w.-]{0,127}))?"
+    r"(?:[A-Za-z0-9.-]+(?::[0-9]+)?/)?"
+    rf"{_PATH_COMPONENT}(?:/{_PATH_COMPONENT})*"
+    r"(?::(?P<tag>[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}))?"
     r"(?:@(?P<digest>[A-Za-z][A-Za-z0-9]*:[0-9a-fA-F]{32,}))?"
 )
 
@@ -54,10 +57,12 @@ EnvName = Annotated[str, AfterValidator(_check_env_name)]
 
 
 def _check_branch_template(value: str) -> str:
-    """Return `value` when it contains the `{key}` placeholder; raise `ValueError` otherwise."""
-    if "{key}" not in value:
+    """Return `value` when it contains `{key}` and no other brace; raise `ValueError` otherwise."""
+    rest = value.replace("{key}", "")
+    if rest == value or "{" in rest or "}" in rest:
         raise ValueError(
-            "must contain {key}, which the ticket key replaces, e.g. agent/{key}"
+            "must contain {key}, which the ticket key replaces, and no other brace,"
+            " e.g. agent/{key}"
         )
     return value
 
@@ -68,8 +73,9 @@ BranchTemplate = Annotated[str, AfterValidator(_check_branch_template)]
 def _check_pinned_image(value: str) -> str:
     """Return `value` when it names an image by digest or by a tag other than `latest`.
 
-    A digest is `@<algorithm>:<hex>`, with at least 32 hex digits. A registry port is not
-    taken for a tag, and a reference holding a blank is refused. Raises `ValueError` otherwise.
+    The reference reads `[host[:port]/]path[:tag][@digest]`: path components in lowercase
+    ASCII, a tag in ASCII, a digest `<algorithm>:<hex>` with at least 32 hex digits. Raises
+    `ValueError` otherwise.
     """
     match = IMAGE_REFERENCE.fullmatch(value)
     pinned = bool(match) and bool(

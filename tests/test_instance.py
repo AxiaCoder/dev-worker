@@ -491,14 +491,26 @@ def test_branch_containing_the_key_is_accepted(tmp_path: Path, branch: str) -> N
     assert instance.branch == branch
 
 
-@pytest.mark.parametrize("branch", ["agent/main", "agent/{KEY}", "agent/key", ""])
+@pytest.mark.parametrize(
+    "branch",
+    [
+        "agent/main",
+        "agent/{KEY}",
+        "agent/key",
+        "",
+        "agent/{key}/{other}",
+        "agent/{{key}}",
+        "agent/{key",
+        "agent/}{key}",
+    ],
+)
 def test_branch_without_the_key_is_refused_with_its_reason(
     tmp_path: Path, branch: str
 ) -> None:
     with pytest.raises(
         InstanceError,
         match=r"invalid instance file: branch: .*must contain \{key\}, which the "
-        r"ticket key replaces, e\.g\. agent/\{key\}",
+        r"ticket key replaces, and no other brace, e\.g\. agent/\{key\}",
     ):
         load(tmp_path, VALID.replace("branch: agent/{key}", f"branch: '{branch}'"))
 
@@ -516,6 +528,7 @@ DIGEST = "sha256:" + "0123456789abcdef" * 4
         f"python@{DIGEST}",
         f"ghcr.io/example-org/app@{DIGEST}",
         f"python:latest@{DIGEST}",
+        f"registry.example.com:443/a/b@{DIGEST}",
     ],
 )
 def test_pinned_image_is_accepted(tmp_path: Path, image: str) -> None:
@@ -541,6 +554,12 @@ def test_pinned_image_is_accepted(tmp_path: Path, image: str) -> None:
         "python: 3",
         "python:1.0 ",
         "python@sha256:xyz",
+        "python:latest:1",
+        "a:b:c",
+        "/:3",
+        "python/:3",
+        "python:é",
+        "python:１",
     ],
 )
 def test_unpinned_image_is_refused_with_its_reason(tmp_path: Path, image: str) -> None:
