@@ -210,6 +210,29 @@ def test_unset_token_variable_fails_naming_it(
         Workspace(REPOSITORY, tmp_path).refresh()
 
 
+def test_empty_token_variable_fails_naming_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "")
+
+    with pytest.raises(WorkspaceError, match="the variable GITHUB_TOKEN, which"):
+        Workspace(REPOSITORY, tmp_path).refresh()
+
+
+def test_git_that_cannot_be_started_fails_with_the_token_masked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def refuse(arguments: list[str], **options: Any) -> None:
+        raise OSError(13, f"denied near {TOKEN}")
+
+    monkeypatch.setattr(workspace_module.subprocess, "run", refuse)
+
+    with pytest.raises(WorkspaceError) as caught:
+        Workspace(REPOSITORY, tmp_path).refresh()
+
+    assert str(caught.value) == "git could not be started: denied near [token]"
+
+
 def test_git_that_does_not_answer_in_time_fails_naming_the_action(
     tmp_path: Path,
 ) -> None:

@@ -820,6 +820,55 @@ def test_mandate_runs_in_a_worktree_on_the_ticket_branch_closed_afterwards(
     ]
 
 
+def test_workspace_is_made_for_the_instance_repository_in_its_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+) -> None:
+    made: list[tuple[Repository, Path]] = []
+
+    def make(repository: Repository, directory: Path) -> FakeWorkspace:
+        made.append((repository, directory))
+        return workspace
+
+    monkeypatch.setattr(cli, "make_workspace", make)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed"
+    assert [(repository.name, directory) for repository, directory in made] == [
+        ("example-org/example-app", instance.with_suffix(""))
+    ]
+
+
+def test_worktree_branch_follows_the_instance_branch_template(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+) -> None:
+    text = instance.read_text(encoding="utf-8")
+    assert "branch: agent/{key}\n" in text
+    instance.write_text(
+        text.replace("branch: agent/{key}\n", "branch: feature/{key}-auto\n"),
+        encoding="utf-8",
+    )
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed"
+    assert workspace.calls == [
+        ("refresh",),
+        ("open", "feature/DEMO-1-auto"),
+        ("close", "feature/DEMO-1-auto"),
+    ]
+
+
 def test_make_workspace_keeps_the_mirror_and_worktree_in_the_instance_directory(
     tmp_path: Path,
 ) -> None:
