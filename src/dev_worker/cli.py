@@ -165,15 +165,17 @@ def unreachable_connector(instance: Instance) -> str | None:
     return None
 
 
-def check_ticket_ready(key: str, instance: Instance) -> str | None:
+def check_ticket_ready(
+    key: str, instance: Instance, tracker: TicketTracker
+) -> str | None:
     """Return why the ticket `key` cannot be run, or None when it can.
 
-    The ticket is read from the tracker of `instance`. It is refused when the tracker
-    cannot read it, when its status is not the real status of the `ready` key, or when
-    a ticket that blocks it is not in the real status of the `done` key.
+    The ticket is read from `tracker`. It is refused when the tracker cannot read it,
+    when its status is not the real status of the `ready` key of `instance`, or when a
+    ticket that blocks it is not in the real status of the `done` key.
     """
     try:
-        ticket = make_tracker(instance.tracker).read(key)
+        ticket = tracker.read(key)
     except TrackerError as error:
         return f"Ticket {key!r} cannot be read from the tracker: {error}"
     ready = instance.statuses["ready"]
@@ -193,6 +195,23 @@ def check_ticket_ready(key: str, instance: Instance) -> str | None:
     return None
 
 
+def take_ticket(key: str, instance: Instance, tracker: TicketTracker) -> str | None:
+    """Move the ticket `key` to the real status of the `in_progress` key; return why it failed, or None.
+
+    The reason says the status is unknown: after a tracker failure the move may still
+    have happened.
+    """
+    in_progress = instance.statuses["in_progress"]
+    try:
+        tracker.set_status(key, in_progress)
+    except TrackerError as error:
+        return (
+            f"Ticket {key!r} cannot be moved to {in_progress!r}: {error} "
+            "Its status is unknown and is to be read again in the tracker."
+        )
+    return None
+
+
 def run_journaled(
     handler: Callable[[MandateInput, Instance], MandateOutput],
     mandate: MandateInput,
@@ -202,7 +221,8 @@ def run_journaled(
     """Run `handler` under the lock of the instance directory and journal the run.
 
     The ticket key is checked first, then the ticket is read from the tracker and
-    refused unless it is ready (see `check_ticket_ready`), then the lock is taken, or
+    refused unless it is ready (see `check_ticket_ready`), then moved to the real status
+    of the `in_progress` key (see `take_ticket`), then the lock is taken, or
     taken over from a run that is gone (see `take_over_lock`); a task_id already in the
     journal is refused.
     A refused run is not journaled. The lock is released only if no other run has
@@ -217,7 +237,10 @@ def run_journaled(
         return failed(task_id, refusal)
     ticket_key = mandate.params["ticket_key"]
     assert isinstance(ticket_key, str)
-    refusal = check_ticket_ready(ticket_key, instance)
+    tracker = make_tracker(instance.tracker)
+    refusal = check_ticket_ready(ticket_key, instance, tracker)
+    if refusal is None:
+        refusal = take_ticket(ticket_key, instance, tracker)
     if refusal is not None:
         return failed(task_id, refusal)
     try:
