@@ -197,7 +197,18 @@ class Workspace:
         `refs/heads/<branch>` on the remote, never forced, only when the worktree HEAD
         holds commits the remote's default branch lacks. Raises `WorkspaceError` when a
         git call fails, as when the remote branch has moved on.
+
+        Before any git call, the worktree is searched, without following symbolic
+        links, for an entry named `.git` in any letter case below its root; when one is
+        found, or a directory cannot be read, no git call is made and `WorkspaceError`
+        names its path relative to the worktree.
         """
+        nested = self._nested_git_entry()
+        if nested is not None:
+            raise WorkspaceError(
+                f"the worktree holds a nested git entry at '{nested}'; "
+                "no git command is run on it"
+            )
         self._git_worktree("staging the work left in the worktree", "add", "--all")
         staged = self._git_worktree(
             "listing the staged changes", "diff", "--cached", "--name-only"
@@ -255,6 +266,37 @@ class Workspace:
     def _git_mirror(self, action: str, *arguments: str) -> str:
         """Run git with `arguments` in the mirror and return what it wrote to stdout; see `_git`."""
         return self._git(action, "-C", str(self.mirror), *arguments)
+
+    def _nested_git_entry(self) -> str | None:
+        """Return the path, relative to the worktree and with `/`, of the first entry named
+        `.git` in any letter case below its root, or None when there is none.
+
+        Symbolic links are listed but never followed; directories that cannot be read
+        stop the search. The `.git` at the root is neither reported nor entered. Raises
+        `WorkspaceError` naming the relative path of a directory that cannot be read,
+        and why.
+        """
+
+        def refuse(error: OSError) -> None:
+            unread = Path(error.filename).relative_to(self.worktree).as_posix()
+            reason = error.strerror or str(error)
+            raise WorkspaceError(
+                f"the worktree cannot be searched for nested git entries: "
+                f"'{unread}' cannot be read: {reason}"
+            )
+
+        for directory, subdirectories, files in os.walk(self.worktree, onerror=refuse):
+            here = Path(directory)
+            if here == self.worktree:
+                subdirectories[:] = [
+                    name for name in subdirectories if name.casefold() != ".git"
+                ]
+                continue
+            subdirectories.sort()
+            for name in sorted([*subdirectories, *files]):
+                if name.casefold() == ".git":
+                    return (here / name).relative_to(self.worktree).as_posix()
+        return None
 
     def _worktree_admin(self) -> Path:
         """Return the directory where the mirror keeps the worktree's git data.

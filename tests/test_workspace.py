@@ -330,6 +330,107 @@ def test_rescue_ignores_a_git_file_the_worktree_was_given(
     assert witness.exists()
 
 
+def test_rescue_refuses_a_worktree_holding_a_nested_repository(
+    space: Workspace, remote: Path, tmp_path: Path
+) -> None:
+    space.refresh()
+    path = space.open(BRANCH)
+    head = git("-C", path, "rev-parse", "HEAD")
+    nested = path / "sub"
+    git("init", "--quiet", nested)
+    witness = tmp_path / "witness"
+    monitor = tmp_path / "monitor.py"
+    monitor.write_text(f"open({str(witness)!r}, 'w').close()\n", encoding="utf-8")
+    python = Path(sys.executable).as_posix()
+    git("-C", nested, "config", "core.fsmonitor", f'"{python}" "{monitor.as_posix()}"')
+    (path / "left.txt").write_text("left", encoding="utf-8")
+
+    with pytest.raises(WorkspaceError) as caught:
+        space.rescue(BRANCH, IDENTITY)
+
+    assert str(caught.value) == (
+        "the worktree holds a nested git entry at 'sub/.git'; "
+        "no git command is run on it"
+    )
+    assert not witness.exists()
+    assert git("-C", space.mirror, "rev-parse", BRANCH_REF) == head
+    assert remote_branch(remote) == ""
+
+
+@pytest.mark.parametrize("name", [".git", ".GIT"])
+def test_rescue_refuses_a_nested_git_file_in_any_case(
+    space: Workspace, name: str
+) -> None:
+    space.refresh()
+    path = space.open(BRANCH)
+    (path / "a" / "b").mkdir(parents=True)
+    (path / "a" / "b" / name).write_text("gitdir: elsewhere\n", encoding="utf-8")
+
+    with pytest.raises(WorkspaceError, match=f"nested git entry at 'a/b/{name}'"):
+        space.rescue(BRANCH, IDENTITY)
+
+
+def test_rescue_refuses_a_worktree_with_a_directory_it_cannot_read(
+    monkeypatch: pytest.MonkeyPatch, space: Workspace, remote: Path
+) -> None:
+    space.refresh()
+    path = space.open(BRANCH)
+    head = git("-C", path, "rev-parse", "HEAD")
+    locked = path / "a" / "locked"
+    locked.mkdir(parents=True)
+    (path / "left.txt").write_text("left", encoding="utf-8")
+    scandir = os.scandir
+
+    def refuse_locked(directory: Any) -> Any:
+        if Path(directory) == locked:
+            raise PermissionError(13, "Permission denied", str(locked))
+        return scandir(directory)
+
+    monkeypatch.setattr(workspace_module.os, "scandir", refuse_locked)
+
+    with pytest.raises(WorkspaceError) as caught:
+        space.rescue(BRANCH, IDENTITY)
+
+    monkeypatch.undo()
+    assert str(caught.value) == (
+        "the worktree cannot be searched for nested git entries: "
+        "'a/locked' cannot be read: Permission denied"
+    )
+    assert git("-C", space.mirror, "rev-parse", BRANCH_REF) == head
+    assert remote_branch(remote) == ""
+
+
+def test_rescue_runs_on_subdirectories_holding_no_git_entry(
+    space: Workspace, remote: Path
+) -> None:
+    space.refresh()
+    path = space.open(BRANCH)
+    (path / "docs" / "deep").mkdir(parents=True)
+    (path / "docs" / "deep" / ".gitignore").write_text("*.tmp\n", encoding="utf-8")
+
+    space.rescue(BRANCH, IDENTITY)
+
+    assert remote_branch(remote) == git("-C", path, "rev-parse", "HEAD")
+
+
+def test_rescue_does_not_follow_a_link_to_a_repository_outside(
+    space: Workspace, remote: Path, tmp_path: Path
+) -> None:
+    outside = tmp_path / "outside"
+    git("init", "--quiet", outside)
+    space.refresh()
+    path = space.open(BRANCH)
+    (path / "docs").mkdir()
+    try:
+        (path / "docs" / "linked").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("symbolic links cannot be created on this machine")
+
+    space.rescue(BRANCH, IDENTITY)
+
+    assert remote_branch(remote) == git("-C", path, "rev-parse", "HEAD")
+
+
 def test_worktree_the_mirror_does_not_record_is_refused(space: Workspace) -> None:
     space.worktree.mkdir(parents=True)
 
