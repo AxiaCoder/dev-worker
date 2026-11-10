@@ -319,7 +319,9 @@ def run_under_lock(
 ) -> MandateOutput:
     """Run `handler` unless its task_id is already journaled, journaling the run twice.
 
-    Before anything is journaled, the ticket is moved through `tracker` to the real
+    Before anything is journaled, a worktree an earlier run left in `directory` is
+    rescued and removed (see `rescue_left_worktree`); a run that cannot do so fails
+    without taking its ticket nor being journaled. Then the ticket is moved through `tracker` to the real
     status of the `in_progress` key; a run whose ticket cannot be moved fails without
     being journaled. A `running` line is appended before `handler` runs, so that the
     task is never run again even if its final line, appended once `handler` returns,
@@ -345,7 +347,9 @@ def run_under_lock(
         return failed(task_id, f"Task {task_id!r} has already been run.")
     ticket_key = mandate.params["ticket_key"]
     assert isinstance(ticket_key, str)
-    refusal = take_ticket(ticket_key, instance, tracker)
+    refusal = rescue_left_worktree(instance, directory) or take_ticket(
+        ticket_key, instance, tracker
+    )
     if refusal is not None:
         return failed(task_id, refusal)
     entry: dict[str, object] = {
@@ -377,13 +381,46 @@ def run_under_lock(
     return output
 
 
-def close_worktree(workspace: Workspace, branch: str) -> str | None:
-    """Close the worktree of `workspace` on `branch`; return why it failed, or None."""
+def end_worktree(workspace: Workspace, branch: str, instance: Instance) -> str | None:
+    """Rescue then close the worktree of `workspace` on `branch`; return why it failed, or None.
+
+    The rescue commits with the git identity of `instance` (see `Workspace.rescue`). A
+    worktree whose rescue fails is not closed: it stays on the host, with its local
+    branch, for the next run to rescue.
+    """
+    try:
+        workspace.rescue(branch, instance.git)
+    except WorkspaceError as error:
+        return f"The work of the run cannot be rescued, its worktree is kept: {error}"
     try:
         workspace.close(branch)
     except WorkspaceError as error:
         return f"The worktree cannot be removed: {error}"
     return None
+
+
+def rescue_left_worktree(instance: Instance, directory: Path) -> str | None:
+    """Rescue then remove a worktree an earlier run left in `directory`; return why it failed, or None.
+
+    When no worktree is left, the local branches earlier runs left in the mirror are
+    deleted when the remote holds their tip, and kept otherwise (see
+    `Workspace.drop_left_branches`). Otherwise the branch of the worktree is read from
+    the mirror's record of it (see `Workspace.left_branch`), the mirror is refreshed,
+    and the worktree is ended as a run ends its own (see `end_worktree`).
+    """
+    workspace = make_workspace(instance.repository, directory)
+    try:
+        branch = workspace.left_branch()
+        if branch is None:
+            workspace.drop_left_branches()
+            return None
+        workspace.refresh()
+    except WorkspaceError as error:
+        return f"The worktree left by an earlier run cannot be rescued: {error}"
+    reason = end_worktree(workspace, branch, instance)
+    if reason is None:
+        return None
+    return f"The worktree left by an earlier run on the branch {branch}: {reason}"
 
 
 def run_container(instance: Instance, worktree: Path, began: float) -> str | None:
@@ -419,9 +456,10 @@ def run_in_worktree(
     The worktree is on the branch the `branch` template of `instance` names for the
     ticket (see `Workspace.open`). A mirror that cannot be refreshed or a worktree that
     cannot be opened gives a failed output naming the reason, without running
-    `handler`. Once opened, the worktree and its local branch are removed whatever
-    `handler` returns or raises; a removal that fails keeps the output, with the reason
-    added to `errors`, or the exception `handler` raised, with the reason added as a note.
+    `handler`. Once opened, the worktree is rescued, then it and its local branch are
+    removed, whatever `handler` returns or raises (see `end_worktree`); a rescue or a
+    removal that fails keeps the output, with the reason added to `errors`, or the
+    exception `handler` raised, with the reason added as a note.
 
     Before `handler`, one disposable container is run from the image of `instance`
     with only the worktree mounted (see `Container.run`), and is gone once it ends or
@@ -447,14 +485,14 @@ def run_in_worktree(
         else:
             output = handler(mandate, instance)
     except BaseException as error:
-        close_error = close_worktree(workspace, branch)
-        if close_error is not None:
-            error.add_note(close_error)
+        end_error = end_worktree(workspace, branch, instance)
+        if end_error is not None:
+            error.add_note(end_error)
         raise
-    close_error = close_worktree(workspace, branch)
-    if close_error is not None:
+    end_error = end_worktree(workspace, branch, instance)
+    if end_error is not None:
         return output.model_copy(
-            update={"errors": [*output.errors, writable_text(close_error)]}
+            update={"errors": [*output.errors, writable_text(end_error)]}
         )
     return output
 

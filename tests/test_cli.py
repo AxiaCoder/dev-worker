@@ -20,7 +20,7 @@ from dev_worker.container import Container, ContainerError
 from dev_worker.contract import MandateInput, MandateOutput
 from dev_worker.github import GitHubRepository
 from dev_worker.header import HeaderError
-from dev_worker.instance import Instance, Repository, Tracker
+from dev_worker.instance import GitIdentity, Instance, Repository, Tracker
 from dev_worker.jira import JiraTracker
 from dev_worker.repositories import RepositoryError
 from dev_worker.tickets import Blocker, Ticket, TrackerError
@@ -33,6 +33,8 @@ MAKE_TRACKER = cli.make_tracker
 MAKE_REPOSITORY = cli.make_repository
 MAKE_WORKSPACE = cli.make_workspace
 MAKE_CONTAINER = cli.make_container
+IDENTITY = "12345678+example-worker@users.noreply.github.com"
+RESCUED = ("rescue", "agent/DEMO-1", "Example Worker", IDENTITY)
 
 
 def valid_input(**overrides: object) -> dict[str, object]:
@@ -102,6 +104,7 @@ class FakeWorkspace:
 
     def __init__(self, fail: str | None = None) -> None:
         self.fail = fail
+        self.left: str | None = None
         self.calls: list[tuple[str, ...]] = []
         self.worktree = Path("worktree")
 
@@ -109,6 +112,19 @@ class FakeWorkspace:
         self.calls.append(call)
         if call[0] == self.fail:
             raise WorkspaceError(f"{call[0]} broke")
+
+    def left_branch(self) -> str | None:
+        """Record the look for a left worktree; return the branch in `left`."""
+        self._step("left_branch")
+        return self.left
+
+    def drop_left_branches(self) -> None:
+        """Record the deletion of the local branches left by earlier runs."""
+        self._step("drop_left_branches")
+
+    def rescue(self, branch: str, identity: GitIdentity) -> None:
+        """Record the rescue of `branch` as `identity`."""
+        self._step("rescue", branch, identity.name, identity.email)
 
     def refresh(self) -> None:
         """Record the refresh."""
@@ -850,10 +866,20 @@ def test_mandate_runs_in_a_worktree_on_the_ticket_branch_closed_afterwards(
     )
 
     assert answer["status"] == "completed"
-    assert seen == [[("refresh",), ("open", "agent/DEMO-1")]]
+    assert seen == [
+        [
+            ("left_branch",),
+            ("drop_left_branches",),
+            ("refresh",),
+            ("open", "agent/DEMO-1"),
+        ]
+    ]
     assert workspace.calls == [
+        ("left_branch",),
+        ("drop_left_branches",),
         ("refresh",),
         ("open", "agent/DEMO-1"),
+        RESCUED,
         ("close", "agent/DEMO-1"),
     ]
 
@@ -879,7 +905,7 @@ def test_workspace_is_made_for_the_instance_repository_in_its_directory(
     assert answer["status"] == "completed"
     assert [(repository.name, directory) for repository, directory in made] == [
         ("example-org/example-app", instance.with_suffix(""))
-    ]
+    ] * 2
 
 
 def test_worktree_branch_follows_the_instance_branch_template(
@@ -901,8 +927,11 @@ def test_worktree_branch_follows_the_instance_branch_template(
 
     assert answer["status"] == "completed"
     assert workspace.calls == [
+        ("left_branch",),
+        ("drop_left_branches",),
         ("refresh",),
         ("open", "feature/DEMO-1-auto"),
+        ("rescue", "feature/DEMO-1-auto", "Example Worker", IDENTITY),
         ("close", "feature/DEMO-1-auto"),
     ]
 
@@ -943,6 +972,7 @@ def test_workspace_that_cannot_be_prepared_fails_naming_why_and_journals_it(
     assert_failed(answer, "task-1", f"The worktree cannot be prepared: {step} broke")
     assert ran == []
     assert ("close", "agent/DEMO-1") not in workspace.calls
+    assert RESCUED not in workspace.calls
     assert [line["status"] for line in journal_lines(instance)] == [
         "running",
         "failed",
@@ -973,7 +1003,12 @@ def test_container_runs_from_the_instance_image_on_the_worktree_before_the_manda
     assert container.images == ["ghcr.io/example-org/example-app-agent:1.0.0"]
     assert seen == [
         (
-            [("refresh",), ("open", "agent/DEMO-1")],
+            [
+                ("left_branch",),
+                ("drop_left_branches",),
+                ("refresh",),
+                ("open", "agent/DEMO-1"),
+            ],
             [("run", workspace.worktree, 1800)],
         )
     ]
@@ -1076,7 +1111,7 @@ def test_run_that_reached_its_ceiling_before_the_container_fails_without_startin
     )
     assert container.calls == []
     assert ran == []
-    assert workspace.calls[-1] == ("close", "agent/DEMO-1")
+    assert workspace.calls[-2:] == [RESCUED, ("close", "agent/DEMO-1")]
 
 
 def test_container_that_fails_fails_the_run_naming_why_without_the_mandate(
@@ -1105,7 +1140,7 @@ def test_container_that_fails_fails_the_run_naming_why_without_the_mandate(
         "The container failed: docker failed while running the container: no",
     )
     assert ran == []
-    assert workspace.calls[-1] == ("close", "agent/DEMO-1")
+    assert workspace.calls[-2:] == [RESCUED, ("close", "agent/DEMO-1")]
     assert [line["status"] for line in journal_lines(instance)] == [
         "running",
         "failed",
@@ -1132,7 +1167,7 @@ def test_worktree_is_closed_when_the_mandate_fails(
     )
 
     assert answer["errors"] == ["refused"]
-    assert workspace.calls[-1] == ("close", "agent/DEMO-1")
+    assert workspace.calls[-2:] == [RESCUED, ("close", "agent/DEMO-1")]
 
 
 def test_worktree_is_closed_when_the_mandate_raises(
@@ -1149,7 +1184,7 @@ def test_worktree_is_closed_when_the_mandate_raises(
     with pytest.raises(RuntimeError, match="boom"):
         run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
 
-    assert workspace.calls[-1] == ("close", "agent/DEMO-1")
+    assert workspace.calls[-2:] == [RESCUED, ("close", "agent/DEMO-1")]
 
 
 def test_worktree_that_cannot_be_removed_keeps_the_output_and_reports_it(
@@ -1190,8 +1225,159 @@ def test_worktree_that_cannot_be_removed_after_the_mandate_raised_notes_why_on_i
     with pytest.raises(RuntimeError, match="boom") as caught:
         run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
 
-    assert workspace.calls[-1] == ("close", "agent/DEMO-1")
+    assert workspace.calls[-2:] == [RESCUED, ("close", "agent/DEMO-1")]
     assert caught.value.__notes__ == ["The worktree cannot be removed: close broke"]
+
+
+def test_rescue_that_fails_keeps_the_reason_the_run_stopped_and_the_worktree(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+) -> None:
+    def refuse(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+        return cli.failed(mandate.task_id, "refused")
+
+    monkeypatch.setitem(cli.MANDATES, "deliver_ticket", refuse)
+    workspace.fail = "rescue"
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "failed"
+    assert answer["errors"] == [
+        "refused",
+        "The work of the run cannot be rescued, its worktree is kept: rescue broke",
+    ]
+    assert workspace.calls[-1] == RESCUED
+
+
+def test_rescue_that_fails_after_the_mandate_raised_notes_why_on_it(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+) -> None:
+    def explode(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+        raise RuntimeError("boom")
+
+    monkeypatch.setitem(cli.MANDATES, "deliver_ticket", explode)
+    workspace.fail = "rescue"
+
+    with pytest.raises(RuntimeError, match="boom") as caught:
+        run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert workspace.calls[-1] == RESCUED
+    assert caught.value.__notes__ == [
+        "The work of the run cannot be rescued, its worktree is kept: rescue broke"
+    ]
+
+
+def test_worktree_left_by_an_earlier_run_is_rescued_and_removed_before_the_ticket_is_taken(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    moved: list[list[tuple[str, ...]]] = []
+    move = stub.set_status
+
+    def spy(key: str, status: str) -> None:
+        moved.append(list(workspace.calls))
+        move(key, status)
+
+    monkeypatch.setattr(stub, "set_status", spy)
+    workspace.left = "agent/OLD-7"
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed"
+    assert moved == [
+        [
+            ("left_branch",),
+            ("refresh",),
+            ("rescue", "agent/OLD-7", "Example Worker", IDENTITY),
+            ("close", "agent/OLD-7"),
+        ]
+    ]
+    assert workspace.calls[4:6] == [("refresh",), ("open", "agent/DEMO-1")]
+
+
+@pytest.mark.parametrize(
+    ("step", "reason"),
+    [
+        (
+            "left_branch",
+            "The worktree left by an earlier run cannot be rescued: left_branch broke",
+        ),
+        (
+            "refresh",
+            "The worktree left by an earlier run cannot be rescued: refresh broke",
+        ),
+        (
+            "rescue",
+            (
+                "The worktree left by an earlier run on the branch agent/OLD-7: The work"
+                " of the run cannot be rescued, its worktree is kept: rescue broke"
+            ),
+        ),
+        (
+            "close",
+            (
+                "The worktree left by an earlier run on the branch agent/OLD-7: The"
+                " worktree cannot be removed: close broke"
+            ),
+        ),
+    ],
+)
+def test_worktree_left_that_cannot_be_rescued_fails_the_run_without_taking_the_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    step: str,
+    reason: str,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    workspace.left = "agent/OLD-7"
+    workspace.fail = step
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", reason)
+    assert stub.moves == []
+    assert ("open", "agent/DEMO-1") not in workspace.calls
+    assert journal_lines(instance) == []
+
+
+def test_local_branches_that_cannot_be_dropped_fail_the_run_without_taking_the_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    workspace.fail = "drop_left_branches"
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(
+        answer,
+        "task-1",
+        "The worktree left by an earlier run cannot be rescued: "
+        "drop_left_branches broke",
+    )
+    assert stub.moves == []
+    assert ("refresh",) not in workspace.calls
+    assert journal_lines(instance) == []
 
 
 def test_instance_directory_that_cannot_be_created_fails_naming_it(
