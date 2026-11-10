@@ -64,13 +64,15 @@ class Container:
             "reaching the Docker daemon", "version", "--format", "{{.Server.Version}}"
         )
 
-    def run(self, worktree: Path, ceiling: float) -> None:
+    def run(self, worktree: Path, time_left: float) -> None:
         """Run `RUN_COMMAND` in a new container with `worktree` mounted, and wait for it to end.
 
-        `ceiling` is the run duration ceiling, in seconds: a container still running
+        `time_left` is the time left in the run, in seconds: a container still running
         then is killed, which `--rm` has Docker remove. Raises `ContainerError` when the
-        container cannot be started, exits nonzero, or reaches the ceiling, whether it
-        could then be killed or not.
+        container cannot be started, exits nonzero, or outlasts `time_left`, whether it
+        could then be killed or not. Any other exception raised while waiting, such as
+        `KeyboardInterrupt`, has the container killed and is raised again; a kill that
+        fails is added to it as a note.
         """
         name = f"{NAME_PREFIX}{uuid.uuid4().hex}"
         try:
@@ -86,20 +88,34 @@ class Container:
                 WORKDIR,
                 self._image,
                 *RUN_COMMAND,
-                timeout=ceiling,
+                timeout=time_left,
             )
         except subprocess.TimeoutExpired:
             reached = (
-                f"the container {name} was still running at the run ceiling "
-                f"of {ceiling:g} seconds"
+                f"the container {name} was still running when the run reached "
+                "its ceiling"
             )
             try:
-                self._docker(f"killing the container {name}", "kill", name)
+                self._kill(name)
             except ContainerError as kill_error:
                 raise ContainerError(
                     f"{reached} and could not be killed: {kill_error}"
                 ) from None
             raise ContainerError(f"{reached} and was killed") from None
+        except ContainerError:
+            raise
+        except BaseException as error:
+            try:
+                self._kill(name)
+            except ContainerError as kill_error:
+                error.add_note(
+                    f"the container {name} could not be killed: {kill_error}"
+                )
+            raise
+
+    def _kill(self, name: str) -> None:
+        """Kill the container `name`; raise `ContainerError` when docker cannot."""
+        self._docker(f"killing the container {name}", "kill", name)
 
     def _docker(
         self, action: str, *arguments: str, timeout: float | None = None

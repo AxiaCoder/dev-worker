@@ -154,9 +154,9 @@ class FakeContainer:
         """Record the check."""
         self._step("check_access")
 
-    def run(self, worktree: Path, ceiling: float) -> None:
-        """Record the run on `worktree` under `ceiling`."""
-        self._step("run", worktree, ceiling)
+    def run(self, worktree: Path, time_left: float) -> None:
+        """Record the run on `worktree` with `time_left` seconds left."""
+        self._step("run", worktree, time_left)
 
 
 @pytest.fixture(autouse=True)
@@ -990,10 +990,10 @@ def test_container_runs_under_the_run_timeout_of_the_instance(
 
     run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
 
-    [(step, worktree, ceiling)] = container.calls
+    [(step, worktree, time_left)] = container.calls
     assert (step, worktree) == ("run", Path("worktree"))
-    assert isinstance(ceiling, float)
-    assert 4 < ceiling <= 5
+    assert isinstance(time_left, float)
+    assert 4 < time_left <= 5
 
 
 def slow_refresh(
@@ -1011,7 +1011,7 @@ def slow_refresh(
     monkeypatch.setattr(workspace, "refresh", slow)
 
 
-def test_container_ceiling_is_the_time_left_once_the_worktree_is_ready(
+def test_container_is_given_the_time_left_once_the_worktree_is_ready(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
@@ -1025,7 +1025,7 @@ def test_container_ceiling_is_the_time_left_once_the_worktree_is_ready(
     assert container.calls == [("run", workspace.worktree, 1200)]
 
 
-def test_container_ceiling_counts_the_time_spent_taking_the_ticket(
+def test_container_time_left_counts_the_time_spent_taking_the_ticket(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,

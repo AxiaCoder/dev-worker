@@ -1,7 +1,9 @@
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -126,9 +128,10 @@ def test_a_container_that_cannot_be_started_raises_naming_why(
     assert str(raised.value) == (
         "docker failed while running the container: Unable to find image"
     )
+    assert [call[0] for call in calls(record)] == ["run"]
 
 
-def test_a_container_still_running_at_the_ceiling_is_killed_by_its_name(
+def test_a_container_still_running_when_the_time_is_up_is_killed_by_its_name(
     record: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     answer(monkeypatch, "run", sleep=5)
@@ -140,12 +143,12 @@ def test_a_container_still_running_at_the_ceiling_is_killed_by_its_name(
     name = run[3]
     assert kill == ["kill", name]
     assert str(raised.value) == (
-        f"the container {name} was still running at the run ceiling "
-        "of 0.5 seconds and was killed"
+        f"the container {name} was still running when the run reached its ceiling "
+        "and was killed"
     )
 
 
-def test_a_container_that_cannot_be_killed_at_the_ceiling_raises_naming_why(
+def test_a_container_that_cannot_be_killed_when_the_time_is_up_raises_naming_why(
     record: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     answer(monkeypatch, "run", sleep=5)
@@ -156,7 +159,50 @@ def test_a_container_that_cannot_be_killed_at_the_ceiling_raises_naming_why(
 
     name = calls(record)[0][3]
     assert str(raised.value) == (
-        f"the container {name} was still running at the run ceiling of 0.5 seconds "
+        f"the container {name} was still running when the run reached its ceiling "
         f"and could not be killed: docker failed while killing the container {name}: "
         "No such container"
     )
+
+
+def interrupt_the_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make `docker run` raise `KeyboardInterrupt`; every other docker call runs as usual."""
+    real_run = subprocess.run
+
+    def run(arguments: list[str], **options: Any) -> Any:
+        if arguments[2] == "run":
+            raise KeyboardInterrupt
+        return real_run(arguments, **options)
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+
+def test_an_interrupted_run_kills_its_container_and_raises_again(
+    record: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    interrupt_the_run(monkeypatch)
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        container().run(tmp_path, 60)
+
+    [kill] = calls(record)
+    assert kill[0] == "kill"
+    assert NAME.fullmatch(kill[1])
+    assert not hasattr(raised.value, "__notes__")
+
+
+def test_an_interrupted_run_whose_container_cannot_be_killed_notes_why(
+    record: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    interrupt_the_run(monkeypatch)
+    answer(monkeypatch, "kill", stderr="No such container\n", code=1)
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        container().run(tmp_path, 60)
+
+    [[_, name]] = calls(record)
+    note = (
+        f"the container {name} could not be killed: docker failed while killing "
+        f"the container {name}: No such container"
+    )
+    assert raised.value.__notes__ == [note]
