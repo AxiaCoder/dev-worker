@@ -8,6 +8,7 @@ import sys
 from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from importlib.metadata import entry_points
 from pathlib import Path
 from types import SimpleNamespace
@@ -149,21 +150,27 @@ def workspace(monkeypatch: pytest.MonkeyPatch) -> FakeWorkspace:
 
 
 class FakeContainer:
-    """A container that records its calls and raises `error`, when set, from each of them."""
+    """A container that records its calls and raises `error`, when set, from those named in `failing`.
+
+    `failing` None names every call.
+    """
 
     def __init__(self, error: ContainerError | None = None) -> None:
         self.error = error
+        self.failing: tuple[str, ...] | None = None
         self.images: list[str] = []
+        self.directories: list[Path] = []
         self.calls: list[tuple[object, ...]] = []
 
-    def make(self, image: str) -> "FakeContainer":
-        """Record `image` and return this fake, in place of `cli.make_container`."""
+    def make(self, image: str, directory: Path) -> "FakeContainer":
+        """Record `image` and `directory`; return this fake, in place of `cli.make_container`."""
         self.images.append(image)
+        self.directories.append(directory)
         return self
 
     def _step(self, *call: object) -> None:
         self.calls.append(call)
-        if self.error is not None:
+        if self.error is not None and (self.failing is None or call[0] in self.failing):
             raise self.error
 
     def check_access(self) -> None:
@@ -173,6 +180,14 @@ class FakeContainer:
     def run(self, worktree: Path, time_left: float) -> None:
         """Record the run on `worktree` with `time_left` seconds left."""
         self._step("run", worktree, time_left)
+
+    def check_none_running(self) -> None:
+        """Record the check that no container of the instance is running."""
+        self._step("check_none_running")
+
+    def kill_running(self) -> None:
+        """Record the killing of the containers of the instance still running."""
+        self._step("kill_running")
 
 
 @pytest.fixture(autouse=True)
@@ -1000,7 +1015,8 @@ def test_container_runs_from_the_instance_image_on_the_worktree_before_the_manda
     )
 
     assert answer["status"] == "completed"
-    assert container.images == ["ghcr.io/example-org/example-app-agent:1.0.0"]
+    assert set(container.images) == {"ghcr.io/example-org/example-app-agent:1.0.0"}
+    assert set(container.directories) == {instance.with_suffix("")}
     assert seen == [
         (
             [
@@ -1025,7 +1041,8 @@ def test_container_runs_under_the_run_timeout_of_the_instance(
 
     run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
 
-    [(step, worktree, time_left)] = container.calls
+    [(step, worktree, time_left), checked] = container.calls
+    assert checked == ("check_none_running",)
     assert (step, worktree) == ("run", Path("worktree"))
     assert isinstance(time_left, float)
     assert 4 < time_left <= 5
@@ -1057,7 +1074,10 @@ def test_container_is_given_the_time_left_once_the_worktree_is_ready(
 
     run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
 
-    assert container.calls == [("run", workspace.worktree, 1200)]
+    assert container.calls == [
+        ("run", workspace.worktree, 1200),
+        ("check_none_running",),
+    ]
 
 
 def test_container_time_left_counts_the_time_spent_taking_the_ticket(
@@ -1078,7 +1098,10 @@ def test_container_time_left_counts_the_time_spent_taking_the_ticket(
 
     run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
 
-    assert container.calls == [("run", workspace.worktree, 1500)]
+    assert container.calls == [
+        ("run", workspace.worktree, 1500),
+        ("check_none_running",),
+    ]
 
 
 @pytest.mark.parametrize("seconds", [1800, 2400])
@@ -1109,7 +1132,7 @@ def test_run_that_reached_its_ceiling_before_the_container_fails_without_startin
         "The container was not started: the run ceiling of 1800 seconds "
         "was reached before it.",
     )
-    assert container.calls == []
+    assert container.calls == [("check_none_running",)]
     assert ran == []
     assert workspace.calls[-2:] == [RESCUED, ("close", "agent/DEMO-1")]
 
@@ -1129,6 +1152,7 @@ def test_container_that_fails_fails_the_run_naming_why_without_the_mandate(
 
     monkeypatch.setitem(cli.MANDATES, "deliver_ticket", record)
     container.error = ContainerError("docker failed while running the container: no")
+    container.failing = ("run",)
 
     answer = run_mandate(
         monkeypatch, capsysbinary, encode(valid_input()), instance=instance
@@ -1148,7 +1172,7 @@ def test_container_that_fails_fails_the_run_naming_why_without_the_mandate(
 
 
 def test_make_container_returns_a_container() -> None:
-    assert isinstance(MAKE_CONTAINER("example/image:1.0"), Container)
+    assert isinstance(MAKE_CONTAINER("example/image:1.0", Path("instance")), Container)
 
 
 def test_worktree_is_closed_when_the_mandate_fails(
@@ -1354,6 +1378,179 @@ def test_worktree_left_that_cannot_be_rescued_fails_the_run_without_taking_the_t
     assert stub.moves == []
     assert ("open", "agent/DEMO-1") not in workspace.calls
     assert journal_lines(instance) == []
+
+
+FAKE_DOCKER = Path(__file__).with_name("fake_docker.py")
+
+
+def fake_docker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **answers: str
+) -> Path:
+    """Make `run` drive `tests/fake_docker.py` in place of Docker; return its record.
+
+    Each keyword sets the environment variable `FAKE_DOCKER_<KEYWORD>`, such as
+    `ps_stdout_1` for `FAKE_DOCKER_PS_STDOUT_1`.
+    """
+    record = tmp_path / "docker.jsonl"
+    monkeypatch.setenv("FAKE_DOCKER_RECORD", str(record))
+    for name, value in answers.items():
+        monkeypatch.setenv(f"FAKE_DOCKER_{name.upper()}", value)
+    monkeypatch.setattr(cli, "make_container", MAKE_CONTAINER)
+    monkeypatch.setattr(
+        cli, "Container", partial(Container, command=[sys.executable, str(FAKE_DOCKER)])
+    )
+    return record
+
+
+def docker_calls(record: Path) -> list[str]:
+    """Return the subcommand of each call `record` holds, with the name a `kill` was given."""
+    calls = [json.loads(line) for line in record.read_text("utf-8").splitlines()]
+    return [" ".join(call[:2]) if call[0] == "kill" else call[0] for call in calls]
+
+
+def test_rescue_does_not_run_while_a_container_that_could_not_be_killed_still_runs(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    tmp_path: Path,
+) -> None:
+    record = fake_docker(
+        monkeypatch,
+        tmp_path,
+        run_sleep="5",
+        kill_exit="1",
+        kill_stderr="permission denied\n",
+        ps_stdout="dev-worker-stuck\n",
+    )
+    slow_refresh(monkeypatch, workspace, 1799.5)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(
+        answer,
+        "task-1",
+        "The work of the run cannot be rescued, its worktree is kept: the container "
+        "dev-worker-stuck of the instance is still running",
+    )
+    assert docker_calls(record)[-1] == "ps"
+    assert RESCUED not in workspace.calls
+    assert ("close", "agent/DEMO-1") not in workspace.calls
+
+
+def test_container_left_by_a_killed_worker_is_killed_before_its_worktree_is_rescued(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    tmp_path: Path,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    record = fake_docker(monkeypatch, tmp_path, ps_stdout_0="dev-worker-left\n")
+    workspace.left = "agent/OLD-7"
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed"
+    assert docker_calls(record) == ["ps", "kill dev-worker-left", "ps", "run", "ps"]
+    assert ("rescue", "agent/OLD-7", "Example Worker", IDENTITY) in workspace.calls
+    assert stub.moves != []
+
+
+@pytest.mark.parametrize(
+    ("answers", "reason"),
+    [
+        (
+            {
+                "ps_stdout": "dev-worker-left\n",
+                "kill_exit": "1",
+                "kill_stderr": "permission denied\n",
+            },
+            (
+                "The worktree left by an earlier run cannot be rescued: docker failed "
+                "while killing the container dev-worker-left: permission denied"
+            ),
+        ),
+        (
+            {"ps_stdout": "dev-worker-left\n"},
+            (
+                "The worktree left by an earlier run on the branch agent/OLD-7: The work "
+                "of the run cannot be rescued, its worktree is kept: the container "
+                "dev-worker-left of the instance is still running"
+            ),
+        ),
+    ],
+)
+def test_container_left_that_cannot_be_stopped_fails_the_run_without_taking_the_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    tmp_path: Path,
+    answers: dict[str, str],
+    reason: str,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    record = fake_docker(monkeypatch, tmp_path, **answers)
+    workspace.left = "agent/OLD-7"
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", reason)
+    assert "run" not in docker_calls(record)
+    assert ("rescue", "agent/OLD-7", "Example Worker", IDENTITY) not in workspace.calls
+    assert stub.moves == []
+    assert journal_lines(instance) == []
+
+
+def spell_instance_path(
+    instance: Path, spelling: str, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Return another path to the instance file, written the way `spelling` names."""
+    if spelling == "relative":
+        monkeypatch.chdir(instance.parent)
+        return Path(instance.name)
+    if spelling == "parent-step":
+        (instance.parent / "elsewhere").mkdir()
+        return instance.parent / "elsewhere" / ".." / instance.name
+    if spelling == "symlink":
+        link = instance.parent / "link"
+        try:
+            link.symlink_to(instance.parent, target_is_directory=True)
+        except OSError as error:
+            pytest.skip(f"symbolic links cannot be created here: {error}")
+        return link / instance.name
+    return instance
+
+
+@pytest.mark.parametrize("spelling", ["absolute", "relative", "parent-step", "symlink"])
+def test_containers_of_an_instance_carry_one_label_whatever_the_path_spelling(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    tmp_path: Path,
+    spelling: str,
+) -> None:
+    record = fake_docker(monkeypatch, tmp_path)
+
+    run_mandate(
+        monkeypatch,
+        capsysbinary,
+        encode(valid_input()),
+        instance=spell_instance_path(instance, spelling, monkeypatch),
+    )
+
+    owner = f"dev-worker.instance={instance.with_suffix('').resolve()}"
+    calls = [json.loads(line) for line in record.read_text("utf-8").splitlines()]
+    [run_call] = [call for call in calls if call[0] == "run"]
+    assert owner in run_call
+    assert all(f"label={owner}" in call for call in calls if call[0] == "ps")
 
 
 def test_local_branches_that_cannot_be_dropped_fail_the_run_without_taking_the_ticket(
