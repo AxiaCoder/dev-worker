@@ -328,7 +328,7 @@ class Workspace:
                 return admin
         raise WorkspaceError(
             f"the mirror records no worktree at '{self.worktree}'; "
-            "it was not made by a run"
+            "delete that directory by hand"
         )
 
     def _git_worktree(self, action: str, *arguments: str) -> str:
