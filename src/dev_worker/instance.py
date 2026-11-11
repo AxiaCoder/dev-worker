@@ -23,7 +23,7 @@ ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]*")
 _PATH_COMPONENT = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
 _DOMAIN_COMPONENT = r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
 _DOMAIN = rf"{_DOMAIN_COMPONENT}(?:\.{_DOMAIN_COMPONENT})*"
-_HOST_LIKE = r"(?:[^/]*[.:][^/]*|localhost)/"
+_HOST_LIKE = r"(?:[^/]*[.:A-Z][^/]*|localhost)/"
 IMAGE_REFERENCE = re.compile(
     rf"(?:(?={_HOST_LIKE}){_DOMAIN}(?::[0-9]+)?/|(?!{_HOST_LIKE}))"
     rf"{_PATH_COMPONENT}(?:/{_PATH_COMPONENT})*"
@@ -77,9 +77,9 @@ def _check_pinned_image(value: str) -> str:
     """Return `value` when it names an image by digest or by a tag other than `latest`.
 
     The reference reads `[host[:port]/]path[:tag][@digest]`, as Docker parses it: the first
-    component is a host only when it holds a `.` or a `:`, or is `localhost`; path components
-    are lowercase ASCII joined by `.`, `_`, `__` or a run of `-`; a tag is ASCII; a digest is
-    `<algorithm>:<hex>` with at least 32 hex digits. Raises `ValueError` when the reference
+    component is a host only when it holds a `.`, a `:` or an uppercase letter, or is
+    `localhost`; path components are lowercase ASCII joined by `.`, `_`, `__` or a run of
+    `-`; a tag is ASCII; a digest is `<algorithm>:<hex>` with at least 32 hex digits. Raises `ValueError` when the reference
     is malformed, or when it is well formed but pins no version.
     """
     match = IMAGE_REFERENCE.fullmatch(value)

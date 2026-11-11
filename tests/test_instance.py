@@ -539,6 +539,8 @@ DIGEST = "sha256:" + "0123456789abcdef" * 4
         "My.Registry.example.com/app:1",
         "a-b.example.com/team/app:1",
         "localhostx/app:1",
+        "MyRegistry/app:1",
+        "Localhostx/app:1",
         "a/b/c/d:1",
     ],
 )
@@ -574,7 +576,7 @@ def test_unpinned_image_is_refused_with_its_reason(tmp_path: Path, image: str) -
 @pytest.mark.parametrize(
     "image",
     [
-        "MyRegistry/app:1",
+        "My_Registry/app:1",
         "./app:1",
         "-/app:1",
         "a.-b:1",
@@ -593,7 +595,6 @@ def test_unpinned_image_is_refused_with_its_reason(tmp_path: Path, image: str) -
         "registry.example.com:abc/app:1",
         "registry.example.com:/app:1",
         "localhost:/app:1",
-        "Localhostx/app:1",
         "my_registry.com/app:1",
         "my_registry:5000/app:1",
         "python:",
