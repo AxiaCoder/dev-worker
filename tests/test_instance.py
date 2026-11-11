@@ -529,6 +529,19 @@ DIGEST = "sha256:" + "0123456789abcdef" * 4
         f"ghcr.io/example-org/app@{DIGEST}",
         f"python:latest@{DIGEST}",
         f"registry.example.com:443/a/b@{DIGEST}",
+        "a__b:1",
+        "a--b:1",
+        "a_b.c-d:1",
+        "localhost/app:1",
+        "my-registry.example.com/app:1",
+        "myregistry:5000/app:1",
+        "127.0.0.1:5000/app:1",
+        "My.Registry.example.com/app:1",
+        "a-b.example.com/team/app:1",
+        "localhostx/app:1",
+        "MyRegistry/app:1",
+        "Localhostx/app:1",
+        "a/b/c/d:1",
     ],
 )
 def test_pinned_image_is_accepted(tmp_path: Path, image: str) -> None:
@@ -542,12 +555,50 @@ def test_pinned_image_is_accepted(tmp_path: Path, image: str) -> None:
     [
         "python",
         "python:latest",
-        "python:",
-        ":1.0",
         "ghcr.io/example-org/app",
         "ghcr.io/example-org/app:latest",
         "localhost:5000/app",
         "registry:5000/app",
+        "localhost/app:latest",
+    ],
+)
+def test_unpinned_image_is_refused_with_its_reason(tmp_path: Path, image: str) -> None:
+    text = VALID.replace("image: python:3.12-slim", f"image: '{image}'")
+
+    with pytest.raises(
+        InstanceError,
+        match=r"invalid instance file: container\.image: .*must pin a version, with a "
+        r"tag other than latest or a digest, e\.g\. python:3\.12-slim",
+    ):
+        load(tmp_path, text)
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        "My_Registry/app:1",
+        "./app:1",
+        "-/app:1",
+        "a.-b:1",
+        "a...b:1",
+        "a._b:1",
+        "a___b:1",
+        "a-_b:1",
+        ".app:1",
+        "app-:1",
+        "a//b:1",
+        "a-.b/app:1",
+        "-a.com/app:1",
+        "a..b/app:1",
+        ".registry.com/app:1",
+        "registry.com./app:1",
+        "registry.example.com:abc/app:1",
+        "registry.example.com:/app:1",
+        "localhost:/app:1",
+        "my_registry.com/app:1",
+        "my_registry:5000/app:1",
+        "python:",
+        ":1.0",
         "python@",
         "@sha256:abc",
         "python:latest@",
@@ -562,13 +613,13 @@ def test_pinned_image_is_accepted(tmp_path: Path, image: str) -> None:
         "python:１",
     ],
 )
-def test_unpinned_image_is_refused_with_its_reason(tmp_path: Path, image: str) -> None:
+def test_malformed_image_is_refused_as_invalid(tmp_path: Path, image: str) -> None:
     text = VALID.replace("image: python:3.12-slim", f"image: '{image}'")
 
     with pytest.raises(
         InstanceError,
-        match=r"invalid instance file: container\.image: .*must pin a version, with a "
-        r"tag other than latest or a digest, e\.g\. python:3\.12-slim",
+        match=r"invalid instance file: container\.image: .*is not a valid image "
+        r"reference, e\.g\. python:3\.12-slim",
     ):
         load(tmp_path, text)
 

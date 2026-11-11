@@ -20,9 +20,12 @@ from dev_worker.header import (
 )
 
 ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]*")
-_PATH_COMPONENT = r"[a-z0-9]+(?:[._-]+[a-z0-9]+)*"
+_PATH_COMPONENT = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
+_DOMAIN_COMPONENT = r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+_DOMAIN = rf"{_DOMAIN_COMPONENT}(?:\.{_DOMAIN_COMPONENT})*"
+_HOST_LIKE = r"(?:[^/]*[.:A-Z][^/]*|localhost)/"
 IMAGE_REFERENCE = re.compile(
-    r"(?:[A-Za-z0-9.-]+(?::[0-9]+)?/)?"
+    rf"(?:(?={_HOST_LIKE}){_DOMAIN}(?::[0-9]+)?/|(?!{_HOST_LIKE}))"
     rf"{_PATH_COMPONENT}(?:/{_PATH_COMPONENT})*"
     r"(?::(?P<tag>[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}))?"
     r"(?:@(?P<digest>[A-Za-z][A-Za-z0-9]*:[0-9a-fA-F]{32,}))?"
@@ -73,15 +76,17 @@ BranchTemplate = Annotated[str, AfterValidator(_check_branch_template)]
 def _check_pinned_image(value: str) -> str:
     """Return `value` when it names an image by digest or by a tag other than `latest`.
 
-    The reference reads `[host[:port]/]path[:tag][@digest]`: path components in lowercase
-    ASCII, a tag in ASCII, a digest `<algorithm>:<hex>` with at least 32 hex digits. Raises
-    `ValueError` otherwise.
+    The reference reads `[host[:port]/]path[:tag][@digest]`. The first component is a host
+    when it holds a `.`, a `:` or an uppercase letter, or is `localhost`, as Docker splits
+    it, and must then be a valid domain with an optional numeric port; path components are
+    lowercase ASCII joined by `.`, `_`, `__` or a run of `-`; a tag is ASCII; a digest is
+    `<algorithm>:<hex>` with at least 32 hex digits. Raises `ValueError` when the reference
+    is malformed, or when it is well formed but pins no version.
     """
     match = IMAGE_REFERENCE.fullmatch(value)
-    pinned = bool(match) and bool(
-        match["digest"] or match["tag"] not in (None, "latest")
-    )
-    if not pinned:
+    if match is None:
+        raise ValueError("is not a valid image reference, e.g. python:3.12-slim")
+    if not match["digest"] and match["tag"] in (None, "latest"):
         raise ValueError(
             "must pin a version, with a tag other than latest or a digest,"
             " e.g. python:3.12-slim"
