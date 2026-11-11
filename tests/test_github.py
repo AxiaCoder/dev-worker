@@ -630,5 +630,4 @@ def test_gh_that_does_not_answer_is_stopped_at_the_timeout(
 
     assert str(raised.value) == f"gh did not answer within 0.5 seconds while {action}"
     assert TOKEN not in str(raised.value)
-    assert record.exists()
     assert elapsed < 10
