@@ -2,6 +2,7 @@ import json
 import sys
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -610,7 +611,10 @@ def test_claims_count_only_those_since_the_last_entry_in_the_status_oldest_first
 
     claims = tracker().claims("ABC-218", "To Do")
 
-    assert claims == (Claim(100, "task-1"), Claim(120, "task-2"))
+    assert claims == (
+        Claim(100, "task-1", datetime(2026, 11, 11, 8, 0, tzinfo=UTC)),
+        Claim(120, "task-2", datetime(2026, 11, 11, 8, 0, tzinfo=UTC)),
+    )
     assert calls == [
         ["jira", "workitem", "changelog", "query", "--issue-id", "ABC-218",
          "--first", "100"],
@@ -640,7 +644,9 @@ def test_claims_of_a_ticket_that_never_entered_the_status_all_count(
         ),
     )
 
-    assert tracker().claims("ABC-218", "To Do") == (Claim(90, "task-1"),)
+    assert tracker().claims("ABC-218", "To Do") == (
+        Claim(90, "task-1", datetime(2020, 1, 1, tzinfo=UTC)),
+    )
 
 
 @pytest.mark.parametrize("cursor", [None, "2"])

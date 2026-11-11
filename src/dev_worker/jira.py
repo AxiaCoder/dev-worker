@@ -262,8 +262,9 @@ class JiraTracker:
 
         The last entry is the latest changelog entry that sets the status to `status`; a
         claim counts when its comment was created at that instant or after, and every claim
-        counts when there is no such entry. Claims are ordered by comment id. Every page of
-        the changelog and of the comments is read. Raises `TrackerError` when `key` is not a
+        counts when there is no such entry. Each claim carries the creation time of its
+        comment. Claims are ordered by comment id. Every page of the changelog and of the
+        comments is read. Raises `TrackerError` when `key` is not a
         ticket key, the token variable is not set, `twg` fails, or an answer cannot be read.
         """
         _check_key(key)
@@ -297,7 +298,13 @@ class JiraTracker:
                 if text.startswith(CLAIM_MARKER) and (
                     since is None or comment.created >= since
                 ):
-                    found.append(Claim(comment.id, text.removeprefix(CLAIM_MARKER)))
+                    found.append(
+                        Claim(
+                            comment.id,
+                            text.removeprefix(CLAIM_MARKER),
+                            comment.created,
+                        )
+                    )
         return tuple(sorted(found, key=lambda claim: claim.claim_id))
 
     def _pages[P: _Page](

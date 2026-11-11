@@ -12,7 +12,7 @@ import re
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from importlib.resources import as_file, files
 from pathlib import Path
 
@@ -64,6 +64,8 @@ from dev_worker.workspace import Workspace, WorkspaceError
 
 TICKET_KEY = re.compile(r"(.+)-([1-9][0-9]*)")
 RECENT_RUNS = 10
+CLAIM_READ_LIMIT_SECONDS = 300
+CLAIM_EXPIRY_SECONDS = 600
 
 
 def failed(task_id: str | None, *errors: str) -> MandateOutput:
@@ -230,11 +232,16 @@ def claim_ticket(
 
     The run may take the ticket only when its own claim is the oldest of those posted
     since the ticket last entered the real status of the `ready` key: of runs that both
-    read the ticket ready, one only goes on. A run whose claim cannot be posted, whose
-    claims cannot be read, or whose own claim is not found among them may not take it;
-    the reason says whether the claim may have been posted.
+    read the ticket ready, one only goes on. A claim created more than
+    `CLAIM_EXPIRY_SECONDS` before the run's own, by the tracker's clock, is left by a run
+    that is gone and does not count. A run whose claim cannot be posted, whose claims
+    cannot be read, whose claims are read back more than `CLAIM_READ_LIMIT_SECONDS` after
+    it began posting its claim, or whose own claim is not found among them may not take
+    it; the reason says whether the claim may have been posted. A run whose claim wins
+    reads the ticket again and may not take it unless it is still in the `ready` status.
     """
     ready = instance.statuses["ready"]
+    began = time.monotonic()
     try:
         own = tracker.claim(key, task_id)
     except TrackerError as error:
@@ -249,14 +256,34 @@ def claim_ticket(
             f"The claims on ticket {key!r} cannot be read: {error} "
             f"The claim of task {task_id!r} was posted."
         )
-    if own not in [claim.claim_id for claim in claims]:
+    if time.monotonic() - began > CLAIM_READ_LIMIT_SECONDS:
+        return (
+            f"The claims on ticket {key!r} were read back more than "
+            f"{CLAIM_READ_LIMIT_SECONDS} seconds after the claim of task {task_id!r} "
+            "began to be posted. The claim was posted."
+        )
+    own_claims = [claim for claim in claims if claim.claim_id == own]
+    if not own_claims:
         return (
             f"The claim of task {task_id!r} is not found among the claims on "
             f"ticket {key!r} since it last entered {ready!r}."
         )
-    first = claims[0]
+    oldest_live = own_claims[0].created - timedelta(seconds=CLAIM_EXPIRY_SECONDS)
+    first = next(claim for claim in claims if claim.created >= oldest_live)
     if first.claim_id != own:
         return f"Ticket {key!r} is claimed by task {first.task_id!r}."
+    try:
+        ticket = tracker.read(key)
+    except TrackerError as error:
+        return (
+            f"Ticket {key!r} cannot be read again from the tracker: {error} "
+            f"The claim of task {task_id!r} was posted."
+        )
+    if ticket.status != ready:
+        return (
+            f"Ticket {key!r} is no longer in {ready!r}: it is in {ticket.status!r}. "
+            f"The claim of task {task_id!r} was posted."
+        )
     return None
 
 
@@ -367,9 +394,10 @@ def run_under_lock(
     Before anything is journaled, a worktree an earlier run left in `directory` is
     rescued and removed (see `rescue_left_worktree`); a run that cannot do so fails
     without taking its ticket nor being journaled. Then the ticket is claimed for the run
-    through `tracker` (see `claim_ticket`) and moved to the real status of the
-    `in_progress` key; a run whose ticket cannot be claimed or moved fails without being
-    journaled. A `running` line is appended before `handler` runs, so that the
+    through `tracker` (see `claim_ticket`): the claim must be read back in time, win
+    over the live claims and find the ticket still ready. The ticket is then moved to the
+    real status of the `in_progress` key; a run whose ticket cannot be claimed or moved
+    fails without being journaled. A `running` line is appended before `handler` runs, so that the
     task is never run again even if its final line, appended once `handler` returns,
     cannot be written; the output is then kept, with the journal error added to
     `errors`. A run whose `running` line cannot be written fails without running

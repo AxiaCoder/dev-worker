@@ -78,7 +78,7 @@ class ReadyTracker:
 
     def claims(self, key: str, status: str) -> tuple[Claim, ...]:
         """Return the claim 1 alone."""
-        return (Claim(1, "task-1"),)
+        return (Claim(1, "task-1", CLAIM_EPOCH),)
 
     def set_status(self, key: str, status: str) -> None:
         """Change nothing."""
@@ -374,7 +374,9 @@ class StubTracker:
 
     def claims(self, key: str, status: str) -> tuple[Claim, ...]:
         """Return every claim recorded, oldest first."""
-        return tuple(Claim(rank, task) for rank, task in enumerate(self.posted, 1))
+        return tuple(
+            Claim(rank, task, CLAIM_EPOCH) for rank, task in enumerate(self.posted, 1)
+        )
 
     def set_status(self, key: str, status: str) -> None:
         """Record the change, then raise `move_error` or give the answer `status`."""
@@ -416,7 +418,7 @@ def test_run_reads_the_mandate_ticket_from_the_tracker_of_the_instance(
     )
 
     assert answer["status"] == "completed"
-    assert stub.reads == ["DEMO-1"]
+    assert stub.reads == ["DEMO-1", "DEMO-1"]
     assert [tracker.project for tracker in stub.trackers] == ["DEMO"]
     assert stub.trackers[0].token_env == "JIRA_TOKEN"
 
@@ -727,7 +729,9 @@ class InterleavedTracker(ReadyTracker):
     def claims(self, key: str, status: str) -> tuple[Claim, ...]:
         """Record `status`; return every claim kept, oldest first."""
         self.asked.append(status)
-        return tuple(Claim(rank, task) for rank, task in enumerate(self.posted, 1))
+        return tuple(
+            Claim(rank, task, CLAIM_EPOCH) for rank, task in enumerate(self.posted, 1)
+        )
 
     def set_status(self, key: str, status: str) -> None:
         """Record the change."""
@@ -779,7 +783,7 @@ class UnclaimableTracker(ReadyTracker):
             raise TrackerError(
                 "twg failed while reading the comments of DEMO-1: timeout"
             )
-        return (Claim(3, "task-0"),)
+        return (Claim(3, "task-0", CLAIM_EPOCH),)
 
     def set_status(self, key: str, status: str) -> None:
         """Record the change."""
@@ -829,6 +833,193 @@ def test_ticket_that_cannot_be_claimed_is_not_moved_nor_journaled(
     )
 
     assert_failed(answer, "task-1", reason)
+    assert tracker.moves == []
+    assert journal_lines(instance) == []
+
+
+CLAIM_EPOCH = datetime(2026, 11, 11, 9, 0, tzinfo=UTC)
+
+
+def timed_claim(claim_id: int, task_id: str, created: datetime) -> Claim:
+    """Return the claim `claim_id` of `task_id`, created on the tracker at `created`."""
+    return Claim(claim_id, task_id, created)
+
+
+class TimedTracker(ReadyTracker):
+    """A tracker whose claims carry the server time they were created at.
+
+    `earlier` holds the claims already on the ticket, as (task_id, created) pairs, oldest
+    first; the run's own claim is created at `own_created`. Reading the claims advances
+    the monotonic `clock` by `read_seconds`. Once a claim is posted, reads answer
+    `status_after_claim`. `moves` records each status change.
+    """
+
+    def __init__(
+        self,
+        earlier: list[tuple[str, datetime]],
+        own_created: datetime,
+        read_seconds: float = 0.0,
+        status_after_claim: str = "To Do",
+    ) -> None:
+        """Keep the claims already posted, the time of the own claim and the read delay."""
+        self.posted = list(earlier)
+        self.own_created = own_created
+        self.read_seconds = read_seconds
+        self.status_after_claim = status_after_claim
+        self.clock = [1000.0]
+        self.claimed = False
+        self.moves: list[tuple[str, str]] = []
+
+    def monotonic(self) -> float:
+        """Return the fake monotonic clock, in seconds."""
+        return self.clock[0]
+
+    def read(self, key: str) -> Ticket:
+        """Return the ticket ready, or in `status_after_claim` once a claim is posted."""
+        status = self.status_after_claim if self.claimed else "To Do"
+        return Ticket(key=key, status=status, labels=(), blockers=())
+
+    def claim(self, key: str, task_id: str) -> int:
+        """Keep the claim of `task_id`, created at `own_created`; return its id."""
+        self.posted.append((task_id, self.own_created))
+        self.claimed = True
+        return len(self.posted)
+
+    def claims(self, key: str, status: str) -> tuple[Claim, ...]:
+        """Advance the clock by `read_seconds`; return every claim kept, oldest first."""
+        self.clock[0] += self.read_seconds
+        return tuple(
+            timed_claim(rank, task, created)
+            for rank, (task, created) in enumerate(self.posted, 1)
+        )
+
+    def set_status(self, key: str, status: str) -> None:
+        """Record the change."""
+        self.moves.append((key, status))
+
+
+def serve_timed(monkeypatch: pytest.MonkeyPatch, tracker: TimedTracker) -> None:
+    """Make `run` use `tracker` and read time from its monotonic clock."""
+    monkeypatch.setattr(cli, "make_tracker", lambda made: tracker)
+    monkeypatch.setattr(cli.time, "monotonic", tracker.monotonic)
+
+
+@pytest.mark.parametrize("orphan_task", ["task-0", "task-1"])
+def test_claim_created_more_than_the_expiry_before_its_own_does_not_block_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    orphan_task: str,
+) -> None:
+    tracker = TimedTracker(
+        [(orphan_task, CLAIM_EPOCH)],
+        CLAIM_EPOCH + timedelta(seconds=601),
+    )
+    serve_timed(monkeypatch, tracker)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed", answer["errors"]
+    assert tracker.moves == [("DEMO-1", "In Progress")]
+
+
+@pytest.mark.parametrize("age", [1, 600])
+def test_rival_claim_created_within_the_expiry_still_wins_over_its_own(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    age: int,
+) -> None:
+    tracker = TimedTracker(
+        [("task-0", CLAIM_EPOCH)],
+        CLAIM_EPOCH + timedelta(seconds=age),
+    )
+    serve_timed(monkeypatch, tracker)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", "Ticket 'DEMO-1' is claimed by task 'task-0'.")
+    assert tracker.moves == []
+    assert journal_lines(instance) == []
+
+
+def test_run_whose_claims_are_read_back_too_late_gives_up_the_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    tracker = TimedTracker([], CLAIM_EPOCH, read_seconds=301.0)
+    serve_timed(monkeypatch, tracker)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", "300 seconds")
+    assert tracker.moves == []
+    assert journal_lines(instance) == []
+
+
+def test_run_whose_claims_are_read_back_within_the_delay_takes_the_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    tracker = TimedTracker([], CLAIM_EPOCH, read_seconds=300.0)
+    serve_timed(monkeypatch, tracker)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed", answer["errors"]
+    assert tracker.moves == [("DEMO-1", "In Progress")]
+
+
+def test_winning_run_gives_up_a_ticket_read_again_out_of_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    tracker = TimedTracker([], CLAIM_EPOCH, status_after_claim="In Progress")
+    serve_timed(monkeypatch, tracker)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", "no longer in 'To Do'")
+    assert tracker.moves == []
+    assert journal_lines(instance) == []
+
+
+class RereadFailingTracker(TimedTracker):
+    """A timed tracker that cannot read the ticket again once a claim is posted."""
+
+    def read(self, key: str) -> Ticket:
+        """Return the ticket ready, or raise once a claim is posted."""
+        if self.claimed:
+            raise TrackerError("twg failed while reading DEMO-1: timeout")
+        return super().read(key)
+
+
+def test_winning_run_gives_up_a_ticket_that_cannot_be_read_again(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    tracker = RereadFailingTracker([], CLAIM_EPOCH)
+    serve_timed(monkeypatch, tracker)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", "cannot be read again")
     assert tracker.moves == []
     assert journal_lines(instance) == []
 
@@ -972,7 +1163,7 @@ def test_journal_records_the_duration_of_the_mandate_in_seconds(
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
 ) -> None:
-    clock = [90.0, 100.0, 101.0, 102.5]
+    clock = [90.0, 90.0, 90.0, 100.0, 101.0, 102.5]
     monkeypatch.setattr(cli.time, "monotonic", lambda: clock.pop(0))
 
     run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)

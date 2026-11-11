@@ -1,6 +1,7 @@
 """The ticket tracker as the rest of the worker sees it: read a ticket, claim it, change its status."""
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol
 
 
@@ -35,13 +36,15 @@ class Ticket:
 
 @dataclass(frozen=True)
 class Claim:
-    """A claim posted on a ticket by a run: the tracker id of the claim and the task_id it names.
+    """A claim posted on a ticket by a run: the tracker id of the claim, the task_id it names and when it was created.
 
     Claim ids grow in the order the tracker recorded the claims: the lower, the older.
+    `created` is the timezone-aware time the tracker server recorded the claim at.
     """
 
     claim_id: int
     task_id: str
+    created: datetime
 
 
 class TicketTracker(Protocol):
@@ -66,7 +69,7 @@ class TicketTracker(Protocol):
     def claims(self, key: str, status: str) -> tuple[Claim, ...]:
         """Return the claims posted on the ticket `key` since it last entered the real status `status`, oldest first.
 
-        A ticket that never entered `status` by a change of status gives all its claims.
+        Each claim carries the server time it was created at. A ticket that never entered `status` by a change of status gives all its claims.
         Raises `TrackerError` when they cannot be read.
         """
         ...
