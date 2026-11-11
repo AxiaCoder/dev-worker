@@ -547,6 +547,8 @@ HEX = "0123456789abcdef"
         "app@sha512:" + HEX * 8,
         "a" * 255 + ":1",
         "a" * 255 + ":" + "a" * 128,
+        "a" * 255 + "@" + DIGEST,
+        "localhost:5000/" + "a" * 240 + ":1",
     ],
 )
 def test_pinned_image_is_accepted(tmp_path: Path, image: str) -> None:
@@ -622,8 +624,17 @@ def test_unpinned_image_is_refused_with_its_reason(tmp_path: Path, image: str) -
         "app@md5:" + HEX * 2,
         "app@SHA256:" + HEX * 4,
         "app@sha384:" + HEX * 4,
+        "app@sha256:" + (HEX * 4)[:-1],
+        "app@sha384:" + (HEX * 6)[:-1],
+        "app@sha384:" + HEX * 6 + "0",
+        "app@sha512:" + (HEX * 8)[:-1],
+        "app@sha512:" + HEX * 8 + "0",
+        "app@sha512:" + HEX * 6,
+        "app@sha512:" + HEX.upper() * 8,
         "a" * 256 + ":1",
+        "a" * 256 + "@" + DIGEST,
         "registry.example.com/" + "a" * 235 + ":1",
+        "localhost:5000/" + "a" * 241 + ":1",
     ],
 )
 def test_malformed_image_is_refused_as_invalid(tmp_path: Path, image: str) -> None:
