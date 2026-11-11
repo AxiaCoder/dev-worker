@@ -67,12 +67,13 @@ It may comment on the ticket and create follow-up tickets in the tracker.
 
 - **An open choice is decided, not asked.** Take the option you would have recommended, and record
   it in the pull request body as a hypothesis, with its reason, so the reviewer can reverse it.
-- **Stop only on what is hard to undo or cannot be guessed**: then end the run with `needs_human`.
-  Everything else is decided and recorded.
-- **Where a command or a skill of the plugin hands back to the user, the run stops there** and ends
-  with `blocked`, the failing check as its reason: a `pr` gate still failing after its bounded
-  retries, a `dev` ⇄ `qa` loop past its two passes. It never goes past such a gate on its own, and
-  never opens the pull request a gate refused.
+- **Stop on a decision only when it is hard to undo or cannot be guessed**: then end the run with
+  `needs_human`. Every other decision is made and recorded.
+- **Where a check of the plugin still fails and the command or skill running it hands back to the
+  user, the run stops there** and ends with `blocked`, the failing check as its reason: a `pr` gate
+  still failing after its bounded retries, a `dev` ⇄ `qa` loop past its two passes. It never goes
+  past such a gate on its own, and never opens the pull request a gate refused. The merge request
+  and review comments pending a decision are not such checks: § Merging without asking covers them.
 - **An authorised task chains.** No pause between steps, and one report, at the end: the outcome.
 - **A trivial defect is fixed or left unsaid.** When fixing it costs less than deciding, fix it in
   this pull request if it concerns it; otherwise say nothing.
