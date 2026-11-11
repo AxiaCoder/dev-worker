@@ -1,5 +1,6 @@
 """Reading and validation of the front matter of a `WORKER.md` file."""
 
+import re
 from collections.abc import Hashable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,7 @@ from yaml.constructor import ConstructorError
 from yaml.nodes import MappingNode
 
 FENCE = "---"
+_URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://.+", re.DOTALL)
 
 StatusKey = Annotated[str, Field(min_length=1)]
 CeilingName = Annotated[str, Field(min_length=1)]
@@ -62,7 +64,8 @@ class Outcomes(BaseModel):
 class Plugin(BaseModel):
     """The Claude Code plugin a run loads: the git `repository` it comes from, at `tag`.
 
-    Neither value is empty nor starts with `-`.
+    Neither value is empty nor starts with `-`. `repository` is a URL,
+    `<scheme>://<rest>`.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -76,6 +79,14 @@ class Plugin(BaseModel):
         """Refuse a value git would read as an option."""
         if value.startswith("-"):
             raise ValueError("must not start with '-'")
+        return value
+
+    @field_validator("repository", mode="after")
+    @classmethod
+    def _require_url(cls, value: str) -> str:
+        """Refuse a repository that is not a `<scheme>://<rest>` URL."""
+        if not _URL.fullmatch(value):
+            raise ValueError("must be a URL, '<scheme>://<rest>'")
         return value
 
 

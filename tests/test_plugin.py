@@ -169,6 +169,25 @@ def test_a_directory_that_cannot_be_deleted_raises_naming_it(
     )
 
 
+def test_a_replaced_checkout_that_cannot_be_deleted_leaves_the_new_one_in_place(
+    url: str, instance: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    PluginCheckout(instance).prepare(Plugin(repository=url, tag="v1"))
+    rmtree = plugin_module.shutil.rmtree
+
+    def refuse_the_discard(path: Path) -> None:
+        if Path(path) == instance / "plugin.old":
+            raise PermissionError(13, "Permission denied")
+        rmtree(path)
+
+    monkeypatch.setattr(plugin_module.shutil, "rmtree", refuse_the_discard)
+
+    checkout = PluginCheckout(instance).prepare(Plugin(repository=url, tag="v2"))
+
+    assert checkout == instance / "plugin"
+    assert version(checkout) == "v2"
+
+
 def test_a_checkout_that_cannot_be_replaced_raises_naming_it(
     url: str, instance: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -288,6 +288,36 @@ def test_plugin_value_read_as_an_option_is_refused(
         load_worker_file(write(tmp_path, with_header(VALID.replace(old, new))))
 
 
+@pytest.mark.parametrize(
+    "repository",
+    ["plugin.git", "../plugin.git", "/srv/plugin.git", "git@github.com:a/b.git"],
+)
+def test_plugin_repository_that_is_not_a_url_is_refused(
+    tmp_path: Path, repository: str
+) -> None:
+    front_matter = VALID.replace(
+        "repository: https://example.com/plugin.git", f"repository: '{repository}'"
+    )
+
+    with pytest.raises(HeaderError, match="plugin.repository"):
+        load_worker_file(write(tmp_path, with_header(front_matter)))
+
+
+@pytest.mark.parametrize(
+    "repository", ["https://example.com/plugin.git", "file:///srv/plugin.git"]
+)
+def test_plugin_repository_that_is_a_url_is_accepted(
+    tmp_path: Path, repository: str
+) -> None:
+    front_matter = VALID.replace(
+        "repository: https://example.com/plugin.git", f"repository: '{repository}'"
+    )
+
+    worker = load_worker_file(write(tmp_path, with_header(front_matter)))
+
+    assert worker.header.plugin.repository == repository
+
+
 def test_unknown_plugin_key_is_refused(tmp_path: Path) -> None:
     front_matter = VALID.replace("  tag: v1.0.0\n", "  tag: v1.0.0\n  branch: main\n")
 

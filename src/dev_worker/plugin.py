@@ -5,10 +5,13 @@ anonymously: inherited credential helpers are cleared and git never prompts. It 
 fetched only when it is missing or is not at that tag of that repository, as read from
 the checkout itself. A new clone is made beside it, in `STAGING_DIRECTORY`, and replaces
 it only once complete, so a clone that fails leaves the previous checkout as it was; a
-failure while swapping them leaves no checkout, and the next run fetches it again.
+failure while swapping them leaves no checkout, and the next run fetches it again. The
+replaced checkout is deleted if it can be; otherwise the new one is used all the same, and
+the next fetch deletes the old one first.
 Every git call is bounded by `GIT_TIMEOUT_SECONDS` (600 seconds).
 """
 
+import contextlib
 import os
 import shutil
 import stat
@@ -57,10 +60,12 @@ class PluginCheckout:
 
         A checkout at the tag of `plugin`, cloned from its repository, is used as it is,
         without reaching the network. Otherwise the tag is cloned into
-        `STAGING_DIRECTORY`, which then replaces the checkout. What an earlier fetch
-        left in `STAGING_DIRECTORY` or `DISCARD_DIRECTORY` is deleted first. Raises
-        `PluginError` when the clone fails, is not at a tag of that name, or a
-        directory cannot be deleted or moved.
+        `STAGING_DIRECTORY`, which then replaces the checkout; the replaced checkout,
+        moved to `DISCARD_DIRECTORY`, is deleted if it can be, and left there otherwise.
+        What an earlier fetch left in `STAGING_DIRECTORY` or `DISCARD_DIRECTORY` is
+        deleted first. Raises `PluginError` when the clone fails, is not at a tag of
+        that name, a leftover of an earlier fetch cannot be deleted, or a directory
+        cannot be moved.
         """
         if self._holds(self.checkout, plugin):
             return self.checkout
@@ -89,7 +94,8 @@ class PluginCheckout:
             raise PluginError(
                 f"the checkout '{self.checkout}' cannot be replaced: {reason}"
             ) from None
-        self._delete(self._discard)
+        with contextlib.suppress(PluginError):
+            self._delete(self._discard)
         return self.checkout
 
     def _holds(self, checkout: Path, plugin: Plugin) -> bool:
