@@ -304,6 +304,27 @@ def test_plugin_repository_that_is_not_a_url_is_refused(
 
 
 @pytest.mark.parametrize(
+    "escaped_repository",
+    [
+        r"https://example.com/a\nb.git",
+        r"https://example.com/a\tb.git",
+        r"https:// example.com/plugin.git",
+        r"https://example.com/plugin.git\n",
+    ],
+)
+def test_plugin_repository_holding_whitespace_is_refused(
+    tmp_path: Path, escaped_repository: str
+) -> None:
+    front_matter = VALID.replace(
+        "repository: https://example.com/plugin.git",
+        f'repository: "{escaped_repository}"',
+    )
+
+    with pytest.raises(HeaderError, match="plugin.repository"):
+        load_worker_file(write(tmp_path, with_header(front_matter)))
+
+
+@pytest.mark.parametrize(
     "repository", ["https://example.com/plugin.git", "file:///srv/plugin.git"]
 )
 def test_plugin_repository_that_is_a_url_is_accepted(

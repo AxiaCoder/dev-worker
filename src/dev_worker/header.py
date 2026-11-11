@@ -20,7 +20,7 @@ from yaml.constructor import ConstructorError
 from yaml.nodes import MappingNode
 
 FENCE = "---"
-_URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://.+", re.DOTALL)
+_URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S+")
 
 StatusKey = Annotated[str, Field(min_length=1)]
 CeilingName = Annotated[str, Field(min_length=1)]
@@ -65,7 +65,7 @@ class Plugin(BaseModel):
     """The Claude Code plugin a run loads: the git `repository` it comes from, at `tag`.
 
     Neither value is empty nor starts with `-`. `repository` is a URL,
-    `<scheme>://<rest>`.
+    `<scheme>://<rest>`, with no whitespace.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -84,9 +84,9 @@ class Plugin(BaseModel):
     @field_validator("repository", mode="after")
     @classmethod
     def _require_url(cls, value: str) -> str:
-        """Refuse a repository that is not a `<scheme>://<rest>` URL."""
+        """Refuse a repository that is not a `<scheme>://<rest>` URL without whitespace."""
         if not _URL.fullmatch(value):
-            raise ValueError("must be a URL, '<scheme>://<rest>'")
+            raise ValueError("must be a URL, '<scheme>://<rest>', with no whitespace")
         return value
 
 
