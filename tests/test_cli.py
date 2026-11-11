@@ -1092,7 +1092,9 @@ def test_run_whose_claims_are_read_back_too_late_gives_up_the_ticket(
         monkeypatch, capsysbinary, encode(valid_input()), instance=instance
     )
 
-    assert_failed(answer, "task-1", "300 seconds")
+    assert_failed(
+        answer, "task-1", "were read back more than 300 seconds after the claim"
+    )
     assert tracker.moves == []
     assert journal_lines(instance) == []
 
@@ -1113,14 +1115,23 @@ def test_run_whose_claims_are_read_back_within_the_delay_takes_the_ticket(
     assert tracker.moves == [("DEMO-1", "In Progress")]
 
 
+TOO_LATE_TO_MOVE = (
+    "Ticket 'DEMO-1' was about to be moved more than 300 seconds after the claim of "
+    "task 'task-1' began to be posted. The claim was posted; the ticket was not moved."
+)
+TOO_LATE_TO_READ = "were read back more than 300 seconds after the claim"
+
+
 @pytest.mark.parametrize(
-    ("read", "suspended", "reread", "reread_suspended"),
+    ("read", "suspended", "reread", "reread_suspended", "reason"),
     [
-        (0.0, 0.0, 301.0, 0.0),
-        (1.0, 0.0, 300.0, 0.0),
-        (0.0, 301.0, 0.0, 0.0),
-        (0.0, 0.0, 0.0, 301.0),
-        (0.0, 1.0, 0.0, 300.0),
+        (0.0, 0.0, 301.0, 0.0, TOO_LATE_TO_MOVE),
+        (1.0, 0.0, 300.0, 0.0, TOO_LATE_TO_MOVE),
+        (0.0, 301.0, 0.0, 0.0, TOO_LATE_TO_READ),
+        (0.0, 0.0, 0.0, 301.0, TOO_LATE_TO_MOVE),
+        (0.0, 1.0, 0.0, 300.0, TOO_LATE_TO_MOVE),
+        (301.0, -301.0, 0.0, 0.0, TOO_LATE_TO_READ),
+        (0.0, 0.0, 301.0, -301.0, TOO_LATE_TO_MOVE),
     ],
 )
 def test_run_that_reaches_the_move_too_late_after_its_claim_gives_up_the_ticket(
@@ -1131,6 +1142,7 @@ def test_run_that_reaches_the_move_too_late_after_its_claim_gives_up_the_ticket(
     suspended: float,
     reread: float,
     reread_suspended: float,
+    reason: str,
 ) -> None:
     tracker = TimedTracker(
         [],
@@ -1146,9 +1158,35 @@ def test_run_that_reaches_the_move_too_late_after_its_claim_gives_up_the_ticket(
         monkeypatch, capsysbinary, encode(valid_input()), instance=instance
     )
 
-    assert_failed(answer, "task-1", "300 seconds")
+    assert_failed(answer, "task-1", reason)
     assert tracker.moves == []
     assert journal_lines(instance) == []
+
+
+def test_claim_delay_starts_after_the_worktree_left_by_an_earlier_run_is_rescued(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+) -> None:
+    tracker = TimedTracker([], CLAIM_EPOCH)
+    serve_timed(monkeypatch, tracker)
+    rescue = workspace.rescue
+
+    def slow_rescue(branch: str, identity: GitIdentity) -> None:
+        rescue(branch, identity)
+        tracker.clock[0] += 1000.0
+        tracker.wall[0] += 1000.0
+
+    monkeypatch.setattr(workspace, "rescue", slow_rescue)
+    workspace.left = "agent/OLD-7"
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed", answer["errors"]
+    assert tracker.moves == [("DEMO-1", "In Progress")]
 
 
 @pytest.mark.parametrize(
