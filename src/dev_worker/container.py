@@ -62,7 +62,8 @@ class Container:
         """Keep what later calls need; nothing is run yet.
 
         `owner` names the instance, and is the value of `OWNER_LABEL` on the containers
-        it runs. `timeout` bounds, in seconds, each docker call other than the run itself.
+        it runs. `timeout` bounds, in seconds, each docker call other than the pull of the
+        image and the run of the container, which the time left in the run bounds.
         """
         self._image = image
         self._owner = owner
