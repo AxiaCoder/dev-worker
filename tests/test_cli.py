@@ -947,6 +947,26 @@ def test_rival_claim_created_within_the_expiry_still_wins_over_its_own(
     assert journal_lines(instance) == []
 
 
+def test_live_rival_claim_wins_over_its_own_once_an_orphan_claim_is_left_out(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    tracker = TimedTracker(
+        [("task-0", CLAIM_EPOCH), ("task-2", CLAIM_EPOCH + timedelta(seconds=300))],
+        CLAIM_EPOCH + timedelta(seconds=601),
+    )
+    serve_timed(monkeypatch, tracker)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", "Ticket 'DEMO-1' is claimed by task 'task-2'.")
+    assert tracker.moves == []
+    assert journal_lines(instance) == []
+
+
 def test_run_whose_claims_are_read_back_too_late_gives_up_the_ticket(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],

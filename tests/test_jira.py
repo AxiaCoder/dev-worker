@@ -649,6 +649,34 @@ def test_claims_of_a_ticket_that_never_entered_the_status_all_count(
     )
 
 
+def test_claims_carry_the_creation_time_of_their_own_comment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    serve_pages(
+        monkeypatch,
+        page([history("2026-11-11T08:00:00.000Z", ("status", "To Do"))]),
+        page(
+            [
+                comment(
+                    "100",
+                    "2026-11-11T08:05:00.000Z",
+                    "dev-worker claims this ticket for task task-1",
+                ),
+                comment(
+                    "110",
+                    "2026-11-11T09:10:30.000+0100",
+                    "dev-worker claims this ticket for task task-2",
+                ),
+            ]
+        ),
+    )
+
+    assert tracker().claims("ABC-218", "To Do") == (
+        Claim(100, "task-1", datetime(2026, 11, 11, 8, 5, tzinfo=UTC)),
+        Claim(110, "task-2", datetime(2026, 11, 11, 8, 10, 30, tzinfo=UTC)),
+    )
+
+
 @pytest.mark.parametrize("cursor", [None, "2"])
 def test_claims_with_a_next_page_and_no_new_cursor_raise(
     monkeypatch: pytest.MonkeyPatch, cursor: str | None
