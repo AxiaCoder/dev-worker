@@ -857,8 +857,10 @@ class TimedTracker(ReadyTracker):
     `earlier` holds the claims already on the ticket, as (task_id, created) pairs, oldest
     first; the run's own claim is created at `own_created`, and the claims of `later`
     are posted right after it, with higher ids. Reading the claims advances the
-    monotonic `clock` by `read_seconds`. Once a claim is posted, reads answer
-    `status_after_claim`. `moves` records each status change.
+    monotonic `clock` and the `wall` clock by `read_seconds`, and the `wall` clock alone
+    by `suspended_seconds`. Once a claim is posted, reading the ticket advances both
+    clocks by `reread_seconds` and the `wall` clock alone by `reread_suspended_seconds`,
+    and answers `status_after_claim`. `moves` records each status change.
     """
 
     def __init__(
@@ -868,14 +870,21 @@ class TimedTracker(ReadyTracker):
         read_seconds: float = 0.0,
         status_after_claim: str = "To Do",
         later: tuple[tuple[str, datetime], ...] = (),
+        suspended_seconds: float = 0.0,
+        reread_seconds: float = 0.0,
+        reread_suspended_seconds: float = 0.0,
     ) -> None:
-        """Keep the claims already posted, the own claim's time, the read delay and the later claims."""
+        """Keep the claims already posted, the own claim's time, the delays and the later claims."""
         self.posted = list(earlier)
         self.own_created = own_created
         self.later = later
         self.read_seconds = read_seconds
         self.status_after_claim = status_after_claim
+        self.suspended_seconds = suspended_seconds
+        self.reread_seconds = reread_seconds
+        self.reread_suspended_seconds = reread_suspended_seconds
         self.clock = [1000.0]
+        self.wall = [CLAIM_EPOCH.timestamp()]
         self.claimed = False
         self.moves: list[tuple[str, str]] = []
 
@@ -883,8 +892,15 @@ class TimedTracker(ReadyTracker):
         """Return the fake monotonic clock, in seconds."""
         return self.clock[0]
 
+    def time(self) -> float:
+        """Return the fake wall clock, in seconds since the epoch."""
+        return self.wall[0]
+
     def read(self, key: str) -> Ticket:
         """Return the ticket ready, or in `status_after_claim` once a claim is posted."""
+        if self.claimed:
+            self.clock[0] += self.reread_seconds
+            self.wall[0] += self.reread_seconds + self.reread_suspended_seconds
         status = self.status_after_claim if self.claimed else "To Do"
         return Ticket(key=key, status=status, labels=(), blockers=())
 
@@ -897,8 +913,9 @@ class TimedTracker(ReadyTracker):
         return own
 
     def claims(self, key: str, status: str) -> tuple[Claim, ...]:
-        """Advance the clock by `read_seconds`; return every claim kept, oldest first."""
+        """Advance the clocks by the read delays; return every claim kept, oldest first."""
         self.clock[0] += self.read_seconds
+        self.wall[0] += self.read_seconds + self.suspended_seconds
         return tuple(
             timed_claim(rank, task, created)
             for rank, (task, created) in enumerate(self.posted, 1)
@@ -910,9 +927,10 @@ class TimedTracker(ReadyTracker):
 
 
 def serve_timed(monkeypatch: pytest.MonkeyPatch, tracker: TimedTracker) -> None:
-    """Make `run` use `tracker` and read time from its monotonic clock."""
+    """Make `run` use `tracker` and read time from its monotonic and wall clocks."""
     monkeypatch.setattr(cli, "make_tracker", lambda made: tracker)
     monkeypatch.setattr(cli.time, "monotonic", tracker.monotonic)
+    monkeypatch.setattr(cli.time, "time", tracker.time)
 
 
 @pytest.mark.parametrize("orphan_task", ["task-0", "task-1"])
@@ -1074,7 +1092,9 @@ def test_run_whose_claims_are_read_back_too_late_gives_up_the_ticket(
         monkeypatch, capsysbinary, encode(valid_input()), instance=instance
     )
 
-    assert_failed(answer, "task-1", "300 seconds")
+    assert_failed(
+        answer, "task-1", "were read back more than 300 seconds after the claim"
+    )
     assert tracker.moves == []
     assert journal_lines(instance) == []
 
@@ -1085,6 +1105,117 @@ def test_run_whose_claims_are_read_back_within_the_delay_takes_the_ticket(
     instance: Path,
 ) -> None:
     tracker = TimedTracker([], CLAIM_EPOCH, read_seconds=300.0)
+    serve_timed(monkeypatch, tracker)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed", answer["errors"]
+    assert tracker.moves == [("DEMO-1", "In Progress")]
+
+
+TOO_LATE_TO_MOVE = (
+    "Ticket 'DEMO-1' was about to be moved more than 300 seconds after the claim of "
+    "task 'task-1' began to be posted. The claim was posted; the ticket was not moved."
+)
+TOO_LATE_TO_READ = "were read back more than 300 seconds after the claim"
+
+
+@pytest.mark.parametrize(
+    ("read", "suspended", "reread", "reread_suspended", "reason"),
+    [
+        (0.0, 0.0, 301.0, 0.0, TOO_LATE_TO_MOVE),
+        (1.0, 0.0, 300.0, 0.0, TOO_LATE_TO_MOVE),
+        (0.0, 301.0, 0.0, 0.0, TOO_LATE_TO_READ),
+        (0.0, 0.0, 0.0, 301.0, TOO_LATE_TO_MOVE),
+        (0.0, 1.0, 0.0, 300.0, TOO_LATE_TO_MOVE),
+        (301.0, -301.0, 0.0, 0.0, TOO_LATE_TO_READ),
+        (0.0, 0.0, 301.0, -301.0, TOO_LATE_TO_MOVE),
+    ],
+)
+def test_run_that_reaches_the_move_too_late_after_its_claim_gives_up_the_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    read: float,
+    suspended: float,
+    reread: float,
+    reread_suspended: float,
+    reason: str,
+) -> None:
+    tracker = TimedTracker(
+        [],
+        CLAIM_EPOCH,
+        read_seconds=read,
+        suspended_seconds=suspended,
+        reread_seconds=reread,
+        reread_suspended_seconds=reread_suspended,
+    )
+    serve_timed(monkeypatch, tracker)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", reason)
+    assert tracker.moves == []
+    assert journal_lines(instance) == []
+
+
+def test_claim_delay_starts_after_the_worktree_left_by_an_earlier_run_is_rescued(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+) -> None:
+    tracker = TimedTracker([], CLAIM_EPOCH)
+    serve_timed(monkeypatch, tracker)
+    rescue = workspace.rescue
+
+    def slow_rescue(branch: str, identity: GitIdentity) -> None:
+        rescue(branch, identity)
+        tracker.clock[0] += 1000.0
+        tracker.wall[0] += 1000.0
+
+    monkeypatch.setattr(workspace, "rescue", slow_rescue)
+    workspace.left = "agent/OLD-7"
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed", answer["errors"]
+    assert tracker.moves == [("DEMO-1", "In Progress")]
+
+
+@pytest.mark.parametrize(
+    ("read", "suspended", "reread", "reread_suspended"),
+    [
+        (0.0, 0.0, 300.0, 0.0),
+        (150.0, 0.0, 150.0, 0.0),
+        (0.0, 300.0, 0.0, 0.0),
+        (0.0, 0.0, 0.0, 300.0),
+        (0.0, 150.0, 0.0, 150.0),
+    ],
+)
+def test_run_that_reaches_the_move_within_the_delay_after_its_claim_takes_the_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    read: float,
+    suspended: float,
+    reread: float,
+    reread_suspended: float,
+) -> None:
+    tracker = TimedTracker(
+        [],
+        CLAIM_EPOCH,
+        read_seconds=read,
+        suspended_seconds=suspended,
+        reread_seconds=reread,
+        reread_suspended_seconds=reread_suspended,
+    )
     serve_timed(monkeypatch, tracker)
 
     answer = run_mandate(
@@ -1278,7 +1409,7 @@ def test_journal_records_the_duration_of_the_mandate_in_seconds(
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
 ) -> None:
-    clock = [90.0, 90.0, 90.0, 100.0, 101.0, 102.5]
+    clock = [90.0, 90.0, 90.0, 90.0, 100.0, 101.0, 102.5]
     monkeypatch.setattr(cli.time, "monotonic", lambda: clock.pop(0))
 
     run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)

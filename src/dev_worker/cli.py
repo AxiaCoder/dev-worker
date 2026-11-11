@@ -12,6 +12,7 @@ import re
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from importlib.resources import as_file, files
 from pathlib import Path
@@ -64,7 +65,7 @@ from dev_worker.workspace import Workspace, WorkspaceError
 
 TICKET_KEY = re.compile(r"(.+)-([1-9][0-9]*)")
 RECENT_RUNS = 10
-CLAIM_READ_LIMIT_SECONDS = 300
+CLAIM_TAKE_LIMIT_SECONDS = 300
 CLAIM_EXPIRY_SECONDS = 600
 
 
@@ -225,8 +226,37 @@ def check_ticket_ready(
     return None
 
 
+@dataclass(frozen=True)
+class ClaimStart:
+    """The `time.monotonic()` and `time.time()` readings taken when a run began posting its claim."""
+
+    monotonic: float
+    wall: float
+
+
+def start_claim() -> ClaimStart:
+    """Read both clocks now, as the start of a claim."""
+    return ClaimStart(monotonic=time.monotonic(), wall=time.time())
+
+
+def claim_overdue(start: ClaimStart) -> bool:
+    """Return whether more than `CLAIM_TAKE_LIMIT_SECONDS` have passed since `start` on either clock.
+
+    The wall clock counts time the machine spent suspended; the monotonic clock counts
+    time while the wall clock was set back.
+    """
+    return (
+        time.monotonic() - start.monotonic > CLAIM_TAKE_LIMIT_SECONDS
+        or time.time() - start.wall > CLAIM_TAKE_LIMIT_SECONDS
+    )
+
+
 def claim_ticket(
-    key: str, task_id: str, instance: Instance, tracker: TicketTracker
+    key: str,
+    task_id: str,
+    instance: Instance,
+    tracker: TicketTracker,
+    start: ClaimStart,
 ) -> str | None:
     """Claim the ticket `key` for `task_id` through `tracker`; return why the run may not take it, or None.
 
@@ -236,13 +266,13 @@ def claim_ticket(
     claim is otherwise left by a run that is gone, and a losing claim never blocks
     another. The run may take the ticket only when its own claim wins: of runs that both
     read the ticket ready, one only goes on. A run whose claim cannot be posted, whose claims
-    cannot be read, whose claims are read back more than `CLAIM_READ_LIMIT_SECONDS` after
-    it began posting its claim, or whose own claim is not found among them may not take
-    it; the reason says whether the claim may have been posted. A run whose claim wins
-    reads the ticket again and may not take it unless it is still in the `ready` status.
+    cannot be read, whose claims are read back too late after `start` (see
+    `claim_overdue`), or whose own claim is not found among them may not take it; the
+    reason says whether the claim may have been posted. A run whose claim wins reads the
+    ticket again and may not take it unless it is still in the `ready` status. `start` is
+    taken right before the claim is posted.
     """
     ready = instance.statuses["ready"]
-    began = time.monotonic()
     try:
         own = tracker.claim(key, task_id)
     except TrackerError as error:
@@ -257,10 +287,10 @@ def claim_ticket(
             f"The claims on ticket {key!r} cannot be read: {error} "
             f"The claim of task {task_id!r} was posted."
         )
-    if time.monotonic() - began > CLAIM_READ_LIMIT_SECONDS:
+    if claim_overdue(start):
         return (
             f"The claims on ticket {key!r} were read back more than "
-            f"{CLAIM_READ_LIMIT_SECONDS} seconds after the claim of task {task_id!r} "
+            f"{CLAIM_TAKE_LIMIT_SECONDS} seconds after the claim of task {task_id!r} "
             "began to be posted. The claim was posted."
         )
     own_claims = [claim for claim in claims if claim.claim_id == own]
@@ -301,12 +331,25 @@ def claim_ticket(
     return None
 
 
-def take_ticket(key: str, instance: Instance, tracker: TicketTracker) -> str | None:
+def take_ticket(
+    key: str,
+    task_id: str,
+    instance: Instance,
+    tracker: TicketTracker,
+    start: ClaimStart,
+) -> str | None:
     """Move the ticket `key` to the real status of the `in_progress` key; return why it failed, or None.
 
-    The reason says the status is unknown: after a tracker failure the move may still
-    have happened.
+    The ticket is not moved when the claim of `task_id`, begun at `start`, is overdue
+    (see `claim_overdue`). After a tracker failure the reason says the status is
+    unknown: the move may still have happened.
     """
+    if claim_overdue(start):
+        return (
+            f"Ticket {key!r} was about to be moved more than "
+            f"{CLAIM_TAKE_LIMIT_SECONDS} seconds after the claim of task {task_id!r} "
+            "began to be posted. The claim was posted; the ticket was not moved."
+        )
     in_progress = instance.statuses["in_progress"]
     try:
         tracker.set_status(key, in_progress)
@@ -435,11 +478,12 @@ def run_under_lock(
         return failed(task_id, f"Task {task_id!r} has already been run.")
     ticket_key = mandate.params["ticket_key"]
     assert isinstance(ticket_key, str)
-    refusal = (
-        rescue_left_worktree(instance, directory)
-        or claim_ticket(ticket_key, task_id, instance, tracker)
-        or take_ticket(ticket_key, instance, tracker)
-    )
+    refusal = rescue_left_worktree(instance, directory)
+    if refusal is None:
+        claim_start = start_claim()
+        refusal = claim_ticket(
+            ticket_key, task_id, instance, tracker, claim_start
+        ) or take_ticket(ticket_key, task_id, instance, tracker, claim_start)
     if refusal is not None:
         return failed(task_id, refusal)
     entry: dict[str, object] = {
