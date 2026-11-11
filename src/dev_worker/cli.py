@@ -65,7 +65,7 @@ from dev_worker.workspace import Workspace, WorkspaceError
 
 TICKET_KEY = re.compile(r"(.+)-([1-9][0-9]*)")
 RECENT_RUNS = 10
-CLAIM_READ_LIMIT_SECONDS = 300
+CLAIM_TAKE_LIMIT_SECONDS = 300
 CLAIM_EXPIRY_SECONDS = 600
 
 
@@ -240,14 +240,14 @@ def start_claim() -> ClaimStart:
 
 
 def claim_overdue(start: ClaimStart) -> bool:
-    """Return whether more than `CLAIM_READ_LIMIT_SECONDS` have passed since `start` on either clock.
+    """Return whether more than `CLAIM_TAKE_LIMIT_SECONDS` have passed since `start` on either clock.
 
     The wall clock counts time the machine spent suspended; the monotonic clock counts
     time while the wall clock was set back.
     """
     return (
-        time.monotonic() - start.monotonic > CLAIM_READ_LIMIT_SECONDS
-        or time.time() - start.wall > CLAIM_READ_LIMIT_SECONDS
+        time.monotonic() - start.monotonic > CLAIM_TAKE_LIMIT_SECONDS
+        or time.time() - start.wall > CLAIM_TAKE_LIMIT_SECONDS
     )
 
 
@@ -290,7 +290,7 @@ def claim_ticket(
     if claim_overdue(start):
         return (
             f"The claims on ticket {key!r} were read back more than "
-            f"{CLAIM_READ_LIMIT_SECONDS} seconds after the claim of task {task_id!r} "
+            f"{CLAIM_TAKE_LIMIT_SECONDS} seconds after the claim of task {task_id!r} "
             "began to be posted. The claim was posted."
         )
     own_claims = [claim for claim in claims if claim.claim_id == own]
@@ -347,7 +347,7 @@ def take_ticket(
     if claim_overdue(start):
         return (
             f"Ticket {key!r} was about to be moved more than "
-            f"{CLAIM_READ_LIMIT_SECONDS} seconds after the claim of task {task_id!r} "
+            f"{CLAIM_TAKE_LIMIT_SECONDS} seconds after the claim of task {task_id!r} "
             "began to be posted. The claim was posted; the ticket was not moved."
         )
     in_progress = instance.statuses["in_progress"]
