@@ -28,7 +28,7 @@ from dev_worker.contract import (
     State,
 )
 from dev_worker.github import GitHubRepository
-from dev_worker.header import Header, HeaderError, load_worker_file
+from dev_worker.header import Header, HeaderError, Plugin, load_worker_file
 from dev_worker.instance import (
     Instance,
     InstanceError,
@@ -37,6 +37,7 @@ from dev_worker.instance import (
     load_instance,
 )
 from dev_worker.jira import JiraTracker
+from dev_worker.plugin import PluginCheckout, PluginError
 from dev_worker.repositories import CodeRepository, RepositoryError
 from dev_worker.run_journal import (
     GUARD_FILE,
@@ -156,6 +157,11 @@ def make_repository(repository: Repository) -> CodeRepository:
 def make_workspace(repository: Repository, directory: Path) -> Workspace:
     """Return the workspace of `repository` kept in the instance directory `directory`."""
     return Workspace(repository, directory)
+
+
+def make_plugin(directory: Path) -> PluginCheckout:
+    """Return the plugin checkout kept in the instance directory `directory`."""
+    return PluginCheckout(directory)
 
 
 def make_container(image: str, directory: Path) -> Container:
@@ -365,10 +371,12 @@ def run_journaled(
     handler: Callable[[MandateInput, Instance], MandateOutput],
     mandate: MandateInput,
     instance: Instance,
+    plugin: Plugin,
     instance_path: Path,
 ) -> MandateOutput:
     """Run `handler` under the lock of the instance directory and journal the run.
 
+    `plugin` is the plugin the run loads (see `run_in_worktree`).
     The ticket key is checked first, then the ticket is read from the tracker and
     refused unless it is ready (see `check_ticket_ready`), then the lock is taken, or
     taken over from a run that is gone (see `take_over_lock`); a task_id already in the
@@ -423,7 +431,7 @@ def run_journaled(
     lock = taken
     try:
         output = run_under_lock(
-            handler, mandate, instance, tracker, directory, start, began
+            handler, mandate, instance, plugin, tracker, directory, start, began
         )
     finally:
         try:
@@ -441,6 +449,7 @@ def run_under_lock(
     handler: Callable[[MandateInput, Instance], MandateOutput],
     mandate: MandateInput,
     instance: Instance,
+    plugin: Plugin,
     tracker: TicketTracker,
     directory: Path,
     start: str,
@@ -448,6 +457,7 @@ def run_under_lock(
 ) -> MandateOutput:
     """Run `handler` unless its task_id is already journaled, journaling the run twice.
 
+    `plugin` is the plugin the run loads (see `run_in_worktree`).
     Before anything is journaled, a worktree an earlier run left in `directory` is
     rescued and removed (see `rescue_left_worktree`); a run that cannot do so fails
     without taking its ticket nor being journaled. Then the ticket is claimed for the run
@@ -501,7 +511,7 @@ def run_under_lock(
             task_id, f"Journal in '{directory}' cannot be written: {os_reason(error)}"
         )
     mandate_began = time.monotonic()
-    output = run_in_worktree(handler, mandate, instance, directory, began)
+    output = run_in_worktree(handler, mandate, instance, plugin, directory, began)
     entry |= {"status": output.status, "duration": time.monotonic() - mandate_began}
     try:
         append_entry(directory, entry)
@@ -565,11 +575,12 @@ def rescue_left_worktree(instance: Instance, directory: Path) -> str | None:
 
 
 def run_container(
-    instance: Instance, directory: Path, worktree: Path, began: float
+    instance: Instance, directory: Path, worktree: Path, plugin: Path, began: float
 ) -> str | None:
     """Run the container of `instance` on `worktree` for the time left in the run; return why it failed, or None.
 
-    `directory` is the instance directory of `instance`.
+    `directory` is the instance directory of `instance`, `plugin` the plugin checkout
+    the container mounts read only.
     `began` is the `time.monotonic()` reading taken when the run started; the time left
     is `run_timeout_seconds` minus the seconds elapsed since. None left: the container
     is not started.
@@ -582,7 +593,7 @@ def run_container(
             "was reached before it."
         )
     try:
-        make_container(instance.container.image, directory).run(worktree, left)
+        make_container(instance.container.image, directory).run(worktree, left, plugin)
     except ContainerError as error:
         return f"The container failed: {error}"
     return None
@@ -592,12 +603,15 @@ def run_in_worktree(
     handler: Callable[[MandateInput, Instance], MandateOutput],
     mandate: MandateInput,
     instance: Instance,
+    plugin: Plugin,
     directory: Path,
     began: float,
 ) -> MandateOutput:
-    """Run `handler` once the mirror in `directory` is refreshed and a fresh worktree opened.
+    """Run `handler` once the plugin is prepared, the mirror in `directory` refreshed and a fresh worktree opened.
 
-    The worktree is on the branch the `branch` template of `instance` names for the
+    The checkout of `plugin` in `directory` is prepared first (see
+    `PluginCheckout.prepare`); one that cannot be fetched gives a failed output naming
+    the reason, without opening the worktree nor running `handler`. The worktree is on the branch the `branch` template of `instance` names for the
     ticket (see `Workspace.open`). A mirror that cannot be refreshed or a worktree that
     cannot be opened gives a failed output naming the reason, without running
     `handler`. Once opened, the worktree is rescued, then it and its local branch are
@@ -606,7 +620,8 @@ def run_in_worktree(
     exception `handler` raised, with the reason added as a note.
 
     Before `handler`, one disposable container is run from the image of `instance`
-    with only the worktree mounted (see `Container.run`), and is gone once it ends or
+    with only the worktree and, read only, the plugin checkout mounted (see
+    `Container.run`), and is gone once it ends or
     is removed when the run reaches its `run_timeout_seconds` limit, counted from
     `began`, the `time.monotonic()` reading taken when the run started (see
     `run_container`); a container that cannot be run, that reaches that limit, or that
@@ -616,6 +631,10 @@ def run_in_worktree(
     ticket_key = mandate.params["ticket_key"]
     assert isinstance(ticket_key, str)
     branch = instance.branch.replace("{key}", ticket_key)
+    try:
+        checkout = make_plugin(directory).prepare(plugin)
+    except PluginError as error:
+        return failed(mandate.task_id, f"The plugin cannot be fetched: {error}")
     workspace = make_workspace(instance.repository, directory)
     try:
         workspace.refresh()
@@ -623,7 +642,9 @@ def run_in_worktree(
     except WorkspaceError as error:
         return failed(mandate.task_id, f"The worktree cannot be prepared: {error}")
     try:
-        container_error = run_container(instance, directory, workspace.worktree, began)
+        container_error = run_container(
+            instance, directory, workspace.worktree, checkout, began
+        )
         if container_error is not None:
             output = failed(mandate.task_id, container_error)
         else:
@@ -707,17 +728,19 @@ def run_mandate(
     if handler is None:
         return failed(task_id, f"Unknown mandate {mandate_name!r}.")
 
-    instance = load_checked_instance(instance_path)
-    if isinstance(instance, str):
-        return failed(task_id, instance)
-    return run_journaled(handler, mandate, instance, instance_path)
+    loaded = load_checked_instance(instance_path)
+    if isinstance(loaded, str):
+        return failed(task_id, loaded)
+    instance, header = loaded
+    return run_journaled(handler, mandate, instance, header.plugin, instance_path)
 
 
-def load_checked_instance(instance_path: Path) -> Instance | str:
+def load_checked_instance(instance_path: Path) -> tuple[Instance, Header] | str:
     """Read the instance from `instance_path`, checked against the packaged `WORKER.md`.
 
-    Returns the reason as a sentence instead when `WORKER.md` or the instance file
-    cannot be read or is invalid. Never raises on a file error.
+    Returns the instance with the header of `WORKER.md`, or the reason as a sentence
+    instead when `WORKER.md` or the instance file cannot be read or is invalid. Never
+    raises on a file error.
     """
     try:
         header = load_header()
@@ -726,7 +749,7 @@ def load_checked_instance(instance_path: Path) -> Instance | str:
     except OSError as error:
         return f"WORKER.md cannot be read: {os_reason(error)}"
     try:
-        return load_instance(instance_path, header)
+        return load_instance(instance_path, header), header
     except InstanceError as error:
         return f"Instance file '{instance_path}': {error}"
     except OSError as error:
@@ -1006,9 +1029,10 @@ def read_health(instance_path: Path) -> Health:
     by taking the lock over, or the journal holds a torn line (see
     `torn_journal_line`); `ok` otherwise. Writes nothing and never raises.
     """
-    instance = load_checked_instance(instance_path)
-    if isinstance(instance, str):
-        return Health(status="down", reason=writable_text(instance), active=True)
+    loaded = load_checked_instance(instance_path)
+    if isinstance(loaded, str):
+        return Health(status="down", reason=writable_text(loaded), active=True)
+    instance, _ = loaded
     try:
         directory = instance_directory(instance_path)
     except ValueError as error:

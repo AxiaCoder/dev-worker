@@ -2,7 +2,8 @@
 
 A run pulls its image when the daemon does not have it, within the time left in the
 run, then creates one container with `docker create --rm`, the worktree bind-mounted at
-`WORKDIR` and nothing else mounted, then starts it; `--rm` has Docker remove it once it
+`WORKDIR` and the plugin checkout bind-mounted read only at `PLUGIN_DIR`, nothing else
+mounted, then starts it; `--rm` has Docker remove it once it
 ends. The container is named, so that a run reaching its duration ceiling, or
 interrupted, can remove it by force: created before it is started, it exists by then,
 and once removed it can no longer start. It is labelled
@@ -24,6 +25,7 @@ from dev_worker.github import failure_reason
 
 DOCKER_TIMEOUT_SECONDS = 60.0
 WORKDIR = "/workspace"
+PLUGIN_DIR = "/plugin"
 RUN_COMMAND = ("true",)
 NAME_PREFIX = "dev-worker-"
 OWNER_LABEL = "dev-worker.instance"
@@ -36,15 +38,16 @@ class ContainerError(Exception):
     """
 
 
-def mount_option(source: Path) -> str:
-    """Return the `--mount` value binding the directory `source` at `WORKDIR`.
+def mount_option(source: Path, target: str = WORKDIR, readonly: bool = False) -> str:
+    """Return the `--mount` value binding the directory `source` at `target`, read only if `readonly`.
 
     Each field is quoted as CSV when it needs to be, so a path holding a comma or a
     quote is passed whole.
     """
+    fields = ["type=bind", f"source={source}", f"target={target}"]
     buffer = io.StringIO()
     csv.writer(buffer, lineterminator="").writerow(
-        ["type=bind", f"source={source}", f"target={WORKDIR}"]
+        [*fields, "readonly"] if readonly else fields
     )
     return buffer.getvalue()
 
@@ -76,8 +79,10 @@ class Container:
             "reaching the Docker daemon", "version", "--format", "{{.Server.Version}}"
         )
 
-    def run(self, worktree: Path, time_left: float) -> None:
+    def run(self, worktree: Path, time_left: float, plugin: Path) -> None:
         """Run `RUN_COMMAND` in a new container with `worktree` mounted, and wait for it to end.
+
+        The plugin checkout `plugin` is mounted read only at `PLUGIN_DIR`.
 
         The image is pulled when it is missing, then the container is created and
         started. `time_left` is the time left in the run, in seconds, counted from the
@@ -105,6 +110,8 @@ class Container:
                 f"{OWNER_LABEL}={self._owner}",
                 "--mount",
                 mount_option(worktree),
+                "--mount",
+                mount_option(plugin, PLUGIN_DIR, readonly=True),
                 "--workdir",
                 WORKDIR,
                 self._image,
