@@ -754,7 +754,12 @@ def test_two_runs_that_both_read_the_ticket_ready_move_it_once(
         instance=instance,
     )
 
-    assert_failed(answer, "task-2", "Ticket 'DEMO-1' is claimed by task 'task-1'.")
+    assert_failed(
+        answer,
+        "task-2",
+        "Ticket 'DEMO-1' is claimed by task 'task-1'. "
+        "The claim of task 'task-2' was posted.",
+    )
     assert tracker.moves == [("DEMO-1", "In Progress")]
     assert tracker.asked == ["To Do", "To Do"]
     assert [line["task_id"] for line in journal_lines(instance)] == [
@@ -813,7 +818,8 @@ class UnclaimableTracker(ReadyTracker):
             "lost",
             (
                 "The claim of task 'task-1' is not found among the claims on "
-                "ticket 'DEMO-1' since it last entered 'To Do'."
+                "ticket 'DEMO-1' since it last entered 'To Do'. "
+                "The claim of task 'task-1' was posted."
             ),
         ),
     ],
@@ -942,19 +948,24 @@ def test_rival_claim_created_within_the_expiry_still_wins_over_its_own(
         monkeypatch, capsysbinary, encode(valid_input()), instance=instance
     )
 
-    assert_failed(answer, "task-1", "Ticket 'DEMO-1' is claimed by task 'task-0'.")
+    assert_failed(
+        answer,
+        "task-1",
+        "Ticket 'DEMO-1' is claimed by task 'task-0'. "
+        "The claim of task 'task-1' was posted.",
+    )
     assert tracker.moves == []
     assert journal_lines(instance) == []
 
 
-def test_live_rival_claim_wins_over_its_own_once_an_orphan_claim_is_left_out(
+def test_losing_claim_does_not_block_the_run_once_the_claim_it_lost_to_expired(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
 ) -> None:
     tracker = TimedTracker(
         [("task-0", CLAIM_EPOCH), ("task-2", CLAIM_EPOCH + timedelta(seconds=300))],
-        CLAIM_EPOCH + timedelta(seconds=601),
+        CLAIM_EPOCH + timedelta(seconds=700),
     )
     serve_timed(monkeypatch, tracker)
 
@@ -962,7 +973,60 @@ def test_live_rival_claim_wins_over_its_own_once_an_orphan_claim_is_left_out(
         monkeypatch, capsysbinary, encode(valid_input()), instance=instance
     )
 
-    assert_failed(answer, "task-1", "Ticket 'DEMO-1' is claimed by task 'task-2'.")
+    assert answer["status"] == "completed", answer["errors"]
+    assert tracker.moves == [("DEMO-1", "In Progress")]
+
+
+def test_winning_claim_created_the_expiry_before_its_own_wins_over_a_losing_one(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    tracker = TimedTracker(
+        [("task-0", CLAIM_EPOCH), ("task-2", CLAIM_EPOCH + timedelta(seconds=300))],
+        CLAIM_EPOCH + timedelta(seconds=600),
+    )
+    serve_timed(monkeypatch, tracker)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(
+        answer,
+        "task-1",
+        "Ticket 'DEMO-1' is claimed by task 'task-0'. "
+        "The claim of task 'task-1' was posted.",
+    )
+    assert tracker.moves == []
+    assert journal_lines(instance) == []
+
+
+def test_claim_that_won_after_an_expired_one_wins_over_its_own(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    tracker = TimedTracker(
+        [
+            ("task-0", CLAIM_EPOCH),
+            ("task-2", CLAIM_EPOCH + timedelta(seconds=300)),
+            ("task-3", CLAIM_EPOCH + timedelta(seconds=700)),
+        ],
+        CLAIM_EPOCH + timedelta(seconds=1000),
+    )
+    serve_timed(monkeypatch, tracker)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(
+        answer,
+        "task-1",
+        "Ticket 'DEMO-1' is claimed by task 'task-3'. "
+        "The claim of task 'task-1' was posted.",
+    )
     assert tracker.moves == []
     assert journal_lines(instance) == []
 

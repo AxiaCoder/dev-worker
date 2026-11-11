@@ -58,7 +58,7 @@ from dev_worker.run_journal import (
     take_lock,
     torn_tail,
 )
-from dev_worker.tickets import TicketTracker, TrackerError
+from dev_worker.tickets import Claim, TicketTracker, TrackerError
 from dev_worker.validation import describe_validation_error
 from dev_worker.workspace import Workspace, WorkspaceError
 
@@ -230,11 +230,12 @@ def claim_ticket(
 ) -> str | None:
     """Claim the ticket `key` for `task_id` through `tracker`; return why the run may not take it, or None.
 
-    The run may take the ticket only when its own claim is the oldest of those posted
-    since the ticket last entered the real status of the `ready` key: of runs that both
-    read the ticket ready, one only goes on. A claim created more than
-    `CLAIM_EXPIRY_SECONDS` before the run's own, by the tracker's clock, is left by a run
-    that is gone and does not count. A run whose claim cannot be posted, whose claims
+    The claims posted since the ticket last entered the real status of the `ready` key
+    are judged in the order of their ids: a claim wins unless an older winning claim was
+    created at most `CLAIM_EXPIRY_SECONDS` before it, by the tracker's clock. An older
+    claim is otherwise left by a run that is gone, and a losing claim never blocks
+    another. The run may take the ticket only when its own claim wins: of runs that both
+    read the ticket ready, one only goes on. A run whose claim cannot be posted, whose claims
     cannot be read, whose claims are read back more than `CLAIM_READ_LIMIT_SECONDS` after
     it began posting its claim, or whose own claim is not found among them may not take
     it; the reason says whether the claim may have been posted. A run whose claim wins
@@ -266,12 +267,23 @@ def claim_ticket(
     if not own_claims:
         return (
             f"The claim of task {task_id!r} is not found among the claims on "
-            f"ticket {key!r} since it last entered {ready!r}."
+            f"ticket {key!r} since it last entered {ready!r}. "
+            f"The claim of task {task_id!r} was posted."
         )
-    oldest_live = own_claims[0].created - timedelta(seconds=CLAIM_EXPIRY_SECONDS)
-    first = next(claim for claim in claims if claim.created >= oldest_live)
-    if first.claim_id != own:
-        return f"Ticket {key!r} is claimed by task {first.task_id!r}."
+    expiry = timedelta(seconds=CLAIM_EXPIRY_SECONDS)
+    winners: list[Claim] = []
+    for claim in sorted(claims, key=lambda claim: claim.claim_id):
+        if not any(winner.created >= claim.created - expiry for winner in winners):
+            winners.append(claim)
+    if all(winner.claim_id != own for winner in winners):
+        oldest_live = own_claims[0].created - expiry
+        rival = next(
+            winner for winner in reversed(winners) if winner.created >= oldest_live
+        )
+        return (
+            f"Ticket {key!r} is claimed by task {rival.task_id!r}. "
+            f"The claim of task {task_id!r} was posted."
+        )
     try:
         ticket = tracker.read(key)
     except TrackerError as error:
