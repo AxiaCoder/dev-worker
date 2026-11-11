@@ -1,8 +1,10 @@
 """The disposable container of a run, driven through the `docker` command line.
 
-A run starts one container with `docker run --rm`, the worktree bind-mounted at
-`WORKDIR` and nothing else mounted. The container is named, so that a run reaching its
-duration ceiling can kill it; `--rm` then has Docker remove it. It is labelled
+A run creates one container with `docker create --rm`, the worktree bind-mounted at
+`WORKDIR` and nothing else mounted, then starts it; `--rm` has Docker remove it once it
+ends. The container is named, so that a run reaching its duration ceiling, or
+interrupted, can remove it by force: created before it is started, it exists by then,
+and once removed it can no longer start. It is labelled
 `OWNER_LABEL` with the instance that started it, so that the running containers of an
 instance can be listed and killed. Every other docker call is bounded by
 `DOCKER_TIMEOUT_SECONDS` (60 seconds).
@@ -11,6 +13,7 @@ instance can be listed and killed. Every other docker call is bounded by
 import csv
 import io
 import subprocess
+import time
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
@@ -73,18 +76,20 @@ class Container:
     def run(self, worktree: Path, time_left: float) -> None:
         """Run `RUN_COMMAND` in a new container with `worktree` mounted, and wait for it to end.
 
-        `time_left` is the time left in the run, in seconds: a container still running
-        then is killed, which `--rm` has Docker remove. Raises `ContainerError` when the
-        container cannot be started, exits nonzero, or outlasts `time_left`, whether it
-        could then be killed or not. Any other exception raised while waiting, such as
-        `KeyboardInterrupt`, has the container killed and is raised again; a kill that
-        fails is added to it as a note.
+        The container is created, then started. `time_left` is the time left in the run,
+        in seconds, counted from the call: a container still running then is removed by
+        force. Raises `ContainerError` when the container cannot be created or started,
+        exits nonzero, or outlasts `time_left`, whether it could then be removed or not.
+        Any other exception raised meanwhile, such as `KeyboardInterrupt`, has the
+        container removed by force and is raised again; a removal that fails is added to
+        it as a note.
         """
         name = f"{NAME_PREFIX}{uuid.uuid4().hex}"
+        deadline = time.monotonic() + time_left
         try:
             self._docker(
-                "running the container",
-                "run",
+                "creating the container",
+                "create",
                 "--rm",
                 "--name",
                 name,
@@ -96,7 +101,13 @@ class Container:
                 WORKDIR,
                 self._image,
                 *RUN_COMMAND,
-                timeout=time_left,
+            )
+            self._docker(
+                "running the container",
+                "start",
+                "--attach",
+                name,
+                timeout=max(deadline - time.monotonic(), 0),
             )
         except subprocess.TimeoutExpired:
             reached = (
@@ -104,20 +115,20 @@ class Container:
                 "its ceiling"
             )
             try:
-                self._kill(name)
-            except ContainerError as kill_error:
+                self._remove(name)
+            except ContainerError as removal_error:
                 raise ContainerError(
-                    f"{reached} and could not be killed: {kill_error}"
+                    f"{reached} and could not be removed: {removal_error}"
                 ) from None
-            raise ContainerError(f"{reached} and was killed") from None
+            raise ContainerError(f"{reached} and was removed") from None
         except ContainerError:
             raise
         except BaseException as error:
             try:
-                self._kill(name)
-            except ContainerError as kill_error:
+                self._remove(name)
+            except ContainerError as removal_error:
                 error.add_note(
-                    f"the container {name} could not be killed: {kill_error}"
+                    f"the container {name} could not be removed: {removal_error}"
                 )
             raise
 
@@ -161,6 +172,13 @@ class Container:
     def _kill(self, name: str) -> None:
         """Kill the container `name`; raise `ContainerError` when docker cannot."""
         self._docker(f"killing the container {name}", "kill", name)
+
+    def _remove(self, name: str) -> None:
+        """Remove the container `name`, killing it first when it runs.
+
+        Raises `ContainerError` when docker cannot, such as when no container has that name.
+        """
+        self._docker(f"removing the container {name}", "rm", "--force", name)
 
     def _docker(
         self, action: str, *arguments: str, timeout: float | None = None

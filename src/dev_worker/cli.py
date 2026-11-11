@@ -480,7 +480,7 @@ def run_in_worktree(
 
     Before `handler`, one disposable container is run from the image of `instance`
     with only the worktree mounted (see `Container.run`), and is gone once it ends or
-    is killed when the run reaches its `run_timeout_seconds` limit, counted from
+    is removed when the run reaches its `run_timeout_seconds` limit, counted from
     `began`, the `time.monotonic()` reading taken when the run started (see
     `run_container`); a container that cannot be run, that reaches that limit, or that
     the run reached it before, gives a failed output naming the reason, without

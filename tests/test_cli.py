@@ -1418,9 +1418,9 @@ def test_rescue_does_not_run_while_a_container_that_could_not_be_killed_still_ru
     record = fake_docker(
         monkeypatch,
         tmp_path,
-        run_sleep="5",
-        kill_exit="1",
-        kill_stderr="permission denied\n",
+        start_sleep="5",
+        rm_exit="1",
+        rm_stderr="permission denied\n",
         ps_stdout="dev-worker-stuck\n",
     )
     slow_refresh(monkeypatch, workspace, 1799.5)
@@ -1456,7 +1456,14 @@ def test_container_left_by_a_killed_worker_is_killed_before_its_worktree_is_resc
     )
 
     assert answer["status"] == "completed"
-    assert docker_calls(record) == ["ps", "kill dev-worker-left", "ps", "run", "ps"]
+    assert docker_calls(record) == [
+        "ps",
+        "kill dev-worker-left",
+        "ps",
+        "create",
+        "start",
+        "ps",
+    ]
     assert ("rescue", "agent/OLD-7", "Example Worker", IDENTITY) in workspace.calls
     assert stub.moves != []
 
@@ -1503,7 +1510,7 @@ def test_container_left_that_cannot_be_stopped_fails_the_run_without_taking_the_
     )
 
     assert_failed(answer, "task-1", reason)
-    assert "run" not in docker_calls(record)
+    assert "create" not in docker_calls(record)
     assert ("rescue", "agent/OLD-7", "Example Worker", IDENTITY) not in workspace.calls
     assert stub.moves == []
     assert journal_lines(instance) == []
@@ -1548,8 +1555,8 @@ def test_containers_of_an_instance_carry_one_label_whatever_the_path_spelling(
 
     owner = f"dev-worker.instance={instance.with_suffix('').resolve()}"
     calls = [json.loads(line) for line in record.read_text("utf-8").splitlines()]
-    [run_call] = [call for call in calls if call[0] == "run"]
-    assert owner in run_call
+    [create_call] = [call for call in calls if call[0] == "create"]
+    assert owner in create_call
     assert all(f"label={owner}" in call for call in calls if call[0] == "ps")
 
 
