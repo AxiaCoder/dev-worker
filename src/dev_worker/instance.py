@@ -76,10 +76,11 @@ BranchTemplate = Annotated[str, AfterValidator(_check_branch_template)]
 def _check_pinned_image(value: str) -> str:
     """Return `value` when it names an image by digest or by a tag other than `latest`.
 
-    The reference reads `[host[:port]/]path[:tag][@digest]`, as Docker parses it: the first
-    component is a host only when it holds a `.`, a `:` or an uppercase letter, or is
-    `localhost`; path components are lowercase ASCII joined by `.`, `_`, `__` or a run of
-    `-`; a tag is ASCII; a digest is `<algorithm>:<hex>` with at least 32 hex digits. Raises `ValueError` when the reference
+    The reference reads `[host[:port]/]path[:tag][@digest]`. The first component is a host
+    when it holds a `.`, a `:` or an uppercase letter, or is `localhost`, as Docker splits
+    it, and must then be a valid domain with an optional numeric port; path components are
+    lowercase ASCII joined by `.`, `_`, `__` or a run of `-`; a tag is ASCII; a digest is
+    `<algorithm>:<hex>` with at least 32 hex digits. Raises `ValueError` when the reference
     is malformed, or when it is well formed but pins no version.
     """
     match = IMAGE_REFERENCE.fullmatch(value)
