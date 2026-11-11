@@ -278,7 +278,9 @@ def claim_ticket(
     if all(winner.claim_id != own for winner in winners):
         oldest_live = own_claims[0].created - expiry
         rival = next(
-            winner for winner in reversed(winners) if winner.created >= oldest_live
+            winner
+            for winner in winners
+            if winner.claim_id < own and winner.created >= oldest_live
         )
         return (
             f"Ticket {key!r} is claimed by task {rival.task_id!r}. "

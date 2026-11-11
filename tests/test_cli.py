@@ -855,8 +855,9 @@ class TimedTracker(ReadyTracker):
     """A tracker whose claims carry the server time they were created at.
 
     `earlier` holds the claims already on the ticket, as (task_id, created) pairs, oldest
-    first; the run's own claim is created at `own_created`. Reading the claims advances
-    the monotonic `clock` by `read_seconds`. Once a claim is posted, reads answer
+    first; the run's own claim is created at `own_created`, and the claims of `later`
+    are posted right after it, with higher ids. Reading the claims advances the
+    monotonic `clock` by `read_seconds`. Once a claim is posted, reads answer
     `status_after_claim`. `moves` records each status change.
     """
 
@@ -866,10 +867,12 @@ class TimedTracker(ReadyTracker):
         own_created: datetime,
         read_seconds: float = 0.0,
         status_after_claim: str = "To Do",
+        later: tuple[tuple[str, datetime], ...] = (),
     ) -> None:
-        """Keep the claims already posted, the time of the own claim and the read delay."""
+        """Keep the claims already posted, the own claim's time, the read delay and the later claims."""
         self.posted = list(earlier)
         self.own_created = own_created
+        self.later = later
         self.read_seconds = read_seconds
         self.status_after_claim = status_after_claim
         self.clock = [1000.0]
@@ -886,10 +889,12 @@ class TimedTracker(ReadyTracker):
         return Ticket(key=key, status=status, labels=(), blockers=())
 
     def claim(self, key: str, task_id: str) -> int:
-        """Keep the claim of `task_id`, created at `own_created`; return its id."""
+        """Keep the claim of `task_id`, created at `own_created`, then `later`; return its id."""
         self.posted.append((task_id, self.own_created))
+        own = len(self.posted)
+        self.posted.extend(self.later)
         self.claimed = True
-        return len(self.posted)
+        return own
 
     def claims(self, key: str, status: str) -> tuple[Claim, ...]:
         """Advance the clock by `read_seconds`; return every claim kept, oldest first."""
@@ -1025,6 +1030,32 @@ def test_claim_that_won_after_an_expired_one_wins_over_its_own(
         answer,
         "task-1",
         "Ticket 'DEMO-1' is claimed by task 'task-3'. "
+        "The claim of task 'task-1' was posted.",
+    )
+    assert tracker.moves == []
+    assert journal_lines(instance) == []
+
+
+def test_losing_claim_names_the_claim_it_lost_to_not_a_later_winning_one(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    tracker = TimedTracker(
+        [("task-0", CLAIM_EPOCH)],
+        CLAIM_EPOCH + timedelta(seconds=599),
+        later=(("task-2", CLAIM_EPOCH + timedelta(seconds=601)),),
+    )
+    serve_timed(monkeypatch, tracker)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(
+        answer,
+        "task-1",
+        "Ticket 'DEMO-1' is claimed by task 'task-0'. "
         "The claim of task 'task-1' was posted.",
     )
     assert tracker.moves == []
