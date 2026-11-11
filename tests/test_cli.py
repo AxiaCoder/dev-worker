@@ -598,6 +598,37 @@ def test_ready_ticket_is_moved_to_in_progress_once_under_the_lock_before_the_jou
     assert seen == [(True, [])]
 
 
+def test_ticket_is_claimed_under_the_lock_before_it_is_moved_and_the_run_journaled(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    directory = instance.with_suffix("")
+    seen: list[tuple[bool, list[tuple[str, str]], list[dict[str, object]]]] = []
+    post = stub.claim
+
+    def spy(key: str, task_id: str) -> int:
+        seen.append(
+            (
+                (directory / run_journal.LOCK_FILE).exists(),
+                list(stub.moves),
+                journal_lines(instance),
+            )
+        )
+        return post(key, task_id)
+
+    monkeypatch.setattr(stub, "claim", spy)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed"
+    assert stub.posted == ["task-1"]
+    assert seen == [(True, [], [])]
+
+
 def test_ticket_not_ready_is_not_moved(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
@@ -611,6 +642,7 @@ def test_ticket_not_ready_is_not_moved(
 
     assert_failed(answer, "task-1", "is in status 'Done', not 'To Do'.")
     assert stub.moves == []
+    assert stub.posted == []
 
 
 def test_ticket_the_tracker_cannot_read_is_not_moved(
@@ -821,6 +853,7 @@ def test_ticket_is_not_moved_when_a_live_run_holds_the_lock(
 
     assert_failed(answer, "task-1", "A run is already in progress")
     assert stub.moves == []
+    assert stub.posted == []
 
 
 def test_ticket_is_not_moved_again_for_a_task_id_already_run(
@@ -837,6 +870,7 @@ def test_ticket_is_not_moved_again_for_a_task_id_already_run(
 
     assert_failed(answer, "task-1", "Task 'task-1' has already been run.")
     assert stub.moves == [("DEMO-1", "In Progress")]
+    assert stub.posted == ["task-1"]
 
 
 def test_make_tracker_returns_a_jira_tracker() -> None:
@@ -1522,6 +1556,7 @@ def test_worktree_left_that_cannot_be_rescued_fails_the_run_without_taking_the_t
 
     assert_failed(answer, "task-1", reason)
     assert stub.moves == []
+    assert stub.posted == []
     assert ("open", "agent/DEMO-1") not in workspace.calls
     assert journal_lines(instance) == []
 
