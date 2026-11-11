@@ -2,6 +2,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -89,17 +90,27 @@ def test_docker_that_does_not_answer_raises(
     )
 
 
-def test_run_starts_one_named_disposable_container_of_its_owner_with_only_the_worktree_mounted(
+INSPECT = ["image", "inspect", "--format", "{{.Id}}", IMAGE]
+
+
+def created(record: Path) -> str:
+    """Return the name given to the one `docker create` call `record` holds."""
+    (create,) = [call for call in calls(record) if call[0] == "create"]
+    return create[create.index("--name") + 1]
+
+
+def test_run_creates_one_named_disposable_container_of_its_owner_with_only_the_worktree_mounted_then_starts_it(
     record: Path, tmp_path: Path
 ) -> None:
     worktree = tmp_path / "worktree"
 
     container().run(worktree, 60)
 
-    [call] = calls(record)
-    assert call[:3] == ["run", "--rm", "--name"]
-    assert NAME.fullmatch(call[3])
-    assert call[4:] == [
+    _, create, start = calls(record)
+    assert create[:5] == ["create", "--pull", "never", "--rm", "--name"]
+    name = create[5]
+    assert NAME.fullmatch(name)
+    assert create[6:] == [
         "--label",
         f"dev-worker.instance={OWNER}",
         "--mount",
@@ -109,14 +120,81 @@ def test_run_starts_one_named_disposable_container_of_its_owner_with_only_the_wo
         IMAGE,
         "true",
     ]
+    assert start == ["start", "--attach", name]
+
+
+def test_an_image_the_daemon_has_is_not_pulled(record: Path, tmp_path: Path) -> None:
+    container().run(tmp_path, 60)
+
+    assert calls(record)[0] == INSPECT
+    assert [call[0] for call in calls(record)] == ["image", "create", "start"]
+
+
+def test_an_image_the_daemon_lacks_is_pulled_before_the_container_is_created(
+    record: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    answer(monkeypatch, "image", stderr="No such image\n", code=1)
+
+    container().run(tmp_path, 60)
+
+    inspect, pull, create, start = calls(record)
+    assert inspect == INSPECT
+    assert pull == ["pull", IMAGE]
+    assert create[0] == "create"
+    assert start[0] == "start"
+
+
+def test_an_image_that_cannot_be_pulled_raises_naming_why_and_creates_no_container(
+    record: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    answer(monkeypatch, "image", stderr="No such image\n", code=1)
+    answer(monkeypatch, "pull", stderr="manifest unknown\n", code=1)
+
+    with pytest.raises(ContainerError) as raised:
+        container().run(tmp_path, 60)
+
+    assert str(raised.value) == (
+        f"docker failed while pulling the image {IMAGE}: manifest unknown"
+    )
+    assert [call[0] for call in calls(record)] == ["image", "pull"]
+
+
+def test_an_image_still_being_pulled_when_the_time_is_up_raises_and_creates_no_container(
+    record: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    answer(monkeypatch, "image", stderr="No such image\n", code=1)
+    answer(monkeypatch, "pull", sleep=10)
+    began = time.monotonic()
+
+    with pytest.raises(ContainerError) as raised:
+        container().run(tmp_path, 0.5)
+
+    assert time.monotonic() - began < 5
+    assert str(raised.value) == (
+        f"the image {IMAGE} was still being pulled when the run reached its ceiling"
+    )
+    assert [call[0] for call in calls(record)] == ["image", "pull"]
+
+
+def test_an_interrupted_pull_raises_again_without_removing_any_container(
+    record: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    answer(monkeypatch, "image", stderr="No such image\n", code=1)
+    interrupt(monkeypatch, "pull")
+
+    with pytest.raises(KeyboardInterrupt):
+        container().run(tmp_path, 60)
+
+    assert [call[0] for call in calls(record)] == ["image"]
 
 
 def test_each_run_names_its_container_anew(record: Path, tmp_path: Path) -> None:
     container().run(tmp_path, 60)
+    first = created(record)
+    record.unlink()
     container().run(tmp_path, 60)
 
-    first, second = calls(record)
-    assert first[3] != second[3]
+    assert first != created(record)
 
 
 def test_a_worktree_path_holding_a_comma_or_a_quote_is_mounted_whole() -> None:
@@ -124,93 +202,156 @@ def test_a_worktree_path_holding_a_comma_or_a_quote_is_mounted_whole() -> None:
     assert mount_option(Path('a"b')) == 'type=bind,"source=a""b",target=/workspace'
 
 
-def test_a_container_that_cannot_be_started_raises_naming_why(
+def test_a_container_that_cannot_be_created_raises_naming_why(
     record: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    answer(monkeypatch, "run", stderr="Unable to find image\n", code=125)
+    answer(monkeypatch, "create", stderr="Unable to find image\n", code=125)
 
     with pytest.raises(ContainerError) as raised:
         container().run(tmp_path, 60)
 
     assert str(raised.value) == (
-        "docker failed while running the container: Unable to find image"
+        "docker failed while creating the container: Unable to find image"
     )
-    assert [call[0] for call in calls(record)] == ["run"]
+    assert [call[0] for call in calls(record)] == ["image", "create"]
 
 
-def test_a_container_still_running_when_the_time_is_up_is_killed_by_its_name(
+def test_a_container_that_cannot_be_started_or_exits_nonzero_raises_naming_why(
     record: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    answer(monkeypatch, "run", sleep=5)
+    answer(monkeypatch, "start", stderr="exec failed\n", code=126)
+
+    with pytest.raises(ContainerError) as raised:
+        container().run(tmp_path, 60)
+
+    assert str(raised.value) == (
+        "docker failed while running the container: exec failed"
+    )
+    assert [call[0] for call in calls(record)] == ["image", "create", "start"]
+
+
+def test_a_container_still_running_when_the_time_is_up_is_removed_by_its_name(
+    record: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    answer(monkeypatch, "start", sleep=5)
+
+    with pytest.raises(ContainerError) as raised:
+        container().run(tmp_path, 1.5)
+
+    name = created(record)
+    assert [call[0] for call in calls(record)] == ["image", "create", "start", "rm"]
+    assert calls(record)[-1] == ["rm", "--force", name]
+    assert str(raised.value) == (
+        f"the container {name} was still running when the run reached its ceiling "
+        "and was removed"
+    )
+
+
+def test_the_time_spent_creating_the_container_counts_against_the_ceiling(
+    record: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    answer(monkeypatch, "create", sleep=2)
+    answer(monkeypatch, "start", sleep=10)
+    began = time.monotonic()
+
+    with pytest.raises(ContainerError):
+        container().run(tmp_path, 4)
+
+    assert time.monotonic() - began < 5.5
+    assert "start" in [call[0] for call in calls(record)]
+
+
+def test_a_ceiling_reached_while_the_container_is_created_removes_it_unstarted(
+    record: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    answer(monkeypatch, "create", sleep=1)
 
     with pytest.raises(ContainerError) as raised:
         container().run(tmp_path, 0.5)
 
-    run, kill = calls(record)
-    name = run[3]
-    assert kill == ["kill", name]
+    name = created(record)
+    assert [call[0] for call in calls(record)] == ["image", "create", "rm"]
+    assert calls(record)[-1] == ["rm", "--force", name]
     assert str(raised.value) == (
-        f"the container {name} was still running when the run reached its ceiling "
-        "and was killed"
+        f"the run reached its ceiling before the container {name} was started "
+        "and was removed"
     )
 
 
-def test_a_container_that_cannot_be_killed_when_the_time_is_up_raises_naming_why(
+def test_a_container_that_cannot_be_removed_when_the_ceiling_comes_before_its_start_raises_naming_why(
     record: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    answer(monkeypatch, "run", sleep=5)
-    answer(monkeypatch, "kill", stderr="No such container\n", code=1)
+    answer(monkeypatch, "create", sleep=1)
+    answer(monkeypatch, "rm", stderr="permission denied\n", code=1)
 
     with pytest.raises(ContainerError) as raised:
         container().run(tmp_path, 0.5)
 
-    name = calls(record)[0][3]
+    name = created(record)
     assert str(raised.value) == (
-        f"the container {name} was still running when the run reached its ceiling "
-        f"and could not be killed: docker failed while killing the container {name}: "
-        "No such container"
+        f"the run reached its ceiling before the container {name} was started "
+        f"and could not be removed: docker failed while removing the container {name}: "
+        "permission denied"
     )
 
 
-def interrupt_the_run(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make `docker run` raise `KeyboardInterrupt`; every other docker call runs as usual."""
+def test_a_container_that_cannot_be_removed_when_the_time_is_up_raises_naming_why(
+    record: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    answer(monkeypatch, "start", sleep=5)
+    answer(monkeypatch, "rm", stderr="permission denied\n", code=1)
+
+    with pytest.raises(ContainerError) as raised:
+        container().run(tmp_path, 1.5)
+
+    name = created(record)
+    assert str(raised.value) == (
+        f"the container {name} was still running when the run reached its ceiling "
+        f"and could not be removed: docker failed while removing the container {name}: "
+        "permission denied"
+    )
+
+
+def interrupt(monkeypatch: pytest.MonkeyPatch, subcommand: str) -> None:
+    """Make `docker <subcommand>` raise `KeyboardInterrupt`; every other docker call runs as usual."""
     real_run = subprocess.run
 
     def run(arguments: list[str], **options: Any) -> Any:
-        if arguments[2] == "run":
+        if arguments[2] == subcommand:
             raise KeyboardInterrupt
         return real_run(arguments, **options)
 
     monkeypatch.setattr(subprocess, "run", run)
 
 
-def test_an_interrupted_run_kills_its_container_and_raises_again(
-    record: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("subcommand", ["create", "start"])
+def test_an_interrupted_run_removes_its_container_and_raises_again(
+    record: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, subcommand: str
 ) -> None:
-    interrupt_the_run(monkeypatch)
+    interrupt(monkeypatch, subcommand)
 
     with pytest.raises(KeyboardInterrupt) as raised:
         container().run(tmp_path, 60)
 
-    [kill] = calls(record)
-    assert kill[0] == "kill"
-    assert NAME.fullmatch(kill[1])
+    remove = calls(record)[-1]
+    assert remove[:2] == ["rm", "--force"]
+    assert NAME.fullmatch(remove[2])
     assert not hasattr(raised.value, "__notes__")
 
 
-def test_an_interrupted_run_whose_container_cannot_be_killed_notes_why(
+def test_an_interrupted_run_whose_container_cannot_be_removed_notes_why(
     record: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    interrupt_the_run(monkeypatch)
-    answer(monkeypatch, "kill", stderr="No such container\n", code=1)
+    interrupt(monkeypatch, "start")
+    answer(monkeypatch, "rm", stderr="permission denied\n", code=1)
 
     with pytest.raises(KeyboardInterrupt) as raised:
         container().run(tmp_path, 60)
 
-    [[_, name]] = calls(record)
+    name = created(record)
     note = (
-        f"the container {name} could not be killed: docker failed while killing "
-        f"the container {name}: No such container"
+        f"the container {name} could not be removed: docker failed while removing "
+        f"the container {name}: permission denied"
     )
     assert raised.value.__notes__ == [note]
 
@@ -304,3 +445,68 @@ def test_kill_running_kills_nothing_when_no_container_of_the_owner_runs(
     container().kill_running()
 
     assert calls(record) == [PS]
+
+
+@pytest.fixture
+def daemon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Make the fake docker keep its containers, made 30 seconds after `run` asks."""
+    path = tmp_path / "containers.json"
+    monkeypatch.setenv("FAKE_DOCKER_STATE", str(path))
+    monkeypatch.setenv("FAKE_DOCKER_CREATION_DELAY", "30")
+    return path
+
+
+def left_over(daemon: Path) -> list[str]:
+    """Name the containers the fake daemon made, or will make, and did not remove."""
+    containers = json.loads(daemon.read_text("utf-8"))
+    return [name for name, state in containers.items() if not state["removed"]]
+
+
+def test_a_ceiling_reached_before_the_daemon_made_the_container_leaves_no_container(
+    record: Path, daemon: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    answer(monkeypatch, "run", sleep=10)
+    answer(monkeypatch, "start", sleep=10)
+
+    with pytest.raises(ContainerError):
+        container().run(tmp_path, 0.5)
+
+    assert left_over(daemon) == []
+
+
+def interrupt_once_the_container_is_asked_to_start(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Make `docker run` or `docker start` raise `KeyboardInterrupt` once it reached the fake.
+
+    The docker client is stopped with the interruption; every other docker call runs as usual.
+    """
+    real_run = subprocess.run
+
+    def run(arguments: list[str], **options: Any) -> Any:
+        if arguments[2] not in ("run", "start"):
+            return real_run(arguments, **options)
+        before = len(calls(record)) if record.exists() else 0
+        client = subprocess.Popen(
+            arguments, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        while not record.exists() or len(calls(record)) == before:
+            time.sleep(0.05)
+        client.kill()
+        client.wait()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+
+def test_an_interruption_before_the_daemon_made_the_container_leaves_no_container(
+    record: Path, daemon: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    answer(monkeypatch, "run", sleep=10)
+    answer(monkeypatch, "start", sleep=10)
+    interrupt_once_the_container_is_asked_to_start(record, monkeypatch)
+
+    with pytest.raises(KeyboardInterrupt):
+        container().run(tmp_path, 60)
+
+    assert left_over(daemon) == []
