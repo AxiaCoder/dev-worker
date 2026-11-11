@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -576,10 +577,15 @@ def test_rescue_does_not_follow_a_link_to_a_repository_outside(
 def test_worktree_the_mirror_does_not_record_is_refused(space: Workspace) -> None:
     space.worktree.mkdir(parents=True)
 
-    with pytest.raises(
-        WorkspaceError, match="the mirror records no worktree at '.*'; it was not"
-    ):
+    expected = (
+        f"^the mirror records no worktree at '{re.escape(str(space.worktree))}'; "
+        "delete that directory by hand$"
+    )
+
+    with pytest.raises(WorkspaceError, match=expected) as raised:
         space.left_branch()
+
+    assert "made by a run" not in str(raised.value)
 
 
 def test_rescue_with_commits_but_nothing_left_pushes_without_committing(
