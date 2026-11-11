@@ -1,12 +1,14 @@
 """The disposable container of a run, driven through the `docker` command line.
 
-A run creates one container with `docker create --rm`, the worktree bind-mounted at
+A run pulls its image when the daemon does not have it, within the time left in the
+run, then creates one container with `docker create --rm`, the worktree bind-mounted at
 `WORKDIR` and nothing else mounted, then starts it; `--rm` has Docker remove it once it
 ends. The container is named, so that a run reaching its duration ceiling, or
 interrupted, can remove it by force: created before it is started, it exists by then,
 and once removed it can no longer start. It is labelled
 `OWNER_LABEL` with the instance that started it, so that the running containers of an
-instance can be listed and killed. Every other docker call is bounded by
+instance can be listed and killed. Every docker call other than the pull and the run of
+the container is bounded by
 `DOCKER_TIMEOUT_SECONDS` (60 seconds).
 """
 
@@ -76,20 +78,25 @@ class Container:
     def run(self, worktree: Path, time_left: float) -> None:
         """Run `RUN_COMMAND` in a new container with `worktree` mounted, and wait for it to end.
 
-        The container is created, then started. `time_left` is the time left in the run,
-        in seconds, counted from the call: a container still running then is removed by
-        force. Raises `ContainerError` when the container cannot be created or started,
-        exits nonzero, or outlasts `time_left`, whether it could then be removed or not.
-        Any other exception raised meanwhile, such as `KeyboardInterrupt`, has the
-        container removed by force and is raised again; a removal that fails is added to
-        it as a note.
+        The image is pulled when it is missing, then the container is created and
+        started. `time_left` is the time left in the run, in seconds, counted from the
+        call; it bounds the pull and the run of the container, and a container still
+        there when it runs out is removed by force. Raises `ContainerError` when the
+        image cannot be pulled, the container cannot be created or started, exits
+        nonzero, or `time_left` runs out, whether the container could then be removed
+        or not. Any other exception raised meanwhile, such as `KeyboardInterrupt`, has
+        the container removed by force and is raised again; a removal that fails is
+        added to it as a note.
         """
         name = f"{NAME_PREFIX}{uuid.uuid4().hex}"
         deadline = time.monotonic() + time_left
+        self._pull_missing_image(deadline)
         try:
             self._docker(
                 "creating the container",
                 "create",
+                "--pull",
+                "never",
                 "--rm",
                 "--name",
                 name,
@@ -102,25 +109,26 @@ class Container:
                 self._image,
                 *RUN_COMMAND,
             )
+            start_time_left = deadline - time.monotonic()
+            if start_time_left <= 0:
+                self._remove_at_ceiling(
+                    name,
+                    f"the run reached its ceiling before the container {name} "
+                    "was started",
+                )
             self._docker(
                 "running the container",
                 "start",
                 "--attach",
                 name,
-                timeout=max(deadline - time.monotonic(), 0),
+                timeout=start_time_left,
             )
         except subprocess.TimeoutExpired:
-            reached = (
+            self._remove_at_ceiling(
+                name,
                 f"the container {name} was still running when the run reached "
-                "its ceiling"
+                "its ceiling",
             )
-            try:
-                self._remove(name)
-            except ContainerError as removal_error:
-                raise ContainerError(
-                    f"{reached} and could not be removed: {removal_error}"
-                ) from None
-            raise ContainerError(f"{reached} and was removed") from None
         except ContainerError:
             raise
         except BaseException as error:
@@ -172,6 +180,51 @@ class Container:
     def _kill(self, name: str) -> None:
         """Kill the container `name`; raise `ContainerError` when docker cannot."""
         self._docker(f"killing the container {name}", "kill", name)
+
+    def _pull_missing_image(self, deadline: float) -> None:
+        """Pull the image when the daemon does not have it, within `deadline`.
+
+        `deadline` is a `time.monotonic()` reading. Raises `ContainerError` when the pull
+        fails or is still going on at `deadline`.
+        """
+        try:
+            self._docker(
+                "inspecting the image",
+                "image",
+                "inspect",
+                "--format",
+                "{{.Id}}",
+                self._image,
+            )
+            return
+        except ContainerError:
+            pass
+        try:
+            self._docker(
+                f"pulling the image {self._image}",
+                "pull",
+                self._image,
+                timeout=max(deadline - time.monotonic(), 0),
+            )
+        except subprocess.TimeoutExpired:
+            raise ContainerError(
+                f"the image {self._image} was still being pulled when the run "
+                "reached its ceiling"
+            ) from None
+
+    def _remove_at_ceiling(self, name: str, reached: str) -> None:
+        """Remove the container `name` by force, then raise `ContainerError` from `reached`.
+
+        `reached` is the sentence saying where the run was at its ceiling; the error
+        adds whether the container was removed.
+        """
+        try:
+            self._remove(name)
+        except ContainerError as removal_error:
+            raise ContainerError(
+                f"{reached} and could not be removed: {removal_error}"
+            ) from None
+        raise ContainerError(f"{reached} and was removed") from None
 
     def _remove(self, name: str) -> None:
         """Remove the container `name`, killing it first when it runs.

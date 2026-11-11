@@ -1460,6 +1460,7 @@ def test_container_left_by_a_killed_worker_is_killed_before_its_worktree_is_resc
         "ps",
         "kill dev-worker-left",
         "ps",
+        "image",
         "create",
         "start",
         "ps",
