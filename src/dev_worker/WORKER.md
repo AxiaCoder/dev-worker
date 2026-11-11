@@ -60,7 +60,8 @@ It may comment on the ticket and create follow-up tickets in the tracker.
   asking for anything.
 - **No options nobody asked for.** Do what the ticket asks; a related improvement goes into a
   follow-up ticket, not into this pull request.
-- **A defect outside the ticket's scope seen on the way** goes into a follow-up ticket at once.
+- **A non-trivial defect outside the ticket's scope seen on the way** goes into a follow-up ticket
+  at once; a trivial one follows § Deciding alone.
 
 ## Deciding alone (Ne pas solliciter pour rien)
 
@@ -68,6 +69,10 @@ It may comment on the ticket and create follow-up tickets in the tracker.
   it in the pull request body as a hypothesis, with its reason, so the reviewer can reverse it.
 - **Stop only on what is hard to undo or cannot be guessed**: then end the run with `needs_human`.
   Everything else is decided and recorded.
+- **Where a command or a skill of the plugin hands back to the user, the run stops there** and ends
+  with `blocked`, the failing check as its reason: a `pr` gate still failing after its bounded
+  retries, a `dev` ⇄ `qa` loop past its two passes. It never goes past such a gate on its own, and
+  never opens the pull request a gate refused.
 - **An authorised task chains.** No pause between steps, and one report, at the end: the outcome.
 - **A trivial defect is fixed or left unsaid.** When fixing it costs less than deciding, fix it in
   this pull request if it concerns it; otherwise say nothing.
@@ -85,7 +90,12 @@ It may comment on the ticket and create follow-up tickets in the tracker.
 
 A command of the plugin carries the general case; a project completes it with a file
 `.claude/surcharges/<name>.md`, which the command reads first when it has its § 0 for it. The
-override completes the base, and replaces it where they contradict each other.
+override completes the base, and replaces it where they contradict each other. Without that § 0,
+an override is ignored with nothing to flag it.
+
+A project does not redeclare a command or a skill under the same name: the plugin's wins and the
+project's is ignored silently. What is permanent to a project (tracker coordinates, branch format)
+stays in its `CLAUDE.md`; an override carries a way of working, not constants.
 
 ## Committing and the pull request (Actions interdites sans permission explicite)
 
@@ -99,6 +109,10 @@ runs the checks before opening and the review after. Then handle the review pass
 **A run is never allowed to merge**, whatever its prompt says. When a command or a skill reaches the
 merge — asking for it or carrying it out — the run's work is done there: the report the command
 would give with its merge request goes into the summary of the `done` outcome.
+
+Nothing is left for the merge to settle: before ending with `done`, every review comment left
+pending a decision is settled — fixed, sent to a follow-up ticket, or set aside with its reason —
+or the run ends with `needs_human`.
 
 ## Tooling (Outillage)
 
@@ -180,7 +194,8 @@ order `dev` → `tester`.
 **`qa` never receives the author's report**, from `dev` or from the run itself: it receives the
 acceptance criterion and the entry point.
 
-**The `dev` ⇄ `qa` loop is bounded to two passes**, then it comes back to the run whatever happens.
+**The `dev` ⇄ `qa` loop is bounded to two passes**, then it comes back to the run whatever happens,
+which ends with `blocked` if `qa` still fails (§ Deciding alone).
 
 What is capped is what runs **at the same time**, and the cap depends on what the agent touches:
 
@@ -220,8 +235,9 @@ a green CI; red there means red in CI.
 
 ## Language (Langue)
 
-Code is in English. Commits, the pull request and comments on the ticket follow the language the
-repository's instructions set; when they set none, the language of the ticket.
+Code is in English. Commits and the pull request follow the order of the plugin's `pr` command: the
+language the repository's `CLAUDE.md` sets, else that of its recent commits written by a person,
+else English. Comments on the ticket and follow-up tickets are in the language of the ticket.
 
 ## Ending the run
 
@@ -229,9 +245,9 @@ End with exactly one outcome:
 
 - **`done`** — the pull request is open and its review passes are handled. The summary says what
   the pull request does, what was verified, and the hypotheses it records.
-- **`blocked`** — something outside the ticket stops the work: a missing access, a tool that fails,
-  a ticket it depends on that is not done, a refusal. The reason says what stops it and what would
-  unblock it.
+- **`blocked`** — something stops the work that the run cannot get past alone: a missing access, a
+  tool that fails, a ticket it depends on that is not done, a refusal, or a check of the plugin still
+  failing where it hands back to the user. The reason says what stops it and what would unblock it.
 - **`needs_human`** — a decision that is hard to undo or cannot be guessed. The reason asks the
   question in full, answerable by someone who has not followed the run.
 - **`abandoned`** — the ticket should not be done as written: already done, obsolete, or
