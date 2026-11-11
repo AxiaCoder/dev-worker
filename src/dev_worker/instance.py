@@ -25,11 +25,14 @@ _DOMAIN_COMPONENT = r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
 _DOMAIN = rf"{_DOMAIN_COMPONENT}(?:\.{_DOMAIN_COMPONENT})*"
 _HOST_LIKE = r"(?:[^/]*[.:A-Z][^/]*|localhost)/"
 IMAGE_REFERENCE = re.compile(
+    r"(?P<name>"
     rf"(?:(?={_HOST_LIKE}){_DOMAIN}(?::[0-9]+)?/|(?!{_HOST_LIKE}))"
     rf"{_PATH_COMPONENT}(?:/{_PATH_COMPONENT})*"
+    r")"
     r"(?::(?P<tag>[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}))?"
-    r"(?:@(?P<digest>[A-Za-z][A-Za-z0-9]*:[0-9a-fA-F]{32,}))?"
+    r"(?:@(?P<digest>sha256:[0-9a-f]{64}|sha384:[0-9a-f]{96}|sha512:[0-9a-f]{128}))?"
 )
+NAME_LENGTH_MAX = 255
 
 
 class InstanceError(ValueError):
@@ -79,12 +82,14 @@ def _check_pinned_image(value: str) -> str:
     The reference reads `[host[:port]/]path[:tag][@digest]`. The first component is a host
     when it holds a `.`, a `:` or an uppercase letter, or is `localhost`, as Docker splits
     it, and must then be a valid domain with an optional numeric port; path components are
-    lowercase ASCII joined by `.`, `_`, `__` or a run of `-`; a tag is ASCII; a digest is
-    `<algorithm>:<hex>` with at least 32 hex digits. Raises `ValueError` when the reference
-    is malformed, or when it is well formed but pins no version.
+    lowercase ASCII joined by `.`, `_`, `__` or a run of `-`; the name, host and path
+    without tag or digest, holds at most 255 characters; a tag is ASCII; a digest is
+    `sha256`, `sha384` or `sha512` followed by `:` and 64, 96 or 128 lowercase hex digits.
+    Raises `ValueError` when the reference is malformed, or when it is well formed but pins
+    no version.
     """
     match = IMAGE_REFERENCE.fullmatch(value)
-    if match is None:
+    if match is None or len(match["name"]) > NAME_LENGTH_MAX:
         raise ValueError("is not a valid image reference, e.g. python:3.12-slim")
     if not match["digest"] and match["tag"] in (None, "latest"):
         raise ValueError(

@@ -516,6 +516,7 @@ def test_branch_without_the_key_is_refused_with_its_reason(
 
 
 DIGEST = "sha256:" + "0123456789abcdef" * 4
+HEX = "0123456789abcdef"
 
 
 @pytest.mark.parametrize(
@@ -542,6 +543,10 @@ DIGEST = "sha256:" + "0123456789abcdef" * 4
         "MyRegistry/app:1",
         "Localhostx/app:1",
         "a/b/c/d:1",
+        "app@sha384:" + HEX * 6,
+        "app@sha512:" + HEX * 8,
+        "a" * 255 + ":1",
+        "a" * 255 + ":" + "a" * 128,
     ],
 )
 def test_pinned_image_is_accepted(tmp_path: Path, image: str) -> None:
@@ -611,6 +616,14 @@ def test_unpinned_image_is_refused_with_its_reason(tmp_path: Path, image: str) -
         "python/:3",
         "python:é",
         "python:１",
+        "app@sha256:" + HEX * 2,
+        "app@sha256:" + HEX * 4 + "0",
+        "app@sha256:" + HEX.upper() * 4,
+        "app@md5:" + HEX * 2,
+        "app@SHA256:" + HEX * 4,
+        "app@sha384:" + HEX * 4,
+        "a" * 256 + ":1",
+        "registry.example.com/" + "a" * 235 + ":1",
     ],
 )
 def test_malformed_image_is_refused_as_invalid(tmp_path: Path, image: str) -> None:
