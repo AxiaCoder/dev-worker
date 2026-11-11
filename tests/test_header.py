@@ -14,6 +14,9 @@ outcomes:
   blocked: blocked
   needs_human: blocked
   abandoned: ready
+plugin:
+  repository: https://example.com/plugin.git
+  tag: v1.0.0
 ceilings:
   run_timeout_seconds: 1800
   max_turns: 60
@@ -49,6 +52,10 @@ def test_shipped_worker_file_loads() -> None:
         "abandoned": "blocked",
     }
     assert worker.header.ceilings == {"run_timeout_seconds": 1800, "max_turns": 60}
+    assert worker.header.plugin.model_dump() == {
+        "repository": "https://github.com/AxiaCoder/claude-config.git",
+        "tag": "atelier--v1.0.0",
+    }
     assert worker.body.strip()
 
 
@@ -222,3 +229,118 @@ def test_worker_file_not_in_utf8_is_refused(tmp_path: Path) -> None:
 def test_header_nested_too_deeply_is_refused(tmp_path: Path) -> None:
     with pytest.raises(HeaderError):
         load_worker_file(write(tmp_path, with_header("outcomes: " + "[" * 5000 + "\n")))
+
+
+def test_header_without_a_plugin_is_refused(tmp_path: Path) -> None:
+    front_matter = VALID.replace(
+        "plugin:\n  repository: https://example.com/plugin.git\n  tag: v1.0.0\n", ""
+    )
+
+    with pytest.raises(HeaderError, match="plugin: Field required"):
+        load_worker_file(write(tmp_path, with_header(front_matter)))
+
+
+@pytest.mark.parametrize("field", ["repository", "tag"])
+def test_plugin_without_its_repository_or_tag_is_refused(
+    tmp_path: Path, field: str
+) -> None:
+    lines = [
+        line for line in VALID.splitlines(keepends=True) if f"  {field}:" not in line
+    ]
+
+    with pytest.raises(HeaderError, match=f"plugin.{field}: Field required"):
+        load_worker_file(write(tmp_path, with_header("".join(lines))))
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "field"),
+    [
+        ("tag: v1.0.0", "tag: ''", "tag"),
+        ("repository: https://example.com/plugin.git", "repository: ''", "repository"),
+    ],
+)
+def test_empty_plugin_value_is_refused(
+    tmp_path: Path, old: str, new: str, field: str
+) -> None:
+    with pytest.raises(
+        HeaderError, match=f"plugin.{field}: String should have at least 1"
+    ):
+        load_worker_file(write(tmp_path, with_header(VALID.replace(old, new))))
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "field"),
+    [
+        ("tag: v1.0.0", "tag: --upload-pack=evil", "tag"),
+        (
+            "repository: https://example.com/plugin.git",
+            "repository: -uevil",
+            "repository",
+        ),
+    ],
+)
+def test_plugin_value_read_as_an_option_is_refused(
+    tmp_path: Path, old: str, new: str, field: str
+) -> None:
+    with pytest.raises(
+        HeaderError, match=f"plugin.{field}: Value error, must not start with '-'"
+    ):
+        load_worker_file(write(tmp_path, with_header(VALID.replace(old, new))))
+
+
+@pytest.mark.parametrize(
+    "repository",
+    ["plugin.git", "../plugin.git", "/srv/plugin.git", "git@github.com:a/b.git"],
+)
+def test_plugin_repository_that_is_not_a_url_is_refused(
+    tmp_path: Path, repository: str
+) -> None:
+    front_matter = VALID.replace(
+        "repository: https://example.com/plugin.git", f"repository: '{repository}'"
+    )
+
+    with pytest.raises(HeaderError, match="plugin.repository"):
+        load_worker_file(write(tmp_path, with_header(front_matter)))
+
+
+@pytest.mark.parametrize(
+    "escaped_repository",
+    [
+        r"https://example.com/a\nb.git",
+        r"https://example.com/a\tb.git",
+        r"https:// example.com/plugin.git",
+        r"https://example.com/plugin.git\n",
+    ],
+)
+def test_plugin_repository_holding_whitespace_is_refused(
+    tmp_path: Path, escaped_repository: str
+) -> None:
+    front_matter = VALID.replace(
+        "repository: https://example.com/plugin.git",
+        f'repository: "{escaped_repository}"',
+    )
+
+    with pytest.raises(HeaderError, match="plugin.repository"):
+        load_worker_file(write(tmp_path, with_header(front_matter)))
+
+
+@pytest.mark.parametrize(
+    "repository", ["https://example.com/plugin.git", "file:///srv/plugin.git"]
+)
+def test_plugin_repository_that_is_a_url_is_accepted(
+    tmp_path: Path, repository: str
+) -> None:
+    front_matter = VALID.replace(
+        "repository: https://example.com/plugin.git", f"repository: '{repository}'"
+    )
+
+    worker = load_worker_file(write(tmp_path, with_header(front_matter)))
+
+    assert worker.header.plugin.repository == repository
+
+
+def test_unknown_plugin_key_is_refused(tmp_path: Path) -> None:
+    front_matter = VALID.replace("  tag: v1.0.0\n", "  tag: v1.0.0\n  branch: main\n")
+
+    with pytest.raises(HeaderError, match="plugin.branch: Extra inputs"):
+        load_worker_file(write(tmp_path, with_header(front_matter)))

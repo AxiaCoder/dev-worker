@@ -17,6 +17,7 @@ HEADER = Header.model_validate(
             "abandoned": "ready",
         },
         "ceilings": {"run_timeout_seconds": 1800, "max_turns": 60},
+        "plugin": {"repository": "https://example.com/plugin.git", "tag": "v1"},
     }
 )
 

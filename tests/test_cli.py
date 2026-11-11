@@ -20,9 +20,10 @@ from dev_worker import cli, run_journal
 from dev_worker.container import Container, ContainerError
 from dev_worker.contract import MandateInput, MandateOutput
 from dev_worker.github import GitHubRepository
-from dev_worker.header import HeaderError
+from dev_worker.header import HeaderError, Plugin
 from dev_worker.instance import GitIdentity, Instance, Repository, Tracker
 from dev_worker.jira import JiraTracker
+from dev_worker.plugin import PluginCheckout, PluginError
 from dev_worker.repositories import RepositoryError
 from dev_worker.tickets import Blocker, Claim, Ticket, TrackerError
 from dev_worker.workspace import Workspace, WorkspaceError
@@ -34,6 +35,8 @@ MAKE_TRACKER = cli.make_tracker
 MAKE_REPOSITORY = cli.make_repository
 MAKE_WORKSPACE = cli.make_workspace
 MAKE_CONTAINER = cli.make_container
+MAKE_PLUGIN = cli.make_plugin
+CHECKOUT = Path("plugin")
 IDENTITY = "12345678+example-worker@users.noreply.github.com"
 RESCUED = ("rescue", "agent/DEMO-1", "Example Worker", IDENTITY)
 
@@ -157,6 +160,35 @@ def workspace(monkeypatch: pytest.MonkeyPatch) -> FakeWorkspace:
     return fake
 
 
+class FakePlugin:
+    """A plugin checkout that records what it prepares and raises `error`, when set."""
+
+    def __init__(self) -> None:
+        self.error: PluginError | None = None
+        self.prepared: list[tuple[Path, Plugin]] = []
+        self.directory = Path()
+
+    def make(self, directory: Path) -> "FakePlugin":
+        """Keep `directory`; return this fake, in place of `cli.make_plugin`."""
+        self.directory = directory
+        return self
+
+    def prepare(self, plugin: Plugin) -> Path:
+        """Record `plugin` with the directory; return `CHECKOUT`."""
+        self.prepared.append((self.directory, plugin))
+        if self.error is not None:
+            raise self.error
+        return CHECKOUT
+
+
+@pytest.fixture(autouse=True)
+def plugin(monkeypatch: pytest.MonkeyPatch) -> FakePlugin:
+    """Make `run` use a `FakePlugin` instead of a git checkout; return it."""
+    fake = FakePlugin()
+    monkeypatch.setattr(cli, "make_plugin", fake.make)
+    return fake
+
+
 class FakeContainer:
     """A container that records its calls and raises `error`, when set, from those named in `failing`.
 
@@ -185,9 +217,9 @@ class FakeContainer:
         """Record the check."""
         self._step("check_access")
 
-    def run(self, worktree: Path, time_left: float) -> None:
-        """Record the run on `worktree` with `time_left` seconds left."""
-        self._step("run", worktree, time_left)
+    def run(self, worktree: Path, time_left: float, plugin: Path) -> None:
+        """Record the run on `worktree` with `time_left` seconds left and `plugin` mounted."""
+        self._step("run", worktree, time_left, plugin)
 
     def check_none_running(self) -> None:
         """Record the check that no container of the instance is running."""
@@ -1642,9 +1674,75 @@ def test_container_runs_from_the_instance_image_on_the_worktree_before_the_manda
                 ("refresh",),
                 ("open", "agent/DEMO-1"),
             ],
-            [("run", workspace.worktree, 1800)],
+            [("run", workspace.worktree, 1800, CHECKOUT)],
         )
     ]
+
+
+def test_run_prepares_the_plugin_the_header_names_in_the_instance_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    plugin: FakePlugin,
+) -> None:
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed"
+    assert plugin.prepared == [
+        (
+            instance.with_suffix(""),
+            Plugin(
+                repository="https://github.com/AxiaCoder/claude-config.git",
+                tag="atelier--v1.0.0",
+            ),
+        )
+    ]
+
+
+def test_plugin_that_cannot_be_fetched_fails_the_run_naming_why_before_the_worktree(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    container: FakeContainer,
+    plugin: FakePlugin,
+) -> None:
+    ran: list[str] = []
+
+    def record(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+        ran.append(mandate.task_id)
+        return cli.deliver_ticket(mandate, resolved)
+
+    monkeypatch.setitem(cli.MANDATES, "deliver_ticket", record)
+    plugin.error = PluginError("git failed while cloning: no such tag")
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(
+        answer,
+        "task-1",
+        "The plugin cannot be fetched: git failed while cloning: no such tag",
+    )
+    assert ran == []
+    assert ("refresh",) not in workspace.calls
+    assert container.calls == []
+    assert [line["status"] for line in journal_lines(instance)] == [
+        "running",
+        "failed",
+    ]
+
+
+def test_make_plugin_keeps_the_checkout_in_the_instance_directory(
+    tmp_path: Path,
+) -> None:
+    made = MAKE_PLUGIN(tmp_path)
+
+    assert isinstance(made, PluginCheckout)
+    assert made.checkout == tmp_path / "plugin"
 
 
 def test_container_runs_under_the_run_timeout_of_the_instance(
@@ -1658,9 +1756,9 @@ def test_container_runs_under_the_run_timeout_of_the_instance(
 
     run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
 
-    [(step, worktree, time_left), checked] = container.calls
+    [(step, worktree, time_left, checkout), checked] = container.calls
     assert checked == ("check_none_running",)
-    assert (step, worktree) == ("run", Path("worktree"))
+    assert (step, worktree, checkout) == ("run", Path("worktree"), CHECKOUT)
     assert isinstance(time_left, float)
     assert 4 < time_left <= 5
 
@@ -1692,7 +1790,7 @@ def test_container_is_given_the_time_left_once_the_worktree_is_ready(
     run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
 
     assert container.calls == [
-        ("run", workspace.worktree, 1200),
+        ("run", workspace.worktree, 1200, CHECKOUT),
         ("check_none_running",),
     ]
 
@@ -1716,7 +1814,7 @@ def test_container_time_left_counts_the_time_spent_taking_the_ticket(
     run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
 
     assert container.calls == [
-        ("run", workspace.worktree, 1500),
+        ("run", workspace.worktree, 1500, CHECKOUT),
         ("check_none_running",),
     ]
 

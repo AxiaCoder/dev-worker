@@ -1,5 +1,6 @@
 """Reading and validation of the front matter of a `WORKER.md` file."""
 
+import re
 from collections.abc import Hashable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,7 @@ from yaml.constructor import ConstructorError
 from yaml.nodes import MappingNode
 
 FENCE = "---"
+_URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S+")
 
 StatusKey = Annotated[str, Field(min_length=1)]
 CeilingName = Annotated[str, Field(min_length=1)]
@@ -59,11 +61,41 @@ class Outcomes(BaseModel):
     abandoned: StatusKey
 
 
+class Plugin(BaseModel):
+    """The Claude Code plugin a run loads: the git `repository` it comes from, at `tag`.
+
+    Neither value is empty nor starts with `-`. `repository` is a URL,
+    `<scheme>://<rest>`, with no whitespace.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    repository: str = Field(min_length=1)
+    tag: str = Field(min_length=1)
+
+    @field_validator("repository", "tag", mode="after")
+    @classmethod
+    def _refuse_option(cls, value: str) -> str:
+        """Refuse a value git would read as an option."""
+        if value.startswith("-"):
+            raise ValueError("must not start with '-'")
+        return value
+
+    @field_validator("repository", mode="after")
+    @classmethod
+    def _require_url(cls, value: str) -> str:
+        """Refuse a repository that is not a `<scheme>://<rest>` URL without whitespace."""
+        if not _URL.fullmatch(value):
+            raise ValueError("must be a URL, '<scheme>://<rest>', with no whitespace")
+        return value
+
+
 class Header(BaseModel):
     """The validated front matter of a `WORKER.md` file.
 
     `ceilings` maps a limit name to its absolute ceiling, a positive integer; a lower value
-    is always tighter. It holds at least one entry and is read-only.
+    is always tighter. It holds at least one entry and is read-only. `plugin` names the
+    plugin every run loads.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -71,6 +103,7 @@ class Header(BaseModel):
     status_keys: tuple[StatusKey, ...] = Field(min_length=1)
     outcomes: Outcomes
     ceilings: Mapping[CeilingName, Ceiling] = Field(min_length=1)
+    plugin: Plugin
 
     @field_validator("ceilings", mode="after")
     @classmethod
