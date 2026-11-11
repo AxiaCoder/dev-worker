@@ -223,6 +223,43 @@ def check_ticket_ready(
     return None
 
 
+def claim_ticket(
+    key: str, task_id: str, instance: Instance, tracker: TicketTracker
+) -> str | None:
+    """Claim the ticket `key` for `task_id` through `tracker`; return why the run may not take it, or None.
+
+    The run may take the ticket only when its own claim is the oldest of those posted
+    since the ticket last entered the real status of the `ready` key: of runs that both
+    read the ticket ready, one only goes on. A run whose claim cannot be posted, whose
+    claims cannot be read, or whose own claim is not found among them may not take it;
+    the reason says whether the claim may have been posted.
+    """
+    ready = instance.statuses["ready"]
+    try:
+        own = tracker.claim(key, task_id)
+    except TrackerError as error:
+        return (
+            f"Ticket {key!r} cannot be claimed for task {task_id!r}: {error} "
+            "The claim may have been posted."
+        )
+    try:
+        claims = tracker.claims(key, ready)
+    except TrackerError as error:
+        return (
+            f"The claims on ticket {key!r} cannot be read: {error} "
+            f"The claim of task {task_id!r} was posted."
+        )
+    if own not in [claim.claim_id for claim in claims]:
+        return (
+            f"The claim of task {task_id!r} is not found among the claims on "
+            f"ticket {key!r} since it last entered {ready!r}."
+        )
+    first = claims[0]
+    if first.claim_id != own:
+        return f"Ticket {key!r} is claimed by task {first.task_id!r}."
+    return None
+
+
 def take_ticket(key: str, instance: Instance, tracker: TicketTracker) -> str | None:
     """Move the ticket `key` to the real status of the `in_progress` key; return why it failed, or None.
 
@@ -251,9 +288,10 @@ def run_journaled(
     The ticket key is checked first, then the ticket is read from the tracker and
     refused unless it is ready (see `check_ticket_ready`), then the lock is taken, or
     taken over from a run that is gone (see `take_over_lock`); a task_id already in the
-    journal is refused, otherwise the ticket is moved to the real status of the
-    `in_progress` key (see `take_ticket`) before the run is journaled.
-    A refused run, or one whose ticket cannot be moved, is not journaled. The lock is
+    journal is refused, otherwise the ticket is claimed for the run (see `claim_ticket`)
+    and moved to the real status of the `in_progress` key (see `take_ticket`) before the
+    run is journaled. A refused run, or one whose ticket cannot be claimed or moved, is
+    not journaled. The lock is
     released only if no other run has taken it over meanwhile. Every file error
     becomes a failed output naming the reason, except a lock that cannot be removed:
     the run keeps its status and the reason is added to `errors`. An exception raised
@@ -328,9 +366,10 @@ def run_under_lock(
 
     Before anything is journaled, a worktree an earlier run left in `directory` is
     rescued and removed (see `rescue_left_worktree`); a run that cannot do so fails
-    without taking its ticket nor being journaled. Then the ticket is moved through `tracker` to the real
-    status of the `in_progress` key; a run whose ticket cannot be moved fails without
-    being journaled. A `running` line is appended before `handler` runs, so that the
+    without taking its ticket nor being journaled. Then the ticket is claimed for the run
+    through `tracker` (see `claim_ticket`) and moved to the real status of the
+    `in_progress` key; a run whose ticket cannot be claimed or moved fails without being
+    journaled. A `running` line is appended before `handler` runs, so that the
     task is never run again even if its final line, appended once `handler` returns,
     cannot be written; the output is then kept, with the journal error added to
     `errors`. A run whose `running` line cannot be written fails without running
@@ -354,8 +393,10 @@ def run_under_lock(
         return failed(task_id, f"Task {task_id!r} has already been run.")
     ticket_key = mandate.params["ticket_key"]
     assert isinstance(ticket_key, str)
-    refusal = rescue_left_worktree(instance, directory) or take_ticket(
-        ticket_key, instance, tracker
+    refusal = (
+        rescue_left_worktree(instance, directory)
+        or claim_ticket(ticket_key, task_id, instance, tracker)
+        or take_ticket(ticket_key, instance, tracker)
     )
     if refusal is not None:
         return failed(task_id, refusal)

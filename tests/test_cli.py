@@ -24,7 +24,7 @@ from dev_worker.header import HeaderError
 from dev_worker.instance import GitIdentity, Instance, Repository, Tracker
 from dev_worker.jira import JiraTracker
 from dev_worker.repositories import RepositoryError
-from dev_worker.tickets import Blocker, Ticket, TrackerError
+from dev_worker.tickets import Blocker, Claim, Ticket, TrackerError
 from dev_worker.workspace import Workspace, WorkspaceError
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -71,6 +71,14 @@ class ReadyTracker:
     def read(self, key: str) -> Ticket:
         """Return the ticket `key`, ready and unblocked."""
         return Ticket(key=key, status="To Do", labels=(), blockers=())
+
+    def claim(self, key: str, task_id: str) -> int:
+        """Return the claim id 1."""
+        return 1
+
+    def claims(self, key: str, status: str) -> tuple[Claim, ...]:
+        """Return the claim 1 alone."""
+        return (Claim(1, "task-1"),)
 
     def set_status(self, key: str, status: str) -> None:
         """Change nothing."""
@@ -332,7 +340,8 @@ class StubTracker:
 
     A status change raises `move_error` when one is given; otherwise it becomes the
     status of the ticket later reads answer. `reads` records each key read, `moves` each
-    status change asked and `trackers` each instance tracker it was made for.
+    status change asked, `posted` the task_id of each claim and `trackers` each instance
+    tracker it was made for.
     """
 
     def __init__(
@@ -344,6 +353,7 @@ class StubTracker:
         self.reads: list[str] = []
         self.moves: list[tuple[str, str]] = []
         self.trackers: list[Tracker] = []
+        self.posted: list[str] = []
 
     def make(self, tracker: Tracker) -> "StubTracker":
         """Record `tracker` and return this stub, in place of `cli.make_tracker`."""
@@ -356,6 +366,15 @@ class StubTracker:
         if isinstance(self.answer, TrackerError):
             raise self.answer
         return self.answer
+
+    def claim(self, key: str, task_id: str) -> int:
+        """Record the claim of `task_id`; return its id, its rank from 1."""
+        self.posted.append(task_id)
+        return len(self.posted)
+
+    def claims(self, key: str, status: str) -> tuple[Claim, ...]:
+        """Return every claim recorded, oldest first."""
+        return tuple(Claim(rank, task) for rank, task in enumerate(self.posted, 1))
 
     def set_status(self, key: str, status: str) -> None:
         """Record the change, then raise `move_error` or give the answer `status`."""
@@ -653,6 +672,133 @@ def test_ticket_the_tracker_cannot_move_fails_as_of_unknown_status_journaling_no
     )
     assert journal_lines(instance) == []
     assert not (instance.with_suffix("") / run_journal.LOCK_FILE).exists()
+
+
+class InterleavedTracker(ReadyTracker):
+    """A tracker whose ticket stays ready to every read, as read by runs before any move.
+
+    Claims are kept in the order posted, with ids from 1; `asked` records the status
+    each claims read is asked about, and `moves` each status change.
+    """
+
+    def __init__(self) -> None:
+        """Start with no claim, no claims read and no move."""
+        self.posted: list[str] = []
+        self.asked: list[str] = []
+        self.moves: list[tuple[str, str]] = []
+
+    def claim(self, key: str, task_id: str) -> int:
+        """Keep the claim of `task_id`; return its id."""
+        self.posted.append(task_id)
+        return len(self.posted)
+
+    def claims(self, key: str, status: str) -> tuple[Claim, ...]:
+        """Record `status`; return every claim kept, oldest first."""
+        self.asked.append(status)
+        return tuple(Claim(rank, task) for rank, task in enumerate(self.posted, 1))
+
+    def set_status(self, key: str, status: str) -> None:
+        """Record the change."""
+        self.moves.append((key, status))
+
+
+def test_two_runs_that_both_read_the_ticket_ready_move_it_once(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    tracker = InterleavedTracker()
+    monkeypatch.setattr(cli, "make_tracker", lambda made: tracker)
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    answer = run_mandate(
+        monkeypatch,
+        capsysbinary,
+        encode(valid_input(task_id="task-2")),
+        instance=instance,
+    )
+
+    assert_failed(answer, "task-2", "Ticket 'DEMO-1' is claimed by task 'task-1'.")
+    assert tracker.moves == [("DEMO-1", "In Progress")]
+    assert tracker.asked == ["To Do", "To Do"]
+    assert [line["task_id"] for line in journal_lines(instance)] == [
+        "task-1",
+        "task-1",
+    ]
+
+
+class UnclaimableTracker(ReadyTracker):
+    """A tracker that fails at the claim step `step` with `TrackerError`, or loses the claim."""
+
+    def __init__(self, step: str) -> None:
+        """Keep the step that fails: `claim`, `claims`, or `lost` for a claim not read back."""
+        self.step = step
+        self.moves: list[tuple[str, str]] = []
+
+    def claim(self, key: str, task_id: str) -> int:
+        """Raise when the claim step fails; otherwise return the id 7."""
+        if self.step == "claim":
+            raise TrackerError("twg failed while claiming DEMO-1: timeout")
+        return 7
+
+    def claims(self, key: str, status: str) -> tuple[Claim, ...]:
+        """Raise when the read step fails; otherwise return a claim other than 7."""
+        if self.step == "claims":
+            raise TrackerError(
+                "twg failed while reading the comments of DEMO-1: timeout"
+            )
+        return (Claim(3, "task-0"),)
+
+    def set_status(self, key: str, status: str) -> None:
+        """Record the change."""
+        self.moves.append((key, status))
+
+
+@pytest.mark.parametrize(
+    ("step", "reason"),
+    [
+        (
+            "claim",
+            (
+                "Ticket 'DEMO-1' cannot be claimed for task 'task-1': "
+                "twg failed while claiming DEMO-1: timeout "
+                "The claim may have been posted."
+            ),
+        ),
+        (
+            "claims",
+            (
+                "The claims on ticket 'DEMO-1' cannot be read: "
+                "twg failed while reading the comments of DEMO-1: timeout "
+                "The claim of task 'task-1' was posted."
+            ),
+        ),
+        (
+            "lost",
+            (
+                "The claim of task 'task-1' is not found among the claims on "
+                "ticket 'DEMO-1' since it last entered 'To Do'."
+            ),
+        ),
+    ],
+)
+def test_ticket_that_cannot_be_claimed_is_not_moved_nor_journaled(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    step: str,
+    reason: str,
+) -> None:
+    tracker = UnclaimableTracker(step)
+    monkeypatch.setattr(cli, "make_tracker", lambda made: tracker)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", reason)
+    assert tracker.moves == []
+    assert journal_lines(instance) == []
 
 
 def test_ticket_is_not_moved_when_a_live_run_holds_the_lock(

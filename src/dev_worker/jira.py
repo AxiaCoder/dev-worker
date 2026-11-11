@@ -2,6 +2,9 @@
 
 Each `twg` call is bounded: one that has not answered within `TWG_TIMEOUT_SECONDS`
 (60 seconds) is stopped and raises `TrackerError`.
+
+A claim is a plain-text comment `CLAIM_MARKER` followed by the task_id, such as
+`dev-worker claims this ticket for task task-1`; its id is the comment id.
 """
 
 import json
@@ -11,16 +14,18 @@ import subprocess
 from collections.abc import Sequence
 from typing import Annotated
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import AwareDatetime, BaseModel, Field, ValidationError
 
 from dev_worker.header import _describe
 from dev_worker.instance import Tracker
-from dev_worker.tickets import Blocker, Ticket, TrackerError
+from dev_worker.tickets import Blocker, Claim, Ticket, TrackerError
 
 TICKET_KEY = re.compile(r"[A-Z][A-Z0-9_]*-[0-9]+")
 BLOCKS = "Blocks"
 REDACTED = "[token]"
 TWG_TIMEOUT_SECONDS = 60.0
+CLAIM_MARKER = "dev-worker claims this ticket for task "
+PAGE_SIZE = "100"
 
 
 class _Status(BaseModel):
@@ -70,6 +75,65 @@ class _GetAnswer(BaseModel):
     data: Annotated[list[_Item], Field(min_length=1, max_length=1)]
 
 
+class _CommentId(BaseModel):
+    """The id of a comment, as Jira gives it back when the comment is created."""
+
+    id: int
+
+
+class _CreatedAnswer(BaseModel):
+    """The answer of `twg jira workitem comment create`."""
+
+    data: _CommentId
+
+
+class _PageInfo(BaseModel):
+    """Where the next page of a paged `twg` query starts, if there is one."""
+
+    hasNextPage: bool
+    nextCursor: str | None = None
+
+
+class _Page(BaseModel):
+    """A page of a paged `twg` query."""
+
+    pageInfo: _PageInfo
+
+
+class _Change(BaseModel):
+    """A field change of a changelog entry; `toString` is the new value as text."""
+
+    field: str
+    toString: str | None = None
+
+
+class _History(BaseModel):
+    """A changelog entry: the changes made at one instant."""
+
+    created: AwareDatetime
+    items: list[_Change]
+
+
+class _ChangelogPage(_Page):
+    """A page of `twg jira workitem changelog query`."""
+
+    data: list[_History]
+
+
+class _Comment(BaseModel):
+    """A comment; its body is text or an Atlassian document."""
+
+    id: int
+    created: AwareDatetime
+    body: object = None
+
+
+class _CommentPage(_Page):
+    """A page of `twg jira workitem comment query`."""
+
+    data: list[_Comment]
+
+
 _UNREADABLE = object()
 
 
@@ -79,6 +143,30 @@ def _parse_json(text: str) -> object:
         return json.loads(text)
     except (ValueError, RecursionError):
         return _UNREADABLE
+
+
+def _validate[M: BaseModel](model: type[M], answer: object, action: str) -> M:
+    """Return `answer` read as `model`; raise `TrackerError` naming `action` when it cannot be."""
+    try:
+        return model.model_validate(answer)
+    except ValidationError as error:
+        description = _describe(error, root="answer", echo=False)
+        raise TrackerError(
+            f"the answer of twg to {action} cannot be read: {description}"
+        ) from None
+
+
+def _plain_text(body: object) -> str:
+    """Return the text of a comment body: the string itself, or the text nodes of an Atlassian document."""
+    if isinstance(body, str):
+        return body
+    if isinstance(body, list):
+        return "".join(_plain_text(node) for node in body)
+    if isinstance(body, dict):
+        text = body.get("text")
+        own = text if isinstance(text, str) else ""
+        return own + _plain_text(body.get("content"))
+    return ""
 
 
 def _check_key(key: str) -> None:
@@ -150,6 +238,92 @@ class JiraTracker:
             f"moving {key} to {status!r}",
             ["jira", "workitem", "transition", "--id", key, "--transition-id", status],
         )
+
+    def claim(self, key: str, task_id: str) -> int:
+        """Post on the ticket `key` the claim comment naming `task_id`; return the comment id.
+
+        Raises `TrackerError` when `key` is not a ticket key, the token variable is not set,
+        `twg` fails, or its answer cannot be read. After any `TrackerError` the comment may
+        still have been posted.
+        """
+        _check_key(key)
+        action = f"claiming {key}"
+        answer = self._run(
+            action,
+            [
+                "jira", "workitem", "comment", "create", "--issue-id", key,
+                "--body", f"{CLAIM_MARKER}{task_id}", "--body-format", "plain",
+            ],
+        )  # fmt: skip
+        return _validate(_CreatedAnswer, answer, action).data.id
+
+    def claims(self, key: str, status: str) -> tuple[Claim, ...]:
+        """Return the claims on the ticket `key` since it last entered the status `status`, oldest first.
+
+        The last entry is the latest changelog entry that sets the status to `status`; a
+        claim counts when its comment was created at that instant or after, and every claim
+        counts when there is no such entry. Claims are ordered by comment id. Every page of
+        the changelog and of the comments is read. Raises `TrackerError` when `key` is not a
+        ticket key, the token variable is not set, `twg` fails, or an answer cannot be read.
+        """
+        _check_key(key)
+        changelog = self._pages(
+            f"reading the changelog of {key}",
+            ["jira", "workitem", "changelog", "query", "--issue-id", key],
+            _ChangelogPage,
+        )
+        entries = [
+            history.created
+            for page in changelog
+            for history in page.data
+            if any(
+                change.field == "status" and change.toString == status
+                for change in history.items
+            )
+        ]
+        since = max(entries, default=None)
+        comments = self._pages(
+            f"reading the comments of {key}",
+            [
+                "jira", "workitem", "comment", "query", "--issue-id", key,
+                "--order-by", "created",
+            ],
+            _CommentPage,
+        )  # fmt: skip
+        found: list[Claim] = []
+        for page in comments:
+            for comment in page.data:
+                text = _plain_text(comment.body).strip()
+                if text.startswith(CLAIM_MARKER) and (
+                    since is None or comment.created >= since
+                ):
+                    found.append(Claim(comment.id, text.removeprefix(CLAIM_MARKER)))
+        return tuple(sorted(found, key=lambda claim: claim.claim_id))
+
+    def _pages[P: _Page](
+        self, action: str, arguments: list[str], model: type[P]
+    ) -> list[P]:
+        """Run the paged `twg` query `arguments` page after page; return every page, in order.
+
+        Raises what `_run` raises, and `TrackerError` when a page cannot be read or names
+        a next page without a cursor not given before.
+        """
+        pages: list[P] = []
+        cursors: set[str] = set()
+        cursor: list[str] = []
+        while True:
+            answer = self._run(action, [*arguments, "--first", PAGE_SIZE, *cursor])
+            page = _validate(model, answer, action)
+            pages.append(page)
+            if not page.pageInfo.hasNextPage:
+                return pages
+            following = page.pageInfo.nextCursor
+            if following is None or following in cursors:
+                raise TrackerError(
+                    f"the answer of twg to {action} names a next page without a new cursor"
+                )
+            cursors.add(following)
+            cursor = ["--after", following]
 
     def _token(self) -> str:
         """Return the token held by the variable `token_env` names; raise `TrackerError` if unset."""
