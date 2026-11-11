@@ -23,9 +23,9 @@ ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]*")
 _PATH_COMPONENT = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
 _DOMAIN_COMPONENT = r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
 _DOMAIN = rf"{_DOMAIN_COMPONENT}(?:\.{_DOMAIN_COMPONENT})*"
-_HOST = rf"(?:(?=[^/]*[.:])|(?=localhost[:/])){_DOMAIN}(?::[0-9]+)?"
+_HOST_LIKE = r"(?:[^/]*[.:][^/]*|localhost)/"
 IMAGE_REFERENCE = re.compile(
-    rf"(?:{_HOST}/)?"
+    rf"(?:(?={_HOST_LIKE}){_DOMAIN}(?::[0-9]+)?/|(?!{_HOST_LIKE}))"
     rf"{_PATH_COMPONENT}(?:/{_PATH_COMPONENT})*"
     r"(?::(?P<tag>[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}))?"
     r"(?:@(?P<digest>[A-Za-z][A-Za-z0-9]*:[0-9a-fA-F]{32,}))?"
