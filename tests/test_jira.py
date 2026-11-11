@@ -2,6 +2,7 @@ import json
 import sys
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +10,7 @@ import pytest
 
 from dev_worker.instance import Tracker
 from dev_worker.jira import JiraTracker
-from dev_worker.tickets import Blocker, Ticket, TrackerError
+from dev_worker.tickets import Blocker, Claim, Ticket, TrackerError
 
 FAKE_TWG = Path(__file__).with_name("fake_twg.py")
 TOKEN = "s3cret-token-value"
@@ -480,3 +481,231 @@ def test_check_access_with_twg_missing_raises(record: Path) -> None:
 
     with pytest.raises(TrackerError, match="^twg could not be started: "):
         missing.check_access()
+
+
+def test_claim_posts_the_claim_comment_and_returns_its_id(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, {"ok": True, "data": {"id": "10042", "body": {}}})
+
+    claim_id = tracker().claim("ABC-218", "task-1")
+
+    assert claim_id == 10042
+    called = json.loads(record.read_text(encoding="utf-8"))
+    assert called["argv"] == [
+        "jira", "workitem", "comment", "create", "--issue-id", "ABC-218",
+        "--body", "dev-worker claims this ticket for task task-1",
+        "--body-format", "plain",
+        "--output", "json", "--output-summary", "none",
+    ]  # fmt: skip
+
+
+def test_claim_whose_answer_has_no_comment_id_raises(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, {"ok": True, "data": {}})
+
+    with pytest.raises(TrackerError, match="the answer of twg to claiming ABC-218"):
+        tracker().claim("ABC-218", "task-1")
+
+
+def test_claim_on_a_key_that_is_not_a_ticket_key_is_refused(record: Path) -> None:
+    with pytest.raises(TrackerError, match="is not a Jira ticket key"):
+        tracker().claim("abc-218", "task-1")
+    assert not record.exists()
+
+
+def page(data: list[Any], cursor: str | None = None) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "data": data,
+        "pageInfo": {"hasNextPage": cursor is not None, "nextCursor": cursor},
+    }
+
+
+def history(created: str, *changes: tuple[str, str]) -> dict[str, Any]:
+    return {
+        "id": "1",
+        "created": created,
+        "items": [
+            {"field": field, "fromString": "x", "toString": value}
+            for field, value in changes
+        ],
+    }
+
+
+def adf(text: str) -> dict[str, Any]:
+    return {
+        "type": "doc",
+        "version": 1,
+        "content": [{"type": "paragraph", "content": [{"type": "text", "text": text}]}],
+    }
+
+
+def comment(comment_id: str, created: str, body: object) -> dict[str, Any]:
+    return {"id": comment_id, "created": created, "body": body}
+
+
+def serve_pages(monkeypatch: pytest.MonkeyPatch, *answers: object) -> list[list[str]]:
+    calls: list[list[str]] = []
+    queue = list(answers)
+
+    def run(self: JiraTracker, action: str, arguments: list[str]) -> object:
+        calls.append(arguments)
+        return queue.pop(0)
+
+    monkeypatch.setattr(JiraTracker, "_run", run)
+    return calls
+
+
+def test_claims_count_only_those_since_the_last_entry_in_the_status_oldest_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = serve_pages(
+        monkeypatch,
+        page(
+            [
+                history("2026-11-10T09:00:00.000+0100", ("status", "To Do")),
+                history("2026-11-10T10:00:00.000+0100", ("status", "In Progress")),
+            ],
+            cursor="2",
+        ),
+        page(
+            [
+                history(
+                    "2026-11-11T09:00:00.000+0100",
+                    ("labels", "To Do"),
+                    ("status", "To Do"),
+                ),
+                history("2026-11-11T09:30:00.000+0100", ("labels", "x")),
+            ]
+        ),
+        page(
+            [
+                comment(
+                    "90",
+                    "2026-11-10T09:30:00.000+0100",
+                    adf("dev-worker claims this ticket for task old"),
+                ),
+                comment(
+                    "120",
+                    "2026-11-11T09:00:00.000+0100",
+                    "dev-worker claims this ticket for task task-2",
+                ),
+                comment(
+                    "100",
+                    "2026-11-11T08:00:00.000Z",
+                    [adf("dev-worker claims this ticket for task task-1")],
+                ),
+            ],
+            cursor="3",
+        ),
+        page(
+            [
+                comment("130", "2026-11-11T10:00:00.000+0100", adf("Looks good")),
+                comment("140", "2026-11-11T10:00:00.000+0100", None),
+                comment("150", "2026-11-11T10:00:00.000+0100", {"text": 3}),
+            ]
+        ),
+    )
+
+    claims = tracker().claims("ABC-218", "To Do")
+
+    assert claims == (
+        Claim(100, "task-1", datetime(2026, 11, 11, 8, 0, tzinfo=UTC)),
+        Claim(120, "task-2", datetime(2026, 11, 11, 8, 0, tzinfo=UTC)),
+    )
+    assert calls == [
+        ["jira", "workitem", "changelog", "query", "--issue-id", "ABC-218",
+         "--first", "100"],
+        ["jira", "workitem", "changelog", "query", "--issue-id", "ABC-218",
+         "--first", "100", "--after", "2"],
+        ["jira", "workitem", "comment", "query", "--issue-id", "ABC-218",
+         "--order-by", "created", "--first", "100"],
+        ["jira", "workitem", "comment", "query", "--issue-id", "ABC-218",
+         "--order-by", "created", "--first", "100", "--after", "3"],
+    ]  # fmt: skip
+
+
+def test_claims_of_a_ticket_that_never_entered_the_status_all_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    serve_pages(
+        monkeypatch,
+        page([]),
+        page(
+            [
+                comment(
+                    "90",
+                    "2020-01-01T00:00:00.000Z",
+                    "dev-worker claims this ticket for task task-1",
+                ),
+            ]
+        ),
+    )
+
+    assert tracker().claims("ABC-218", "To Do") == (
+        Claim(90, "task-1", datetime(2020, 1, 1, tzinfo=UTC)),
+    )
+
+
+def test_claims_carry_the_creation_time_of_their_own_comment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    serve_pages(
+        monkeypatch,
+        page([history("2026-11-11T08:00:00.000Z", ("status", "To Do"))]),
+        page(
+            [
+                comment(
+                    "100",
+                    "2026-11-11T08:05:00.000Z",
+                    "dev-worker claims this ticket for task task-1",
+                ),
+                comment(
+                    "110",
+                    "2026-11-11T09:10:30.000+0100",
+                    "dev-worker claims this ticket for task task-2",
+                ),
+            ]
+        ),
+    )
+
+    assert tracker().claims("ABC-218", "To Do") == (
+        Claim(100, "task-1", datetime(2026, 11, 11, 8, 5, tzinfo=UTC)),
+        Claim(110, "task-2", datetime(2026, 11, 11, 8, 10, 30, tzinfo=UTC)),
+    )
+
+
+@pytest.mark.parametrize("cursor", [None, "2"])
+def test_claims_with_a_next_page_and_no_new_cursor_raise(
+    monkeypatch: pytest.MonkeyPatch, cursor: str | None
+) -> None:
+    looping = page([], cursor="2")
+    stuck = {
+        "ok": True,
+        "data": [],
+        "pageInfo": {"hasNextPage": True, "nextCursor": cursor},
+    }
+    serve_pages(monkeypatch, looping, stuck)
+
+    with pytest.raises(TrackerError, match="names a next page without a new cursor"):
+        tracker().claims("ABC-218", "To Do")
+
+
+def test_claims_page_that_cannot_be_read_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    serve_pages(monkeypatch, {"ok": True, "data": []})
+
+    with pytest.raises(
+        TrackerError,
+        match="the answer of twg to reading the changelog of ABC-218 cannot be read",
+    ):
+        tracker().claims("ABC-218", "To Do")
+
+
+def test_claims_on_a_key_that_is_not_a_ticket_key_are_refused(record: Path) -> None:
+    with pytest.raises(TrackerError, match="is not a Jira ticket key"):
+        tracker().claims("abc-218", "To Do")
+    assert not record.exists()
