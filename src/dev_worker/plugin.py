@@ -4,7 +4,8 @@ The checkout is a shallow clone of the tag the `WORKER.md` header names, fetched
 anonymously: inherited credential helpers are cleared and git never prompts. It is
 fetched only when it is missing or is not at that tag of that repository, as read from
 the checkout itself. A new clone is made beside it, in `STAGING_DIRECTORY`, and replaces
-it only once complete, so a fetch that fails leaves the previous checkout as it was.
+it only once complete, so a clone that fails leaves the previous checkout as it was; a
+failure while swapping them leaves no checkout, and the next run fetches it again.
 Every git call is bounded by `GIT_TIMEOUT_SECONDS` (600 seconds).
 """
 

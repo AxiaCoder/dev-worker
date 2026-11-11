@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -206,3 +207,44 @@ def test_git_that_does_not_answer_raises(url: str, instance: Path) -> None:
     assert str(raised.value) == (
         f"git did not answer within 0.5 seconds while cloning the tag v1 of {url}"
     )
+
+
+def test_the_tag_is_cloned_shallow(url: str, instance: Path) -> None:
+    checkout = PluginCheckout(instance).prepare(Plugin(repository=url, tag="v2"))
+
+    assert git("-C", checkout, "rev-parse", "--is-shallow-repository") == "true"
+    assert git("-C", checkout, "rev-list", "--count", "HEAD") == "1"
+
+
+def test_a_lightweight_tag_is_cloned(url: str, instance: Path, tmp_path: Path) -> None:
+    git("-C", tmp_path / "source", "tag", "light", "v1")
+
+    checkout = PluginCheckout(instance).prepare(Plugin(repository=url, tag="light"))
+
+    assert version(checkout) == "v1"
+
+
+def test_git_is_run_without_credential_helpers_nor_prompts(
+    url: str, instance: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorded = tmp_path / "recorded.json"
+    fake = tmp_path / "fake_git.py"
+    fake.write_text(
+        "import json, os, sys\n"
+        "with open(sys.argv[1], 'w', encoding='utf-8') as out:\n"
+        "    json.dump({'argv': sys.argv[2:], 'prompt': os.environ.get("
+        "'GIT_TERMINAL_PROMPT')}, out)\n"
+        "sys.exit(1)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GIT_TERMINAL_PROMPT", "1")
+    recording = PluginCheckout(
+        instance, command=[sys.executable, str(fake), str(recorded)]
+    )
+
+    with pytest.raises(PluginError):
+        recording.prepare(Plugin(repository=url, tag="v1"))
+
+    call = json.loads(recorded.read_text(encoding="utf-8"))
+    assert call["argv"][:3] == ["-c", "credential.helper=", "clone"]
+    assert call["prompt"] == "0"
