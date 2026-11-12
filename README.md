@@ -29,9 +29,11 @@ Real instances and secrets stay outside the repository: the file under `examples
 
 ## Protecting the base branch
 
-Only the worker merges. On GitHub, in the repository's **Settings → Rules → Rulesets**, add a **New branch ruleset** that targets the default branch, turn on **Restrict updates**, and add the worker's identity to its bypass list. The bypass list takes roles, teams and GitHub Apps: for instance, the worker's account holds the Repository admin role and is let through by it, while the agent's account only has Write.
+Only the worker merges, and the guarantee holds only if the worker and the agent are two different GitHub accounts: a token acts with its account's role, so an agent token created on the worker's account would be let through too.
 
-Give the agent a fine-grained token limited to this repository, with **Contents** and **Pull requests** set to read and write. With this rule, a merge attempted with the agent's token is refused.
+On GitHub, in the repository's **Settings → Rules → Rulesets**, add a **New branch ruleset** that targets the default branch, turn on **Restrict updates**, and add the worker's role to its bypass list — for instance Repository admin, held by the worker's account — while the agent's account is a collaborator with Write only.
+
+On a repository owned by a user account, a collaborator cannot use a fine-grained token on it, so the agent's token is a classic token with the `repo` scope; it reaches every repository the agent's account can, so give that account access to this repository only. On a repository owned by an organization the agent's account is a member of, a fine-grained token limited to this repository, with **Contents** and **Pull requests** set to read and write, is enough. With this rule, a merge attempted with the agent's token is refused.
 
 ## Development
 
