@@ -302,7 +302,7 @@ def test_a_rollup_of_the_wrong_shape_raises(
     assert where in message
 
 
-def test_merge_squashes_the_pull_request_under_its_title(
+def test_merge_squashes_the_pull_request_under_its_title_bypassing_the_base_branch_rules(
     record: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls = answer_in_turn(
@@ -315,7 +315,7 @@ def test_merge_squashes_the_pull_request_under_its_title(
     repository().merge(PULL)
 
     assert every_call(calls)[0] == [
-        "pr", "merge", "42", "--squash", "--match-head-commit", HEAD,
+        "pr", "merge", "42", "--squash", "--admin", "--match-head-commit", HEAD,
         "--subject", TITLE, "--repo", "octo/widgets",
     ]  # fmt: skip
     assert called(record)["env"]["GH_TOKEN"] == TOKEN

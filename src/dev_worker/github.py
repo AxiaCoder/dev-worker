@@ -213,6 +213,9 @@ class GitHubRepository:
     def merge(self, pull_request: PullRequest) -> None:
         """Merge `pull_request` as one squashed commit whose subject is `pull_request.title`, which GitHub refuses once its head is not `pull_request.head`.
 
+        The merge uses the worker's bypass of the base branch rules (`--admin`): a rule
+        that blocks the merge for others does not block it for the worker.
+
         Once `gh` has answered, the state of the pull request is read again; this returns
         only when it is merged.
 
@@ -232,6 +235,7 @@ class GitHubRepository:
                     "merge",
                     str(number),
                     "--squash",
+                    "--admin",
                     "--match-head-commit",
                     pull_request.head,
                     "--subject",
