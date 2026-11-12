@@ -37,6 +37,7 @@ from dev_worker.instance import (
     load_instance,
 )
 from dev_worker.jira import JiraTracker
+from dev_worker.outcome import Outcome, read_outcome
 from dev_worker.plugin import PluginCheckout, PluginError
 from dev_worker.repositories import CodeRepository, RepositoryError
 from dev_worker.run_journal import (
@@ -60,6 +61,7 @@ from dev_worker.run_journal import (
     take_lock,
     torn_tail,
 )
+from dev_worker.text import writable_text
 from dev_worker.tickets import Claim, Ticket, TicketTracker, TrackerError
 from dev_worker.validation import describe_validation_error
 from dev_worker.workspace import Workspace, WorkspaceError
@@ -85,21 +87,27 @@ def failed(task_id: str | None, *errors: str) -> MandateOutput:
     )
 
 
-def writable_text(text: str) -> str:
-    """Return `text` with every character UTF-8 cannot encode written as its backslash escape."""
-    return text.encode("utf-8", "backslashreplace").decode("utf-8")
+def deliver_ticket(
+    mandate: MandateInput, instance: Instance, outcome: Outcome
+) -> MandateOutput:
+    """Return the output of the `deliver_ticket` mandate whose run ended on `outcome`.
 
-
-def deliver_ticket(mandate: MandateInput, instance: Instance) -> MandateOutput:
-    """Run the `deliver_ticket` mandate; its body is not built yet, it does nothing."""
-    return MandateOutput(
-        task_id=mandate.task_id,
-        status="completed",
-        summary="Nothing was done: the deliver_ticket mandate has no body yet.",
+    `done` completes it, its message as the summary; any other outcome fails it, the
+    outcome and its message as the error.
+    """
+    if outcome.outcome == "done":
+        return MandateOutput(
+            task_id=mandate.task_id, status="completed", summary=outcome.message
+        )
+    return failed(
+        mandate.task_id,
+        f"The run ended on the outcome {outcome.outcome!r}: {outcome.message}",
     )
 
 
-MANDATES: dict[str, Callable[[MandateInput, Instance], MandateOutput]] = {
+type Handler = Callable[[MandateInput, Instance, Outcome], MandateOutput]
+
+MANDATES: dict[str, Handler] = {
     "deliver_ticket": deliver_ticket,
 }
 
@@ -367,8 +375,62 @@ def take_ticket(
     return None
 
 
+def settle_ticket(
+    key: str,
+    ending: Outcome | str,
+    instance: Instance,
+    worker: WorkerFile,
+    tracker: TicketTracker,
+) -> list[str]:
+    """Comment on the ticket `key` then move it as the run's `ending` says; return why either failed.
+
+    `ending` is the outcome the run ended on, usable, or why it ended without one. An
+    outcome has its message posted and the ticket moved to the real status of the status
+    key the header of `worker` ties it to; a reason is posted and the ticket moved as the
+    `blocked` outcome is. The ticket is moved even when the comment fails, and never to
+    the real status of the `ready` key. After a tracker failure the sentence says whether
+    the comment may have been posted, or that the status is unknown.
+    """
+    if isinstance(ending, Outcome):
+        outcome, body = ending.outcome, ending.message
+    else:
+        outcome, body = "blocked", ending
+    errors: list[str] = []
+    try:
+        tracker.comment(key, body)
+    except TrackerError as error:
+        errors.append(
+            f"Ticket {key!r} cannot be commented on: {error} "
+            "The comment may have been posted."
+        )
+    status = instance.statuses[worker.header.outcomes.model_dump()[outcome]]
+    if status == instance.statuses["ready"]:
+        errors.append(
+            f"Ticket {key!r} was not moved: the outcome {outcome!r} is tied to "
+            f"{status!r}, and a ticket is never moved back to the ready status."
+        )
+        return errors
+    try:
+        tracker.set_status(key, status)
+    except TrackerError as error:
+        errors.append(
+            f"Ticket {key!r} cannot be moved to {status!r}: {error} "
+            "Its status is unknown and is to be read again in the tracker."
+        )
+    return errors
+
+
+def with_errors(output: MandateOutput, errors: Sequence[str]) -> MandateOutput:
+    """Return `output` with `errors` added after its own, each made writable as UTF-8."""
+    if not errors:
+        return output
+    return output.model_copy(
+        update={"errors": [*output.errors, *map(writable_text, errors)]}
+    )
+
+
 def run_journaled(
-    handler: Callable[[MandateInput, Instance], MandateOutput],
+    handler: Handler,
     mandate: MandateInput,
     instance: Instance,
     worker: WorkerFile,
@@ -383,11 +445,12 @@ def run_journaled(
     journal is refused, otherwise the ticket is claimed for the run (see `claim_ticket`)
     and moved to the real status of the `in_progress` key (see `take_ticket`) before the
     run is journaled. A refused run, or one whose ticket cannot be claimed or moved, is
-    not journaled. The lock is
+    not journaled. A run that took its ticket settles it once it ends (see
+    `run_under_lock`). The lock is
     released only if no other run has taken it over meanwhile. Every file error
     becomes a failed output naming the reason, except a lock that cannot be removed:
     the run keeps its status and the reason is added to `errors`. An exception raised
-    by `handler` propagates once the lock is released.
+    by `handler` propagates once the lock is released, the ticket left as it is.
     """
     task_id = mandate.task_id
     refusal = check_ticket_key(mandate, instance)
@@ -446,7 +509,7 @@ def run_journaled(
 
 
 def run_under_lock(
-    handler: Callable[[MandateInput, Instance], MandateOutput],
+    handler: Handler,
     mandate: MandateInput,
     instance: Instance,
     worker: WorkerFile,
@@ -474,6 +537,12 @@ def run_under_lock(
     after a disposable container (see `run_in_worktree`). `start` is the ISO 8601 UTC
     start of the run, written as is in both lines, and `began` the `time.monotonic()`
     reading taken with it. A torn last journal line is first set aside in the torn file.
+
+    Once its ticket is taken, the run settles it before the final line is written (see
+    `settle_ticket`): by the outcome the run ended on when it is usable and its work
+    rescued, as `blocked` with the reason otherwise, a `running` line that cannot be
+    written included. A tracker failure while settling adds its reason to `errors`. An
+    exception raised by `handler` leaves the ticket as it is.
     """
     task_id = mandate.task_id
     try:
@@ -509,12 +578,17 @@ def run_under_lock(
     try:
         append_entry(directory, entry)
     except OSError as error:
-        return failed(
-            task_id, f"Journal in '{directory}' cannot be written: {os_reason(error)}"
+        reason = f"Journal in '{directory}' cannot be written: {os_reason(error)}"
+        return with_errors(
+            failed(task_id, reason),
+            settle_ticket(ticket_key, reason, instance, worker, tracker),
         )
     mandate_began = time.monotonic()
-    output = run_in_worktree(
+    output, ending = run_in_worktree(
         handler, mandate, instance, worker, ticket, directory, began
+    )
+    output = with_errors(
+        output, settle_ticket(ticket_key, ending, instance, worker, tracker)
     )
     entry |= {"status": output.status, "duration": time.monotonic() - mandate_began}
     try:
@@ -534,17 +608,33 @@ def end_worktree(
 ) -> str | None:
     """Rescue then close the worktree of `workspace` on `branch`; return why it failed, or None.
 
+    A worktree whose rescue fails is not closed: it stays on the host, with its local
+    branch, for the next run to rescue (see `rescue_worktree`).
+    """
+    return rescue_worktree(workspace, branch, instance, directory) or close_worktree(
+        workspace, branch
+    )
+
+
+def rescue_worktree(
+    workspace: Workspace, branch: str, instance: Instance, directory: Path
+) -> str | None:
+    """Rescue the work in the worktree of `workspace` on `branch`; return why it failed, or None.
+
     The rescue commits with the git identity of `instance` (see `Workspace.rescue`). It
     fails while a container of the instance kept in `directory` is running, or when
-    Docker cannot tell (see `Container.check_none_running`). A worktree whose rescue
-    fails is not closed: it stays on the host, with its local branch, for the next run
-    to rescue.
+    Docker cannot tell (see `Container.check_none_running`).
     """
     try:
         make_container(instance.container.image, directory).check_none_running()
         workspace.rescue(branch, instance.git)
     except (ContainerError, WorkspaceError) as error:
         return f"The work of the run cannot be rescued, its worktree is kept: {error}"
+    return None
+
+
+def close_worktree(workspace: Workspace, branch: str) -> str | None:
+    """Remove the worktree of `workspace` on `branch` and its local branch; return why it failed, or None."""
     try:
         workspace.close(branch)
     except WorkspaceError as error:
@@ -613,8 +703,8 @@ def run_container(
     began: float,
     worker: WorkerFile,
     ticket: Ticket,
-) -> str | None:
-    """Run the container of `instance` on `worktree` for the time left in the run; return why it failed, or None.
+) -> Outcome | str:
+    """Run the container of `instance` on `worktree` for the time left in the run; return the outcome it ended on, or why there is none.
 
     `directory` is the instance directory of `instance`, `plugin` the plugin checkout
     the container mounts read only. The container runs Claude Code headless on `ticket`
@@ -624,7 +714,8 @@ def run_container(
     is missing.
     `began` is the `time.monotonic()` reading taken when the run started; the time left
     is `run_timeout_seconds` minus the seconds elapsed since. None left: the container
-    is not started.
+    is not started. The outcome is read from what the container wrote (see
+    `read_outcome`); a container that cannot be run, or reaches the ceiling, gives none.
     """
     ceiling = instance.limits["run_timeout_seconds"]
     left = ceiling - (time.monotonic() - began)
@@ -636,31 +727,33 @@ def run_container(
     environment = container_environment(instance)
     if isinstance(environment, str):
         return environment
-    command = agent_command(
-        ticket,
-        worker.body,
-        instance.limits["max_turns"],
-        list(worker.header.outcomes.model_dump()),
-    )
+    outcomes = list(worker.header.outcomes.model_dump())
+    command = agent_command(ticket, worker.body, instance.limits["max_turns"], outcomes)
     try:
-        make_container(instance.container.image, directory).run(
+        exited = make_container(instance.container.image, directory).run(
             worktree, left, plugin, command, environment
         )
     except ContainerError as error:
         return f"The container failed: {error}"
-    return None
+    outcome = read_outcome(exited, outcomes)
+    if isinstance(outcome, str):
+        return f"The run ended without a usable outcome: {outcome}."
+    return outcome
 
 
 def run_in_worktree(
-    handler: Callable[[MandateInput, Instance], MandateOutput],
+    handler: Handler,
     mandate: MandateInput,
     instance: Instance,
     worker: WorkerFile,
     ticket: Ticket,
     directory: Path,
     began: float,
-) -> MandateOutput:
+) -> tuple[MandateOutput, Outcome | str]:
     """Run `handler` once the plugin is prepared, the mirror in `directory` refreshed and a fresh worktree opened.
+
+    Returns the output with how the run ended: the outcome the container ended on when
+    it is usable and the work rescued, else the reasons it is not, joined by a space.
 
     The checkout in `directory` of the plugin the header of `worker` names is prepared first (see
     `PluginCheckout.prepare`); one that cannot be fetched gives a failed output naming
@@ -669,7 +762,8 @@ def run_in_worktree(
     cannot be opened gives a failed output naming the reason, without running
     `handler`. Once opened, the worktree is rescued, then it and its local branch are
     removed, whatever `handler` returns or raises (see `end_worktree`); a rescue or a
-    removal that fails keeps the output, with the reason added to `errors`, or the
+    removal that fails keeps the output, with the reason added to `errors` and, for a
+    rescue, its status set to failed, or the
     exception `handler` raised, with the reason added as a note.
 
     Before `handler`, one disposable container is run from the image of `instance`
@@ -678,9 +772,10 @@ def run_in_worktree(
     and is gone once it ends or
     is removed when the run reaches its `run_timeout_seconds` limit, counted from
     `began`, the `time.monotonic()` reading taken when the run started (see
-    `run_container`); a container that cannot be run, that reaches that limit, or that
-    the run reached it before, gives a failed output naming the reason, without
-    running `handler`.
+    `run_container`); a container that cannot be run, that reaches that limit, that
+    the run reached it before, or that ends without a usable outcome gives a failed
+    output naming the reason, without running `handler`. Otherwise `handler` gets the
+    outcome and gives the output.
     """
     ticket_key = mandate.params["ticket_key"]
     assert isinstance(ticket_key, str)
@@ -688,32 +783,35 @@ def run_in_worktree(
     try:
         checkout = make_plugin(directory).prepare(worker.header.plugin)
     except PluginError as error:
-        return failed(mandate.task_id, f"The plugin cannot be fetched: {error}")
+        reason = f"The plugin cannot be fetched: {error}"
+        return failed(mandate.task_id, reason), reason
     workspace = make_workspace(instance.repository, directory)
     try:
         workspace.refresh()
         workspace.open(branch)
     except WorkspaceError as error:
-        return failed(mandate.task_id, f"The worktree cannot be prepared: {error}")
+        reason = f"The worktree cannot be prepared: {error}"
+        return failed(mandate.task_id, reason), reason
     try:
-        container_error = run_container(
+        ending = run_container(
             instance, directory, workspace.worktree, checkout, began, worker, ticket
         )
-        if container_error is not None:
-            output = failed(mandate.task_id, container_error)
+        if isinstance(ending, str):
+            output = failed(mandate.task_id, ending)
         else:
-            output = handler(mandate, instance)
+            output = handler(mandate, instance, ending)
     except BaseException as error:
         end_error = end_worktree(workspace, branch, instance, directory)
         if end_error is not None:
             error.add_note(end_error)
         raise
-    end_error = end_worktree(workspace, branch, instance, directory)
-    if end_error is not None:
-        return output.model_copy(
-            update={"errors": [*output.errors, writable_text(end_error)]}
-        )
-    return output
+    rescue_error = rescue_worktree(workspace, branch, instance, directory)
+    end_error = rescue_error or close_worktree(workspace, branch)
+    if rescue_error is not None:
+        reasons = [ending, rescue_error] if isinstance(ending, str) else [rescue_error]
+        ending = " ".join(reasons)
+        output = output.model_copy(update={"status": "failed"})
+    return with_errors(output, [end_error] if end_error else []), ending
 
 
 def load_worker() -> WorkerFile:

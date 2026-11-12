@@ -17,12 +17,18 @@ from typing import Any
 import pytest
 
 from dev_worker import cli, run_journal
-from dev_worker.container import Container, ContainerError, agent_command
+from dev_worker.container import (
+    Container,
+    ContainerError,
+    ContainerExit,
+    agent_command,
+)
 from dev_worker.contract import MandateInput, MandateOutput
 from dev_worker.github import GitHubRepository
 from dev_worker.header import HeaderError, Plugin
 from dev_worker.instance import GitIdentity, Instance, Repository, Tracker
 from dev_worker.jira import JiraTracker
+from dev_worker.outcome import Outcome
 from dev_worker.plugin import PluginCheckout, PluginError
 from dev_worker.repositories import RepositoryError
 from dev_worker.tickets import Blocker, Claim, Ticket, TrackerError
@@ -39,6 +45,10 @@ MAKE_PLUGIN = cli.make_plugin
 CHECKOUT = Path("plugin")
 IDENTITY = "12345678+example-worker@users.noreply.github.com"
 RESCUED = ("rescue", "agent/DEMO-1", "Example Worker", IDENTITY)
+SUMMARY = "The login page asks for an email."
+DONE = json.dumps(
+    {"type": "result", "structured_output": {"outcome": "done", "message": SUMMARY}}
+)
 
 
 def valid_input(**overrides: object) -> dict[str, object]:
@@ -89,6 +99,9 @@ class ReadyTracker:
     def claims(self, key: str, status: str) -> tuple[Claim, ...]:
         """Return the claim 1 alone."""
         return (Claim(1, "task-1", CLAIM_EPOCH),)
+
+    def comment(self, key: str, body: str) -> None:
+        """Change nothing."""
 
     def set_status(self, key: str, status: str) -> None:
         """Change nothing."""
@@ -204,6 +217,7 @@ class FakeContainer:
 
     def __init__(self, error: ContainerError | None = None) -> None:
         self.error = error
+        self.exited = ContainerExit(0, DONE, "")
         self.failing: tuple[str, ...] | None = None
         self.images: list[str] = []
         self.directories: list[Path] = []
@@ -233,11 +247,12 @@ class FakeContainer:
         plugin: Path,
         command: Sequence[str],
         environment: Mapping[str, str],
-    ) -> None:
-        """Record the run on `worktree` with `time_left` seconds left and `plugin` mounted, then its command and environment."""
+    ) -> ContainerExit:
+        """Record the run on `worktree` with `time_left` seconds left and `plugin` mounted, then its command and environment; return `exited`."""
         self.commands.append(tuple(command))
         self.environments.append(dict(environment))
         self._step("run", worktree, time_left, plugin)
+        return self.exited
 
     def check_none_running(self) -> None:
         """Record the check that no container of the instance is running."""
@@ -334,7 +349,7 @@ def test_valid_ticket_key_completes_and_journals_the_run(
     assert answer["status"] == "completed"
     assert answer["task_id"] == "task-1"
     assert answer["errors"] == []
-    assert "Nothing was done" in str(answer["summary"])
+    assert answer["summary"] == SUMMARY
     running, line = journal_lines(instance)
     assert running == {
         "task_id": "task-1",
@@ -398,8 +413,9 @@ class StubTracker:
 
     A status change raises `move_error` when one is given; otherwise it becomes the
     status of the ticket later reads answer. `reads` records each key read, `moves` each
-    status change asked, `posted` the task_id of each claim and `trackers` each instance
-    tracker it was made for.
+    status change asked, `posted` the task_id of each claim, `comments` each comment
+    posted, as (key, body), and `trackers` each instance tracker it was made for. A
+    comment raises `comment_error` when one is set.
     """
 
     def __init__(
@@ -412,6 +428,8 @@ class StubTracker:
         self.moves: list[tuple[str, str]] = []
         self.trackers: list[Tracker] = []
         self.posted: list[str] = []
+        self.comments: list[tuple[str, str]] = []
+        self.comment_error: TrackerError | None = None
 
     def make(self, tracker: Tracker) -> "StubTracker":
         """Record `tracker` and return this stub, in place of `cli.make_tracker`."""
@@ -435,6 +453,12 @@ class StubTracker:
         return tuple(
             Claim(rank, task, CLAIM_EPOCH) for rank, task in enumerate(self.posted, 1)
         )
+
+    def comment(self, key: str, body: str) -> None:
+        """Record the comment, then raise `comment_error` when set."""
+        self.comments.append((key, body))
+        if self.comment_error is not None:
+            raise self.comment_error
 
     def set_status(self, key: str, status: str) -> None:
         """Record the change, then raise `move_error` or give the answer `status`."""
@@ -661,8 +685,8 @@ def test_ready_ticket_is_moved_to_in_progress_once_under_the_lock_before_the_jou
     )
 
     assert answer["status"] == "completed"
-    assert stub.moves == [("DEMO-1", "In Progress")]
-    assert seen == [(True, [])]
+    assert stub.moves == [("DEMO-1", "In Progress"), ("DEMO-1", "In Review")]
+    assert seen[0] == (True, [])
 
 
 def test_ticket_is_claimed_under_the_lock_before_it_is_moved_and_the_run_journaled(
@@ -739,8 +763,8 @@ def test_ticket_taken_by_a_run_is_refused_to_a_second_run_under_another_task_id(
         instance=instance,
     )
 
-    assert_failed(answer, "task-2", "is in status 'In Progress', not 'To Do'.")
-    assert stub.moves == [("DEMO-1", "In Progress")]
+    assert_failed(answer, "task-2", "is in status 'In Review', not 'To Do'.")
+    assert stub.moves == [("DEMO-1", "In Progress"), ("DEMO-1", "In Review")]
     assert [line["task_id"] for line in journal_lines(instance)] == [
         "task-1",
         "task-1",
@@ -825,7 +849,7 @@ def test_two_runs_that_both_read_the_ticket_ready_move_it_once(
         "Ticket 'DEMO-1' is claimed by task 'task-1'. "
         "The claim of task 'task-2' was posted.",
     )
-    assert tracker.moves == [("DEMO-1", "In Progress")]
+    assert tracker.moves == [("DEMO-1", "In Progress"), ("DEMO-1", "In Review")]
     assert tracker.asked == ["To Do", "To Do"]
     assert [line["task_id"] for line in journal_lines(instance)] == [
         "task-1",
@@ -1023,7 +1047,7 @@ def test_claim_created_more_than_the_expiry_before_its_own_does_not_block_the_ru
     )
 
     assert answer["status"] == "completed", answer["errors"]
-    assert tracker.moves == [("DEMO-1", "In Progress")]
+    assert tracker.moves == [("DEMO-1", "In Progress"), ("DEMO-1", "In Review")]
 
 
 @pytest.mark.parametrize("age", [1, 600])
@@ -1069,7 +1093,7 @@ def test_losing_claim_does_not_block_the_run_once_the_claim_it_lost_to_expired(
     )
 
     assert answer["status"] == "completed", answer["errors"]
-    assert tracker.moves == [("DEMO-1", "In Progress")]
+    assert tracker.moves == [("DEMO-1", "In Progress"), ("DEMO-1", "In Review")]
 
 
 def test_winning_claim_created_the_expiry_before_its_own_wins_over_a_losing_one(
@@ -1184,7 +1208,7 @@ def test_run_whose_claims_are_read_back_within_the_delay_takes_the_ticket(
     )
 
     assert answer["status"] == "completed", answer["errors"]
-    assert tracker.moves == [("DEMO-1", "In Progress")]
+    assert tracker.moves == [("DEMO-1", "In Progress"), ("DEMO-1", "In Review")]
 
 
 TOO_LATE_TO_MOVE = (
@@ -1258,7 +1282,7 @@ def test_claim_delay_starts_after_the_worktree_left_by_an_earlier_run_is_rescued
     )
 
     assert answer["status"] == "completed", answer["errors"]
-    assert tracker.moves == [("DEMO-1", "In Progress")]
+    assert tracker.moves == [("DEMO-1", "In Progress"), ("DEMO-1", "In Review")]
 
 
 @pytest.mark.parametrize(
@@ -1295,7 +1319,7 @@ def test_run_that_reaches_the_move_within_the_delay_after_its_claim_takes_the_ti
     )
 
     assert answer["status"] == "completed", answer["errors"]
-    assert tracker.moves == [("DEMO-1", "In Progress")]
+    assert tracker.moves == [("DEMO-1", "In Progress"), ("DEMO-1", "In Review")]
 
 
 def test_winning_run_gives_up_a_ticket_read_again_out_of_ready(
@@ -1378,7 +1402,7 @@ def test_ticket_is_not_moved_again_for_a_task_id_already_run(
     answer = run_mandate(monkeypatch, capsysbinary, stdin, instance=instance)
 
     assert_failed(answer, "task-1", "Task 'task-1' has already been run.")
-    assert stub.moves == [("DEMO-1", "In Progress")]
+    assert stub.moves == [("DEMO-1", "In Progress"), ("DEMO-1", "In Review")]
     assert stub.posted == ["task-1"]
 
 
@@ -1460,7 +1484,9 @@ def test_journal_records_the_status_the_mandate_returns(
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
 ) -> None:
-    def refuse(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+    def refuse(
+        mandate: MandateInput, resolved: Instance, outcome: Outcome
+    ) -> MandateOutput:
         return cli.failed(mandate.task_id, "The ticket cannot be delivered.")
 
     monkeypatch.setitem(cli.MANDATES, "deliver_ticket", refuse)
@@ -1517,10 +1543,12 @@ def test_lock_holds_the_run_in_progress(
 ) -> None:
     seen: list[dict[str, object]] = []
 
-    def peek(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+    def peek(
+        mandate: MandateInput, resolved: Instance, outcome: Outcome
+    ) -> MandateOutput:
         lock = instance.with_suffix("") / run_journal.LOCK_FILE
         seen.append(json.loads(lock.read_text(encoding="utf-8")))
-        return cli.deliver_ticket(mandate, resolved)
+        return cli.deliver_ticket(mandate, resolved, outcome)
 
     monkeypatch.setitem(cli.MANDATES, "deliver_ticket", peek)
 
@@ -1539,7 +1567,9 @@ def test_lock_is_released_when_the_mandate_raises(
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
 ) -> None:
-    def explode(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+    def explode(
+        mandate: MandateInput, resolved: Instance, outcome: Outcome
+    ) -> MandateOutput:
         raise RuntimeError("boom")
 
     monkeypatch.setitem(cli.MANDATES, "deliver_ticket", explode)
@@ -1559,9 +1589,11 @@ def test_mandate_runs_in_a_worktree_on_the_ticket_branch_closed_afterwards(
 ) -> None:
     seen: list[list[tuple[str, ...]]] = []
 
-    def peek(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+    def peek(
+        mandate: MandateInput, resolved: Instance, outcome: Outcome
+    ) -> MandateOutput:
         seen.append(list(workspace.calls))
-        return cli.deliver_ticket(mandate, resolved)
+        return cli.deliver_ticket(mandate, resolved, outcome)
 
     monkeypatch.setitem(cli.MANDATES, "deliver_ticket", peek)
 
@@ -1662,9 +1694,11 @@ def test_workspace_that_cannot_be_prepared_fails_naming_why_and_journals_it(
 ) -> None:
     ran: list[str] = []
 
-    def record(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+    def record(
+        mandate: MandateInput, resolved: Instance, outcome: Outcome
+    ) -> MandateOutput:
         ran.append(mandate.task_id)
-        return cli.deliver_ticket(mandate, resolved)
+        return cli.deliver_ticket(mandate, resolved, outcome)
 
     monkeypatch.setitem(cli.MANDATES, "deliver_ticket", record)
     workspace.fail = step
@@ -1692,9 +1726,11 @@ def test_container_runs_from_the_instance_image_on_the_worktree_before_the_manda
 ) -> None:
     seen: list[tuple[list[tuple[str, ...]], list[tuple[object, ...]]]] = []
 
-    def peek(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+    def peek(
+        mandate: MandateInput, resolved: Instance, outcome: Outcome
+    ) -> MandateOutput:
         seen.append((list(workspace.calls), list(container.calls)))
-        return cli.deliver_ticket(mandate, resolved)
+        return cli.deliver_ticket(mandate, resolved, outcome)
 
     monkeypatch.setitem(cli.MANDATES, "deliver_ticket", peek)
     slow_refresh(monkeypatch, workspace, 0)
@@ -1823,9 +1859,11 @@ def test_plugin_that_cannot_be_fetched_fails_the_run_naming_why_before_the_workt
 ) -> None:
     ran: list[str] = []
 
-    def record(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+    def record(
+        mandate: MandateInput, resolved: Instance, outcome: Outcome
+    ) -> MandateOutput:
         ran.append(mandate.task_id)
-        return cli.deliver_ticket(mandate, resolved)
+        return cli.deliver_ticket(mandate, resolved, outcome)
 
     monkeypatch.setitem(cli.MANDATES, "deliver_ticket", record)
     plugin.error = PluginError("git failed while cloning: no such tag")
@@ -1942,9 +1980,11 @@ def test_run_that_reached_its_ceiling_before_the_container_fails_without_startin
 ) -> None:
     ran: list[str] = []
 
-    def record(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+    def record(
+        mandate: MandateInput, resolved: Instance, outcome: Outcome
+    ) -> MandateOutput:
         ran.append(mandate.task_id)
-        return cli.deliver_ticket(mandate, resolved)
+        return cli.deliver_ticket(mandate, resolved, outcome)
 
     monkeypatch.setitem(cli.MANDATES, "deliver_ticket", record)
     slow_refresh(monkeypatch, workspace, seconds)
@@ -1973,9 +2013,11 @@ def test_container_that_fails_fails_the_run_naming_why_without_the_mandate(
 ) -> None:
     ran: list[str] = []
 
-    def record(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+    def record(
+        mandate: MandateInput, resolved: Instance, outcome: Outcome
+    ) -> MandateOutput:
         ran.append(mandate.task_id)
-        return cli.deliver_ticket(mandate, resolved)
+        return cli.deliver_ticket(mandate, resolved, outcome)
 
     monkeypatch.setitem(cli.MANDATES, "deliver_ticket", record)
     container.error = ContainerError("docker failed while running the container: no")
@@ -2008,7 +2050,9 @@ def test_worktree_is_closed_when_the_mandate_fails(
     instance: Path,
     workspace: FakeWorkspace,
 ) -> None:
-    def refuse(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+    def refuse(
+        mandate: MandateInput, resolved: Instance, outcome: Outcome
+    ) -> MandateOutput:
         return cli.failed(mandate.task_id, "refused")
 
     monkeypatch.setitem(cli.MANDATES, "deliver_ticket", refuse)
@@ -2027,7 +2071,9 @@ def test_worktree_is_closed_when_the_mandate_raises(
     instance: Path,
     workspace: FakeWorkspace,
 ) -> None:
-    def explode(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+    def explode(
+        mandate: MandateInput, resolved: Instance, outcome: Outcome
+    ) -> MandateOutput:
         raise RuntimeError("boom")
 
     monkeypatch.setitem(cli.MANDATES, "deliver_ticket", explode)
@@ -2044,7 +2090,9 @@ def test_worktree_that_cannot_be_removed_keeps_the_output_and_reports_it(
     instance: Path,
     workspace: FakeWorkspace,
 ) -> None:
-    def refuse(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+    def refuse(
+        mandate: MandateInput, resolved: Instance, outcome: Outcome
+    ) -> MandateOutput:
         return cli.failed(mandate.task_id, "refused")
 
     monkeypatch.setitem(cli.MANDATES, "deliver_ticket", refuse)
@@ -2067,7 +2115,9 @@ def test_worktree_that_cannot_be_removed_after_the_mandate_raised_notes_why_on_i
     instance: Path,
     workspace: FakeWorkspace,
 ) -> None:
-    def explode(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+    def explode(
+        mandate: MandateInput, resolved: Instance, outcome: Outcome
+    ) -> MandateOutput:
         raise RuntimeError("boom")
 
     monkeypatch.setitem(cli.MANDATES, "deliver_ticket", explode)
@@ -2086,7 +2136,9 @@ def test_rescue_that_fails_keeps_the_reason_the_run_stopped_and_the_worktree(
     instance: Path,
     workspace: FakeWorkspace,
 ) -> None:
-    def refuse(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+    def refuse(
+        mandate: MandateInput, resolved: Instance, outcome: Outcome
+    ) -> MandateOutput:
         return cli.failed(mandate.task_id, "refused")
 
     monkeypatch.setitem(cli.MANDATES, "deliver_ticket", refuse)
@@ -2110,7 +2162,9 @@ def test_rescue_that_fails_after_the_mandate_raised_notes_why_on_it(
     instance: Path,
     workspace: FakeWorkspace,
 ) -> None:
-    def explode(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+    def explode(
+        mandate: MandateInput, resolved: Instance, outcome: Outcome
+    ) -> MandateOutput:
         raise RuntimeError("boom")
 
     monkeypatch.setitem(cli.MANDATES, "deliver_ticket", explode)
@@ -2147,13 +2201,11 @@ def test_worktree_left_by_an_earlier_run_is_rescued_and_removed_before_the_ticke
     )
 
     assert answer["status"] == "completed"
-    assert moved == [
-        [
-            ("left_branch",),
-            ("refresh",),
-            ("rescue", "agent/OLD-7", "Example Worker", IDENTITY),
-            ("close", "agent/OLD-7"),
-        ]
+    assert moved[0] == [
+        ("left_branch",),
+        ("refresh",),
+        ("rescue", "agent/OLD-7", "Example Worker", IDENTITY),
+        ("close", "agent/OLD-7"),
     ]
     assert workspace.calls[4:6] == [("refresh",), ("open", "agent/DEMO-1")]
 
@@ -2217,10 +2269,12 @@ def fake_docker(
     """Make `run` drive `tests/fake_docker.py` in place of Docker; return its record.
 
     Each keyword sets the environment variable `FAKE_DOCKER_<KEYWORD>`, such as
-    `ps_stdout_1` for `FAKE_DOCKER_PS_STDOUT_1`.
+    `ps_stdout_1` for `FAKE_DOCKER_PS_STDOUT_1`. The container writes the `done`
+    outcome `DONE` unless `start_stdout` says otherwise.
     """
     record = tmp_path / "docker.jsonl"
     monkeypatch.setenv("FAKE_DOCKER_RECORD", str(record))
+    monkeypatch.setenv("FAKE_DOCKER_START_STDOUT", DONE)
     for name, value in answers.items():
         monkeypatch.setenv(f"FAKE_DOCKER_{name.upper()}", value)
     monkeypatch.setattr(cli, "make_container", MAKE_CONTAINER)
@@ -2720,9 +2774,11 @@ def test_mandate_is_not_run_when_its_running_line_cannot_be_written(
 ) -> None:
     called: list[str] = []
 
-    def record(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+    def record(
+        mandate: MandateInput, resolved: Instance, outcome: Outcome
+    ) -> MandateOutput:
         called.append(mandate.task_id)
-        return cli.deliver_ticket(mandate, resolved)
+        return cli.deliver_ticket(mandate, resolved, outcome)
 
     def full(directory: Path, entry: object) -> None:
         raise OSError(28, "No space left on device")
@@ -2769,7 +2825,7 @@ def test_final_line_that_cannot_be_written_keeps_the_output_and_reports_it(
 
     directory = instance.with_suffix("")
     assert answer["status"] == "completed"
-    assert "Nothing was done" in str(answer["summary"])
+    assert answer["summary"] == SUMMARY
     assert answer["errors"] == [
         f"Journal in '{directory}' cannot be written: No space left on device"
     ]
@@ -2782,7 +2838,9 @@ def test_final_line_that_cannot_be_written_follows_the_errors_of_the_mandate(
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
 ) -> None:
-    def refuse(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+    def refuse(
+        mandate: MandateInput, resolved: Instance, outcome: Outcome
+    ) -> MandateOutput:
         return cli.failed(mandate.task_id, "The ticket cannot be delivered.")
 
     monkeypatch.setitem(cli.MANDATES, "deliver_ticket", refuse)
@@ -2822,7 +2880,9 @@ def test_task_whose_mandate_raised_is_not_run_again(
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
 ) -> None:
-    def explode(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+    def explode(
+        mandate: MandateInput, resolved: Instance, outcome: Outcome
+    ) -> MandateOutput:
         raise RuntimeError("boom")
 
     with monkeypatch.context() as raising:
@@ -2870,10 +2930,10 @@ def test_run_leaves_the_lock_of_the_run_that_took_it_over_meanwhile(
     lock = instance.with_suffix("") / run_journal.LOCK_FILE
 
     def taken_over_while_running(
-        mandate: MandateInput, resolved: Instance
+        mandate: MandateInput, resolved: Instance, outcome: Outcome
     ) -> MandateOutput:
         lock.write_bytes(successor)
-        return cli.deliver_ticket(mandate, resolved)
+        return cli.deliver_ticket(mandate, resolved, outcome)
 
     monkeypatch.setitem(cli.MANDATES, "deliver_ticket", taken_over_while_running)
 
@@ -3316,9 +3376,11 @@ def test_state_answers_while_a_run_holds_the_lock(
 ) -> None:
     seen: list[dict[str, object]] = []
 
-    def peek(mandate: MandateInput, resolved: Instance) -> MandateOutput:
+    def peek(
+        mandate: MandateInput, resolved: Instance, outcome: Outcome
+    ) -> MandateOutput:
         seen.append(cli.read_state(instance).model_dump(mode="json"))
-        return cli.deliver_ticket(mandate, resolved)
+        return cli.deliver_ticket(mandate, resolved, outcome)
 
     monkeypatch.setitem(cli.MANDATES, "deliver_ticket", peek)
 
@@ -3435,8 +3497,10 @@ def test_state_keeps_the_status_a_finished_run_returned_while_the_lock_is_free(
     instance: Path,
     status: str,
 ) -> None:
-    def still_going(mandate: MandateInput, resolved: Instance) -> MandateOutput:
-        output = cli.deliver_ticket(mandate, resolved)
+    def still_going(
+        mandate: MandateInput, resolved: Instance, outcome: Outcome
+    ) -> MandateOutput:
+        output = cli.deliver_ticket(mandate, resolved, outcome)
         return output.model_copy(update={"status": status})
 
     monkeypatch.setitem(cli.MANDATES, "deliver_ticket", still_going)
@@ -5100,3 +5164,496 @@ def test_health_does_not_check_docker_when_a_connector_cannot_be_reached(
     health(monkeypatch, capsysbinary, instance)
 
     assert container.calls == []
+
+
+IN_PROGRESS = ("DEMO-1", "In Progress")
+IN_REVIEW = ("DEMO-1", "In Review")
+BLOCKED = ("DEMO-1", "Blocked")
+
+
+def ending_on(outcome: str, message: str) -> ContainerExit:
+    """Return how a container ends when Claude Code ends on `outcome` with `message`."""
+    structured = {"outcome": outcome, "message": message}
+    return ContainerExit(
+        0, json.dumps({"subtype": "success", "structured_output": structured}), ""
+    )
+
+
+def test_done_comments_the_summary_then_moves_the_ticket_once_the_work_is_rescued(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    seen: list[list[tuple[str, ...]]] = []
+    post = stub.comment
+
+    def spy(key: str, body: str) -> None:
+        seen.append(list(workspace.calls))
+        post(key, body)
+
+    monkeypatch.setattr(stub, "comment", spy)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed"
+    assert answer["summary"] == SUMMARY
+    assert answer["errors"] == []
+    assert stub.comments == [("DEMO-1", SUMMARY)]
+    assert stub.moves == [IN_PROGRESS, IN_REVIEW]
+    assert seen[0][-2:] == [RESCUED, ("close", "agent/DEMO-1")]
+
+
+@pytest.mark.parametrize("outcome", ["blocked", "needs_human", "abandoned"])
+def test_outcome_other_than_done_comments_the_reason_moves_the_ticket_to_blocked_and_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+    outcome: str,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    container.exited = ending_on(outcome, "The ticket has no acceptance criteria.")
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(
+        answer,
+        "task-1",
+        f"The run ended on the outcome {outcome!r}: "
+        "The ticket has no acceptance criteria.",
+    )
+    assert stub.comments == [("DEMO-1", "The ticket has no acceptance criteria.")]
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
+
+
+@pytest.mark.parametrize(
+    ("exited", "reason"),
+    [
+        pytest.param(
+            ContainerExit(0, "Error: boom", ""),
+            "The run ended without a usable outcome: "
+            "the output of Claude Code is not a JSON object.",
+            id="not-json",
+        ),
+        pytest.param(
+            ContainerExit(
+                1,
+                json.dumps(
+                    {"subtype": "error_max_turns", "is_error": True, "result": "Max."}
+                ),
+                "",
+            ),
+            "The run ended without a usable outcome: Claude Code exited with code 1 "
+            "(subtype error_max_turns, result: Max.).",
+            id="claude-code-fails",
+        ),
+        pytest.param(
+            ending_on("merged", "Done."),
+            "The run ended without a usable outcome: the structured output of "
+            "Claude Code does not match the outcome schema: its outcome 'merged' is "
+            "not one of done, blocked, needs_human, abandoned.",
+            id="off-schema",
+        ),
+    ],
+)
+def test_run_without_a_usable_outcome_comments_why_and_moves_the_ticket_to_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+    exited: ContainerExit,
+    reason: str,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    container.exited = exited
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", reason)
+    assert stub.comments == [("DEMO-1", reason)]
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
+
+
+def test_container_reaching_the_ceiling_comments_why_and_moves_the_ticket_to_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    container.error = ContainerError(
+        "the container dev-worker-1 was still running when the run reached its "
+        "ceiling and was removed"
+    )
+    container.failing = ("run",)
+    reason = f"The container failed: {container.error}"
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", reason)
+    assert stub.comments == [("DEMO-1", reason)]
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
+
+
+def test_plugin_that_cannot_be_fetched_comments_why_and_moves_the_ticket_to_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    plugin: FakePlugin,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    plugin.error = PluginError("git failed while cloning: no such tag")
+    reason = "The plugin cannot be fetched: git failed while cloning: no such tag"
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", reason)
+    assert stub.comments == [("DEMO-1", reason)]
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
+
+
+def test_worktree_that_cannot_be_opened_comments_why_and_moves_the_ticket_to_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    workspace.fail = "open"
+    reason = "The worktree cannot be prepared: open broke"
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", reason)
+    assert stub.comments == [("DEMO-1", reason)]
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
+
+
+def test_missing_token_comments_why_and_moves_the_ticket_to_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN")
+    reason = (
+        "The container was not started: the variable CLAUDE_CODE_OAUTH_TOKEN, which "
+        "should hold the Claude Code token, is not set."
+    )
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", reason)
+    assert stub.comments == [("DEMO-1", reason)]
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
+
+
+def test_ceiling_reached_before_the_container_comments_why_and_moves_the_ticket_to_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    slow_refresh(monkeypatch, workspace, 1800)
+    reason = (
+        "The container was not started: the run ceiling of 1800 seconds "
+        "was reached before it."
+    )
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", reason)
+    assert stub.comments == [("DEMO-1", reason)]
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
+
+
+def test_running_line_that_cannot_be_written_comments_why_and_moves_the_ticket_to_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+
+    def full(directory: Path, entry: object) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(cli, "append_entry", full)
+    reason = (
+        f"Journal in '{instance.with_suffix('')}' cannot be written: "
+        "No space left on device"
+    )
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", reason)
+    assert stub.comments == [("DEMO-1", reason)]
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
+
+
+def test_done_whose_work_cannot_be_rescued_comments_why_and_moves_the_ticket_to_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    workspace.fail = "rescue"
+    reason = "The work of the run cannot be rescued, its worktree is kept: rescue broke"
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "failed"
+    assert answer["errors"] == [reason]
+    assert stub.comments == [("DEMO-1", reason)]
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
+
+
+def test_run_without_outcome_whose_work_cannot_be_rescued_comments_both_reasons(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    container: FakeContainer,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    workspace.fail = "rescue"
+    container.exited = ContainerExit(0, "Error: boom", "")
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    reason = (
+        "The run ended without a usable outcome: the output of Claude Code is "
+        "not a JSON object. The work of the run cannot be rescued, its worktree "
+        "is kept: rescue broke"
+    )
+    assert stub.comments == [("DEMO-1", reason)]
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
+
+
+def test_done_whose_worktree_cannot_be_removed_still_moves_the_ticket_to_review(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    workspace.fail = "close"
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["errors"] == ["The worktree cannot be removed: close broke"]
+    assert stub.comments == [("DEMO-1", SUMMARY)]
+    assert stub.moves == [IN_PROGRESS, IN_REVIEW]
+
+
+def test_comment_that_fails_is_reported_and_the_ticket_is_still_moved(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    stub.comment_error = TrackerError("twg failed while commenting on DEMO-1: timeout")
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed"
+    assert answer["errors"] == [
+        (
+            "Ticket 'DEMO-1' cannot be commented on: twg failed while commenting on "
+            "DEMO-1: timeout The comment may have been posted."
+        )
+    ]
+    assert stub.comments == [("DEMO-1", SUMMARY)]
+    assert stub.moves == [IN_PROGRESS, IN_REVIEW]
+
+
+def test_ticket_that_cannot_be_moved_at_the_end_is_reported_with_its_status_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    move = stub.set_status
+
+    def refuse_review(key: str, status: str) -> None:
+        move(key, status)
+        if status == "In Review":
+            raise TrackerError("twg failed while moving DEMO-1: timeout")
+
+    monkeypatch.setattr(stub, "set_status", refuse_review)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed"
+    assert answer["errors"] == [
+        (
+            "Ticket 'DEMO-1' cannot be moved to 'In Review': twg failed while moving "
+            "DEMO-1: timeout Its status is unknown and is to be read again in the "
+            "tracker."
+        )
+    ]
+    assert stub.comments == [("DEMO-1", SUMMARY)]
+    assert stub.moves == [IN_PROGRESS, IN_REVIEW]
+
+
+def test_ticket_is_commented_on_before_it_is_moved_at_the_end(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    calls: list[str] = []
+    post, move = stub.comment, stub.set_status
+
+    def spy_comment(key: str, body: str) -> None:
+        calls.append("comment")
+        post(key, body)
+
+    def spy_move(key: str, status: str) -> None:
+        calls.append(status)
+        move(key, status)
+
+    monkeypatch.setattr(stub, "comment", spy_comment)
+    monkeypatch.setattr(stub, "set_status", spy_move)
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert calls == ["In Progress", "comment", "In Review"]
+
+
+def test_comment_and_move_that_both_fail_at_the_end_are_both_reported_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    container.exited = ending_on("blocked", "No spec.")
+    stub.comment_error = TrackerError("comment broke.")
+    move = stub.set_status
+
+    def refuse_blocked(key: str, status: str) -> None:
+        move(key, status)
+        if status == "Blocked":
+            raise TrackerError("move broke.")
+
+    monkeypatch.setattr(stub, "set_status", refuse_blocked)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "failed"
+    assert answer["errors"] == [
+        "The run ended on the outcome 'blocked': No spec.",
+        (
+            "Ticket 'DEMO-1' cannot be commented on: comment broke. "
+            "The comment may have been posted."
+        ),
+        (
+            "Ticket 'DEMO-1' cannot be moved to 'Blocked': move broke. "
+            "Its status is unknown and is to be read again in the tracker."
+        ),
+    ]
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
+
+
+def test_ticket_is_never_moved_back_to_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    worker = cli.load_worker()
+    outcomes = worker.header.outcomes.model_copy(update={"done": "ready"})
+    header = worker.header.model_copy(update={"outcomes": outcomes})
+    monkeypatch.setattr(cli, "load_worker", lambda: replace(worker, header=header))
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["errors"] == [
+        (
+            "Ticket 'DEMO-1' was not moved: the outcome 'done' is tied to 'To Do', "
+            "and a ticket is never moved back to the ready status."
+        )
+    ]
+    assert stub.comments == [("DEMO-1", SUMMARY)]
+    assert stub.moves == [IN_PROGRESS]
+
+
+def test_ticket_is_left_as_it_is_when_the_mandate_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+
+    def explode(
+        mandate: MandateInput, resolved: Instance, outcome: Outcome
+    ) -> MandateOutput:
+        raise KeyboardInterrupt
+
+    monkeypatch.setitem(cli.MANDATES, "deliver_ticket", explode)
+
+    with pytest.raises(KeyboardInterrupt):
+        run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert stub.comments == []
+    assert stub.moves == [IN_PROGRESS]
+
+
+@pytest.mark.parametrize("message", ["x\x00y", "x\ud800y"], ids=["nul", "surrogate"])
+def test_done_whose_summary_holds_a_nul_or_a_lone_surrogate_still_comments_moves_and_answers(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+    message: str,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    container.exited = ending_on("done", message)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed"
+    summary = answer["summary"]
+    assert isinstance(summary, str)
+    assert "\x00" not in summary
+    assert [key for key, _ in stub.comments] == ["DEMO-1"]
+    body = stub.comments[0][1]
+    assert "\x00" not in body
+    body.encode("utf-8")
+    assert stub.moves == [IN_PROGRESS, IN_REVIEW]

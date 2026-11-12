@@ -884,10 +884,43 @@ def test_claim_posts_the_claim_comment_and_returns_its_id(
     called = json.loads(record.read_text(encoding="utf-8"))
     assert called["argv"] == [
         "jira", "workitem", "comment", "create", "--issue-id", "ABC-218",
-        "--body", "dev-worker claims this ticket for task task-1",
+        "--body=dev-worker claims this ticket for task task-1",
         "--body-format", "plain",
         "--output", "json", "--output-summary", "none",
     ]  # fmt: skip
+
+
+def test_comment_posts_the_body_as_plain_text_even_when_it_starts_with_a_dash(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, {"ok": True, "data": {"id": "10043", "body": {}}})
+
+    tracker().comment("ABC-218", "- did X: the page asks for an email.")
+
+    called = json.loads(record.read_text(encoding="utf-8"))
+    assert called["argv"] == [
+        "jira", "workitem", "comment", "create", "--issue-id", "ABC-218",
+        "--body=- did X: the page asks for an email.",
+        "--body-format", "plain",
+        "--output", "json", "--output-summary", "none",
+    ]  # fmt: skip
+
+
+def test_comment_whose_answer_cannot_be_read_raises(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, {"ok": True, "data": {}})
+
+    with pytest.raises(
+        TrackerError, match="the answer of twg to commenting on ABC-218"
+    ):
+        tracker().comment("ABC-218", "Done.")
+
+
+def test_comment_on_a_key_that_is_not_a_ticket_key_is_refused(record: Path) -> None:
+    with pytest.raises(TrackerError, match="is not a Jira ticket key"):
+        tracker().comment("abc-218", "Done.")
+    assert not record.exists()
 
 
 def test_claim_whose_answer_has_no_comment_id_raises(
@@ -1099,3 +1132,12 @@ def test_claims_on_a_key_that_is_not_a_ticket_key_are_refused(record: Path) -> N
     with pytest.raises(TrackerError, match="is not a Jira ticket key"):
         tracker().claims("abc-218", "To Do")
     assert not record.exists()
+
+
+def test_comment_whose_body_holds_a_nul_raises_a_tracker_error(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, {"ok": True, "data": {"id": "10043", "body": {}}})
+
+    with pytest.raises(TrackerError):
+        tracker().comment("ABC-218", "x\x00y")
