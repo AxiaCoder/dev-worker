@@ -39,7 +39,7 @@ from dev_worker.instance import (
 from dev_worker.jira import JiraTracker
 from dev_worker.outcome import Outcome, read_outcome
 from dev_worker.plugin import PluginCheckout, PluginError
-from dev_worker.repositories import CodeRepository, RepositoryError
+from dev_worker.repositories import CodeRepository, HeadMovedError, RepositoryError
 from dev_worker.run_journal import (
     GUARD_FILE,
     JOURNAL_FILE,
@@ -375,26 +375,104 @@ def take_ticket(
     return None
 
 
+def run_branch(instance: Instance, key: str) -> str:
+    """Return the branch the `branch` template of `instance` names for the ticket `key`."""
+    return instance.branch.replace("{key}", key)
+
+
+def land_done(
+    key: str,
+    summary: str,
+    instance: Instance,
+    worker: WorkerFile,
+    tracker: TicketTracker,
+) -> tuple[str, str, str | None]:
+    """Merge the pull request of a run on the ticket `key` that ended on `done`; return the status key the ticket goes to, the body of its comment and why it is blocked.
+
+    The open pull request whose head is the run branch (see `run_branch`) is found, its
+    CI read once, the ticket read again through `tracker`, then the pull request merged
+    as one squashed commit under its title. The status key is `done` once merged; the one
+    the header of `worker` ties the `done` outcome to when the ticket carries the
+    `hold_merge_label` of `instance`, the pull request left open; the one it ties
+    `blocked` to when there is no pull request, its CI has not passed, or a step fails,
+    nothing retried. The body is `summary` followed by what happened; after a merge that
+    failed for a reason other than a moved head, it says the merge may have happened.
+    The reason the ticket is blocked is `None` unless it goes to the `blocked` status key.
+    """
+    outcomes = worker.header.outcomes
+
+    def blocked(reason: str) -> tuple[str, str, str]:
+        """Return the landing of a ticket blocked for `reason`."""
+        return (
+            outcomes.blocked,
+            f"{summary}\n\nThe ticket is blocked: {reason}",
+            reason,
+        )
+
+    branch = run_branch(instance, key)
+    repository = make_repository(instance.repository)
+    try:
+        pull_request = repository.find_pull_request(branch)
+        if pull_request is None:
+            return blocked(f"no open pull request has the branch {branch} as its head.")
+        ci = repository.read_ci(pull_request)
+        if ci != "passed":
+            state = "failed" if ci == "failed" else "has not finished"
+            return blocked(
+                f"the CI of the pull request {pull_request.url} {state}; it was not "
+                "merged."
+            )
+        held = instance.hold_merge_label in tracker.read(key).labels
+    except (RepositoryError, TrackerError) as error:
+        return blocked(str(error))
+    if held:
+        left_open = (
+            f"{summary}\n\nThe pull request {pull_request.url} is left open: the "
+            f"ticket carries the label {instance.hold_merge_label!r}, which holds its "
+            "merge back."
+        )
+        return outcomes.done, left_open, None
+    try:
+        repository.merge(pull_request)
+    except HeadMovedError as error:
+        return blocked(str(error))
+    except RepositoryError as error:
+        return blocked(
+            f"the pull request {pull_request.url} cannot be merged: {error} It may "
+            "have been merged and is to be read again."
+        )
+    return "done", f"{summary}\n\nMerged: {pull_request.url}", None
+
+
 def settle_ticket(
     key: str,
     ending: Outcome | str,
     instance: Instance,
     worker: WorkerFile,
     tracker: TicketTracker,
-) -> list[str]:
-    """Comment on the ticket `key` then move it as the run's `ending` says; return why either failed.
+) -> tuple[str | None, list[str]]:
+    """Comment on the ticket `key` then move it as the run's `ending` says; return why a `done` run left it blocked, and why either step failed.
 
-    `ending` is the outcome the run ended on, usable, or why it ended without one. An
-    outcome has its message posted and the ticket moved to the real status of the status
-    key the header of `worker` ties it to; a reason is posted and the ticket moved as the
-    `blocked` outcome is. The ticket is moved even when the comment fails, and never to
-    the real status of the `ready` key. After a tracker failure the sentence says whether
-    the comment may have been posted, or that the status is unknown.
+    `ending` is the outcome the run ended on, usable, or why it ended without one. The
+    `done` outcome first has its pull request merged, and the ticket is commented on and
+    moved as `land_done` says. Any other outcome has its message posted and the ticket
+    moved to the real status of the status key the header of `worker` ties it to; a
+    reason is posted and the ticket moved as the `blocked` outcome is. The ticket is
+    moved even when the comment fails, and never to the real status of the `ready` key.
+    After a tracker failure the sentence says whether the comment may have been posted,
+    or that the status is unknown. The reason a `done` run left the ticket blocked is the
+    one `land_done` gives, `None` for any other ending.
     """
-    if isinstance(ending, Outcome):
-        outcome, body = ending.outcome, ending.message
+    tied = worker.header.outcomes.model_dump()
+    blocking: str | None = None
+    if isinstance(ending, Outcome) and ending.outcome == "done":
+        status_key, body, blocking = land_done(
+            key, ending.message, instance, worker, tracker
+        )
+    elif isinstance(ending, Outcome):
+        status_key, body = tied[ending.outcome], ending.message
     else:
-        outcome, body = "blocked", ending
+        status_key, body = tied["blocked"], ending
     errors: list[str] = []
     try:
         tracker.comment(key, body)
@@ -403,13 +481,13 @@ def settle_ticket(
             f"Ticket {key!r} cannot be commented on: {error} "
             "The comment may have been posted."
         )
-    status = instance.statuses[worker.header.outcomes.model_dump()[outcome]]
+    status = instance.statuses[status_key]
     if status == instance.statuses["ready"]:
         errors.append(
-            f"Ticket {key!r} was not moved: the outcome {outcome!r} is tied to "
-            f"{status!r}, and a ticket is never moved back to the ready status."
+            f"Ticket {key!r} was not moved: the run ended tied to {status!r}, and a "
+            "ticket is never moved back to the ready status."
         )
-        return errors
+        return blocking, errors
     try:
         tracker.set_status(key, status)
     except TrackerError as error:
@@ -417,7 +495,7 @@ def settle_ticket(
             f"Ticket {key!r} cannot be moved to {status!r}: {error} "
             "Its status is unknown and is to be read again in the tracker."
         )
-    return errors
+    return blocking, errors
 
 
 def with_errors(output: MandateOutput, errors: Sequence[str]) -> MandateOutput:
@@ -541,8 +619,11 @@ def run_under_lock(
     Once its ticket is taken, the run settles it before the final line is written (see
     `settle_ticket`): by the outcome the run ended on when it is usable and its work
     rescued, as `blocked` with the reason otherwise, a `running` line that cannot be
-    written included. A tracker failure while settling adds its reason to `errors`. An
-    exception raised by `handler` leaves the ticket as it is.
+    written included. A run that ended on `done` but whose ticket is left blocked fails,
+    the reason as its first error ahead of the errors its output already carried, and
+    is journaled `failed`. A tracker failure while
+    settling adds its reason to `errors`. An exception raised by `handler` leaves the
+    ticket as it is.
     """
     task_id = mandate.task_id
     try:
@@ -579,17 +660,20 @@ def run_under_lock(
         append_entry(directory, entry)
     except OSError as error:
         reason = f"Journal in '{directory}' cannot be written: {os_reason(error)}"
-        return with_errors(
-            failed(task_id, reason),
-            settle_ticket(ticket_key, reason, instance, worker, tracker),
-        )
+        _, errors = settle_ticket(ticket_key, reason, instance, worker, tracker)
+        return with_errors(failed(task_id, reason), errors)
     mandate_began = time.monotonic()
     output, ending = run_in_worktree(
         handler, mandate, instance, worker, ticket, directory, began
     )
-    output = with_errors(
-        output, settle_ticket(ticket_key, ending, instance, worker, tracker)
-    )
+    blocking, errors = settle_ticket(ticket_key, ending, instance, worker, tracker)
+    if blocking is not None:
+        output = failed(
+            task_id,
+            f"The run ended on 'done' but its ticket is blocked: {blocking}",
+            *output.errors,
+        )
+    output = with_errors(output, errors)
     entry |= {"status": output.status, "duration": time.monotonic() - mandate_began}
     try:
         append_entry(directory, entry)
@@ -779,7 +863,7 @@ def run_in_worktree(
     """
     ticket_key = mandate.params["ticket_key"]
     assert isinstance(ticket_key, str)
-    branch = instance.branch.replace("{key}", ticket_key)
+    branch = run_branch(instance, ticket_key)
     try:
         checkout = make_plugin(directory).prepare(worker.header.plugin)
     except PluginError as error:

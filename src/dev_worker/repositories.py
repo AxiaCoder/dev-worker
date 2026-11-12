@@ -23,14 +23,16 @@ class HeadMovedError(RepositoryError):
 
 @dataclass(frozen=True)
 class PullRequest:
-    """An open pull request, by its number, its web address and the commit its head pointed to when found.
+    """An open pull request, by its number, its web address, its title and the commit its head pointed to when found.
 
     `head` is the full SHA of that commit; the CI read and the merge are tied to it.
+    `title` is the subject of the squashed commit the merge makes.
     """
 
     number: int
     url: str
     head: str
+    title: str
 
 
 class CodeRepository(Protocol):
@@ -56,7 +58,7 @@ class CodeRepository(Protocol):
         ...
 
     def merge(self, pull_request: PullRequest) -> None:
-        """Merge `pull_request` as a single squashed commit, only while its head is still `pull_request.head`.
+        """Merge `pull_request` as a single squashed commit titled `pull_request.title`, only while its head is still `pull_request.head`.
 
         Raises `HeadMovedError` when the head has moved: nothing was merged.
         Raises `RepositoryError` on any other failure; after it the merge may still have
