@@ -39,7 +39,7 @@ from dev_worker.instance import (
 from dev_worker.jira import JiraTracker
 from dev_worker.outcome import Outcome, read_outcome
 from dev_worker.plugin import PluginCheckout, PluginError
-from dev_worker.repositories import CodeRepository, RepositoryError
+from dev_worker.repositories import CodeRepository, HeadMovedError, RepositoryError
 from dev_worker.run_journal import (
     GUARD_FILE,
     JOURNAL_FILE,
@@ -375,6 +375,68 @@ def take_ticket(
     return None
 
 
+def run_branch(instance: Instance, key: str) -> str:
+    """Return the branch the `branch` template of `instance` names for the ticket `key`."""
+    return instance.branch.replace("{key}", key)
+
+
+def land_done(
+    key: str,
+    summary: str,
+    instance: Instance,
+    worker: WorkerFile,
+    tracker: TicketTracker,
+) -> tuple[str, str]:
+    """Merge the pull request of a run on the ticket `key` that ended on `done`; return the status key the ticket goes to and the body of its comment.
+
+    The open pull request whose head is the run branch (see `run_branch`) is found, its
+    CI read once, the ticket read again through `tracker`, then the pull request merged
+    as one squashed commit under its title. The status key is `done` once merged; the one
+    the header of `worker` ties the `done` outcome to when the ticket carries the
+    `hold_merge_label` of `instance`, the pull request left open; the one it ties
+    `blocked` to when there is no pull request, its CI has not passed, or a step fails,
+    nothing retried. The body is `summary` followed by what happened; after a merge that
+    failed for a reason other than a moved head, it says the merge may have happened.
+    """
+    outcomes = worker.header.outcomes
+    branch = run_branch(instance, key)
+    repository = make_repository(instance.repository)
+    try:
+        pull_request = repository.find_pull_request(branch)
+        if pull_request is None:
+            return outcomes.blocked, (
+                f"{summary}\n\nThe ticket is blocked: no open pull request has the "
+                f"branch {branch} as its head."
+            )
+        ci = repository.read_ci(pull_request)
+        if ci != "passed":
+            state = "failed" if ci == "failed" else "has not finished"
+            return outcomes.blocked, (
+                f"{summary}\n\nThe ticket is blocked: the CI of the pull request "
+                f"{pull_request.url} {state}; it was not merged."
+            )
+        held = instance.hold_merge_label in tracker.read(key).labels
+    except (RepositoryError, TrackerError) as error:
+        return outcomes.blocked, f"{summary}\n\nThe ticket is blocked: {error}"
+    if held:
+        return outcomes.done, (
+            f"{summary}\n\nThe pull request {pull_request.url} is left open: the "
+            f"ticket carries the label {instance.hold_merge_label!r}, which holds its "
+            "merge back."
+        )
+    try:
+        repository.merge(pull_request)
+    except HeadMovedError as error:
+        return outcomes.blocked, f"{summary}\n\nThe ticket is blocked: {error}"
+    except RepositoryError as error:
+        return outcomes.blocked, (
+            f"{summary}\n\nThe ticket is blocked: the pull request {pull_request.url} "
+            f"cannot be merged: {error} It may have been merged and is to be read "
+            "again."
+        )
+    return "done", f"{summary}\n\nMerged: {pull_request.url}"
+
+
 def settle_ticket(
     key: str,
     ending: Outcome | str,
@@ -384,17 +446,22 @@ def settle_ticket(
 ) -> list[str]:
     """Comment on the ticket `key` then move it as the run's `ending` says; return why either failed.
 
-    `ending` is the outcome the run ended on, usable, or why it ended without one. An
-    outcome has its message posted and the ticket moved to the real status of the status
-    key the header of `worker` ties it to; a reason is posted and the ticket moved as the
-    `blocked` outcome is. The ticket is moved even when the comment fails, and never to
-    the real status of the `ready` key. After a tracker failure the sentence says whether
-    the comment may have been posted, or that the status is unknown.
+    `ending` is the outcome the run ended on, usable, or why it ended without one. The
+    `done` outcome first has its pull request merged, and the ticket is commented on and
+    moved as `land_done` says. Any other outcome has its message posted and the ticket
+    moved to the real status of the status key the header of `worker` ties it to; a
+    reason is posted and the ticket moved as the `blocked` outcome is. The ticket is
+    moved even when the comment fails, and never to the real status of the `ready` key.
+    After a tracker failure the sentence says whether the comment may have been posted,
+    or that the status is unknown.
     """
-    if isinstance(ending, Outcome):
-        outcome, body = ending.outcome, ending.message
+    tied = worker.header.outcomes.model_dump()
+    if isinstance(ending, Outcome) and ending.outcome == "done":
+        status_key, body = land_done(key, ending.message, instance, worker, tracker)
+    elif isinstance(ending, Outcome):
+        status_key, body = tied[ending.outcome], ending.message
     else:
-        outcome, body = "blocked", ending
+        status_key, body = tied["blocked"], ending
     errors: list[str] = []
     try:
         tracker.comment(key, body)
@@ -403,11 +470,11 @@ def settle_ticket(
             f"Ticket {key!r} cannot be commented on: {error} "
             "The comment may have been posted."
         )
-    status = instance.statuses[worker.header.outcomes.model_dump()[outcome]]
+    status = instance.statuses[status_key]
     if status == instance.statuses["ready"]:
         errors.append(
-            f"Ticket {key!r} was not moved: the outcome {outcome!r} is tied to "
-            f"{status!r}, and a ticket is never moved back to the ready status."
+            f"Ticket {key!r} was not moved: the run ended tied to {status!r}, and a "
+            "ticket is never moved back to the ready status."
         )
         return errors
     try:
@@ -779,7 +846,7 @@ def run_in_worktree(
     """
     ticket_key = mandate.params["ticket_key"]
     assert isinstance(ticket_key, str)
-    branch = instance.branch.replace("{key}", ticket_key)
+    branch = run_branch(instance, ticket_key)
     try:
         checkout = make_plugin(directory).prepare(worker.header.plugin)
     except PluginError as error:

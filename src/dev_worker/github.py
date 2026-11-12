@@ -37,11 +37,12 @@ STATUS_STATES: dict[str, CiState] = {
 
 
 class _ListedPullRequest(BaseModel):
-    """A pull request as `gh pr list --json number,url,headRefOid` writes it."""
+    """A pull request as `gh pr list --json number,url,headRefOid,title` writes it."""
 
     number: int
     url: str
     headRefOid: str
+    title: str
 
 
 _LIST_ANSWER = TypeAdapter(list[_ListedPullRequest])
@@ -142,7 +143,7 @@ class GitHubRepository:
                 "--state",
                 "open",
                 "--json",
-                "number,url,headRefOid",
+                "number,url,headRefOid,title",
             ],
         )
         try:
@@ -157,7 +158,12 @@ class GitHubRepository:
                 f"the branch {branch} has more than one open pull request: {numbers}"
             )
         found = listed[0]
-        return PullRequest(number=found.number, url=found.url, head=found.headRefOid)
+        return PullRequest(
+            number=found.number,
+            url=found.url,
+            head=found.headRefOid,
+            title=found.title,
+        )
 
     def read_ci(self, pull_request: PullRequest) -> CiState:
         """Return `"failed"` when a check failed, else `"running"` when one still runs, else `"passed"`.
@@ -193,7 +199,7 @@ class GitHubRepository:
         return "passed"
 
     def merge(self, pull_request: PullRequest) -> None:
-        """Merge `pull_request` as one squashed commit, which GitHub refuses once its head is not `pull_request.head`.
+        """Merge `pull_request` as one squashed commit whose subject is `pull_request.title`, which GitHub refuses once its head is not `pull_request.head`.
 
         On a base branch that requires a merge queue, `gh` only enqueues the pull request,
         and this returns as if it were merged.
@@ -214,6 +220,8 @@ class GitHubRepository:
                     "--squash",
                     "--match-head-commit",
                     pull_request.head,
+                    "--subject",
+                    pull_request.title,
                 ],
             )
         except RepositoryError as error:
