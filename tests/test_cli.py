@@ -36,6 +36,7 @@ from dev_worker.repositories import (
     PullRequest,
     RepositoryError,
 )
+from dev_worker.text import writable_text
 from dev_worker.tickets import Blocker, Claim, Ticket, TrackerError
 from dev_worker.workspace import Workspace, WorkspaceError
 
@@ -5594,6 +5595,28 @@ def test_container_reaching_the_ceiling_comments_why_and_moves_the_ticket_to_blo
 
     assert_failed(answer, "task-1", reason)
     assert stub.comments == [("DEMO-1", reason)]
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
+
+
+@pytest.mark.parametrize("message", ["x\x00y", "x\ud800y"], ids=["nul", "surrogate"])
+def test_container_failing_with_a_nul_or_a_lone_surrogate_comments_a_writable_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+    message: str,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    container.error = ContainerError(message)
+    container.failing = ("run",)
+    reason = f"The container failed: {container.error}"
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert stub.comments == [("DEMO-1", writable_text(reason))]
+    body = stub.comments[0][1]
+    assert "\x00" not in body
+    body.encode("utf-8")
     assert stub.moves == [IN_PROGRESS, BLOCKED]
 
 

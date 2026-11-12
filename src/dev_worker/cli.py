@@ -455,7 +455,8 @@ def settle_ticket(
 
     `ending` is the outcome the run ended on, usable, or why it ended without one. The
     `done` outcome first has its pull request merged, and the ticket is commented on and
-    moved as `land_done` says. Any other outcome has its message posted and the ticket
+    moved as `land_done` says. The comment is made writable as UTF-8 whatever it
+    carries. Any other outcome has its message posted and the ticket
     moved to the real status of the status key the header of `worker` ties it to; a
     reason is posted and the ticket moved as the `blocked` outcome is. The ticket is
     moved even when the comment fails, and never to the real status of the `ready` key.
@@ -475,7 +476,7 @@ def settle_ticket(
         status_key, body = tied["blocked"], ending
     errors: list[str] = []
     try:
-        tracker.comment(key, body)
+        tracker.comment(key, writable_text(body))
     except TrackerError as error:
         errors.append(
             f"Ticket {key!r} cannot be commented on: {error} "
