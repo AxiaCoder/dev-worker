@@ -349,6 +349,72 @@ def test_a_ticket_without_description_has_an_empty_one(
     assert tracker().read("ABC-218").description == ""
 
 
+def test_a_description_written_as_a_string_is_kept_as_it_is(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, {"data": [{**ITEM, "description": "  Line one\n\nLine two\n"}]})
+
+    assert tracker().read("ABC-218").description == "  Line one\n\nLine two\n"
+
+
+def test_a_description_ending_on_a_hard_break_or_holding_unknown_nodes_keeps_only_its_text(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    document = {
+        "type": "doc",
+        "content": [
+            {
+                "type": "orderedList",
+                "content": [
+                    {
+                        "type": "listItem",
+                        "content": [
+                            {
+                                "type": "bulletList",
+                                "content": [
+                                    {
+                                        "type": "listItem",
+                                        "content": [
+                                            {
+                                                "type": "paragraph",
+                                                "content": [
+                                                    {"type": "text", "text": "deep"}
+                                                ],
+                                            }
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "type": "paragraph",
+                "content": [
+                    {"type": "mention", "attrs": {"id": "1"}},
+                    {"type": "text", "text": 42},
+                    {"type": "text", "text": "end"},
+                    "stray",
+                    {"type": "hardBreak"},
+                ],
+            },
+        ],
+    }
+    answer(monkeypatch, {"data": [{**ITEM, "description": document}]})
+
+    assert tracker().read("ABC-218").description == "deep\nend"
+
+
+@pytest.mark.parametrize("description", [42, ["a"], True])
+def test_a_description_neither_text_nor_a_document_is_read_as_empty(
+    record: Path, monkeypatch: pytest.MonkeyPatch, description: object
+) -> None:
+    answer(monkeypatch, {"data": [{**ITEM, "description": description}]})
+
+    assert tracker().read("ABC-218").description == ""
+
+
 def test_a_ticket_that_only_blocks_others_has_no_blockers(
     record: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

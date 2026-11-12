@@ -72,6 +72,7 @@ def test_valid_instance_loads(tmp_path: Path) -> None:
     assert instance.tracker.token_env == "JIRA_TOKEN"
     assert instance.repository.name == "example/project"
     assert instance.repository.token_env == "GITHUB_TOKEN"
+    assert instance.agent.token_env == "CLAUDE_CODE_OAUTH_TOKEN"
     assert instance.statuses == {
         "ready": "To Do",
         "in_progress": "In Progress",
@@ -228,7 +229,12 @@ def test_every_problem_is_reported(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("section", "variable"), [("tracker", "JIRA_TOKEN"), ("repository", "GITHUB_TOKEN")]
+    ("section", "variable"),
+    [
+        ("tracker", "JIRA_TOKEN"),
+        ("repository", "GITHUB_TOKEN"),
+        ("agent", "CLAUDE_CODE_OAUTH_TOKEN"),
+    ],
 )
 @pytest.mark.parametrize(
     "value", ["ghp_abcdef0123456789", "jira_token", "1TOKEN", "JIRA-TOKEN", "''"]
@@ -328,6 +334,17 @@ def test_status_name_with_surrounding_blanks_is_kept_as_written(
             "hold_merge_label: Field required",
         ),
         (VALID.split("statuses:")[0], "statuses: Field required"),
+        (
+            VALID.replace("agent:\n  token_env: CLAUDE_CODE_OAUTH_TOKEN\n", ""),
+            "agent: Field required",
+        ),
+        (
+            VALID.replace(
+                "  token_env: CLAUDE_CODE_OAUTH_TOKEN\n",
+                "  token_env: CLAUDE_CODE_OAUTH_TOKEN\n  model: x\n",
+            ),
+            "agent.model: Extra inputs",
+        ),
     ],
 )
 def test_extra_or_missing_key_is_refused(
@@ -365,6 +382,12 @@ SECRET = "ghp_secret0123456789"
         (
             VALID.replace("  token_env: GITHUB_TOKEN\n", f"  token: {SECRET}\n"),
             "repository.token",
+        ),
+        (
+            VALID.replace(
+                "  token_env: CLAUDE_CODE_OAUTH_TOKEN\n", f"  token: {SECRET}\n"
+            ),
+            "agent.token",
         ),
         (VALID + f"token: {SECRET}\n", "token"),
         (VALID.replace("type: jira", f"type: {SECRET}"), "tracker.type"),

@@ -165,6 +165,30 @@ def test_run_passes_each_variable_by_name_only_and_its_value_through_docker_envi
     assert json.loads(probe.read_text("utf-8")) == environment
 
 
+def test_run_hands_the_container_no_variable_of_the_worker_but_those_it_names(
+    record: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WORKER_ONLY_SECRET", "s3cret-worker")
+    environment = {"CLAUDE_CODE_OAUTH_TOKEN": "s3cret-agent"}
+
+    container().run(tmp_path, 60, PLUGIN, COMMAND, environment)
+
+    _, create, _ = calls(record)
+    options = create[: create.index(IMAGE)]
+    assert [
+        options[index + 1] for index, option in enumerate(options) if option == "--env"
+    ] == ["CLAUDE_CODE_OAUTH_TOKEN"]
+    assert not any(
+        option in ("-e", "--env-file") or option.startswith("--env=")
+        for option in options
+    )
+    assert not any(
+        secret in argument
+        for argument in create
+        for secret in ("s3cret-agent", "s3cret-worker", "WORKER_ONLY_SECRET")
+    )
+
+
 def test_ticket_prompt_holds_the_key_title_and_description() -> None:
     assert ticket_prompt(TICKET) == (
         "Ticket: ABC-1\n"

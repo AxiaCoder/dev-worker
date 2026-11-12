@@ -1759,6 +1759,7 @@ def test_container_runs_claude_on_the_ticket_with_the_worker_rules_and_only_the_
         ("JIRA_TOKEN", "Jira"),
     ],
 )
+@pytest.mark.parametrize("unset", [True, False], ids=["unset", "empty"])
 def test_a_token_variable_unset_fails_the_run_naming_it_without_starting_the_container(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
@@ -1766,8 +1767,12 @@ def test_a_token_variable_unset_fails_the_run_naming_it_without_starting_the_con
     container: FakeContainer,
     variable: str,
     service: str,
+    unset: bool,
 ) -> None:
-    monkeypatch.setenv(variable, "")
+    if unset:
+        monkeypatch.delenv(variable)
+    else:
+        monkeypatch.setenv(variable, "")
 
     answer = run_mandate(
         monkeypatch, capsysbinary, encode(valid_input()), instance=instance
