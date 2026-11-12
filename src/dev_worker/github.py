@@ -249,8 +249,8 @@ class GitHubRepository:
             raise self._unreadable(action, error) from None
         if state != MERGED:
             raise RepositoryError(
-                f"pull request #{number} is not merged after gh merged it: its state "
-                f"is {state}; a merge queue may hold it"
+                f"pull request #{number} is not merged once gh answered: its state "
+                f"is {state}; a merge queue may hold it."
             )
 
     def _token(self) -> str:

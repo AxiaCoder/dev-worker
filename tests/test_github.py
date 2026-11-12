@@ -3,6 +3,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -68,24 +69,31 @@ def answer_in_turn(
 ) -> Path:
     """Have the fake answer each call with the next of `answers`, and return the log of calls.
 
-    An answer is the stdout, as text or as a value given as JSON, of a call that exits 0.
+    An answer is a `GhFailure`, or else the stdout, as text or as a value given as JSON,
+    of a call that exits 0.
     """
     calls = record.with_name("calls.jsonl")
     monkeypatch.setenv("FAKE_GH_CALLS", str(calls))
     monkeypatch.setenv(
-        "FAKE_GH_ANSWERS",
-        json.dumps(
-            [
-                {
-                    "stdout": text if isinstance(text, str) else json.dumps(text),
-                    "stderr": "",
-                    "exit": 0,
-                }
-                for text in answers
-            ]
-        ),
+        "FAKE_GH_ANSWERS", json.dumps([_fake_answer(item) for item in answers])
     )
     return calls
+
+
+@dataclass(frozen=True)
+class GhFailure:
+    """A call of the fake that writes `stderr` and exits with `exit`."""
+
+    stderr: str
+    exit: int = 1
+
+
+def _fake_answer(item: object) -> dict[str, object]:
+    """Return the answer of the fake for one item given to `answer_in_turn`."""
+    if isinstance(item, GhFailure):
+        return {"stdout": "", "stderr": item.stderr, "exit": item.exit}
+    stdout = item if isinstance(item, str) else json.dumps(item)
+    return {"stdout": stdout, "stderr": "", "exit": 0}
 
 
 def every_call(calls: Path) -> list[list[str]]:
@@ -368,15 +376,8 @@ def test_a_state_read_again_that_cannot_be_read_is_not_told_as_merged(
 def test_a_state_that_gh_fails_to_read_again_is_not_told_as_merged(
     record: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    answer_in_turn(monkeypatch, record)
-    monkeypatch.setenv(
-        "FAKE_GH_ANSWERS",
-        json.dumps(
-            [
-                {"stdout": "✓ Squashed and merged\n", "stderr": "", "exit": 0},
-                {"stdout": "", "stderr": "HTTP 502\n", "exit": 1},
-            ]
-        ),
+    answer_in_turn(
+        monkeypatch, record, "✓ Squashed and merged\n", GhFailure("HTTP 502\n")
     )
 
     with pytest.raises(RepositoryError) as raised:
@@ -716,8 +717,7 @@ def test_check_access_is_bounded_by_default(
     repository().check_access()
     repository().merge(PULL)
 
-    assert len(bounds) >= 2
-    assert set(bounds) == {60.0}
+    assert bounds == [60.0, 60.0, 60.0]
 
 
 @pytest.mark.parametrize(
