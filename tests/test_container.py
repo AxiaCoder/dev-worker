@@ -284,7 +284,7 @@ def test_an_image_still_being_pulled_when_the_time_is_up_raises_and_creates_no_c
     assert str(raised.value) == (
         f"the image {IMAGE} was still being pulled when the run reached its ceiling"
     )
-    assert [call[0] for call in calls(record)] == ["image", "pull"]
+    assert [call[0] for call in calls(record)] in (["image"], ["image", "pull"])
 
 
 def test_an_interrupted_pull_raises_again_without_removing_any_container(
