@@ -25,13 +25,16 @@ class Ticket:
     """A ticket as read from the tracker.
 
     `status` is the tracker's real status name; `blockers` are the tickets this one is
-    blocked by, in the tracker's order.
+    blocked by, in the tracker's order. `description` is plain text, empty when the
+    ticket has none.
     """
 
     key: str
     status: str
     labels: tuple[str, ...]
     blockers: tuple[Blocker, ...]
+    title: str
+    description: str
 
 
 @dataclass(frozen=True)

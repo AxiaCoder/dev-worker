@@ -15,6 +15,11 @@ repository:
   name: example-org/example-app
   token_env: GITHUB_TOKEN
 
+# The AI agent a run starts in its container: the name of the environment variable that holds
+# its Claude Code OAuth token, never the token itself.
+agent:
+  token_env: CLAUDE_CODE_OAUTH_TOKEN
+
 # The name of the branch a run works on; {key} is replaced by the ticket key.
 branch: agent/{key}
 

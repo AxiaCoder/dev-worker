@@ -41,6 +41,8 @@ ITEM: dict[str, Any] = {
     "status": {"name": "À faire", "statusCategory": {"key": "new"}},
     "labels": ["hold-merge", "backend"],
     "url": "https://example.atlassian.net/browse/ABC-218",
+    "summary": "Add a login page",
+    "description": "The page asks for an email.",
 }
 TICKET = {
     "apiVersion": "v2",
@@ -83,11 +85,13 @@ def test_read_returns_status_labels_and_blockers(
         status="À faire",
         labels=("hold-merge", "backend"),
         blockers=(Blocker("ABC-217", "Terminé"), Blocker("ABC-219", "En cours")),
+        title="Add a login page",
+        description="The page asks for an email.",
     )
     called = json.loads(record.read_text(encoding="utf-8"))
     assert called["argv"] == [
         "jira", "workitem", "get", "ABC-218",
-        "--fields", "status,labels,issuelinks",
+        "--fields", "status,labels,issuelinks,summary,description",
         "--output", "json", "--output-summary", "none",
     ]  # fmt: skip
     assert called["env"] == {
@@ -285,6 +289,393 @@ def test_a_ticket_without_links_or_labels_has_no_blockers(
     ticket = tracker().read("ABC-218")
 
     assert (ticket.labels, ticket.blockers) == ((), ())
+
+
+def test_a_description_written_as_an_atlassian_document_is_read_as_plain_text(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    document = {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            {
+                "type": "heading",
+                "attrs": {"level": 2},
+                "content": [{"type": "text", "text": "Goal"}],
+            },
+            {
+                "type": "paragraph",
+                "content": [
+                    {"type": "text", "text": "Run "},
+                    {"type": "text", "text": "main", "marks": [{"type": "code"}]},
+                    {"type": "hardBreak"},
+                    {"type": "text", "text": "again."},
+                ],
+            },
+            {
+                "type": "bulletList",
+                "content": [
+                    {
+                        "type": "listItem",
+                        "content": [
+                            {
+                                "type": "paragraph",
+                                "content": [{"type": "text", "text": "one"}],
+                            }
+                        ],
+                    }
+                ],
+            },
+            {"type": "codeBlock", "content": [{"type": "text", "text": "x = 1"}]},
+            {"type": "rule"},
+        ],
+    }
+    answer(monkeypatch, {"data": [{**ITEM, "description": document}]})
+
+    ticket = tracker().read("ABC-218")
+
+    assert ticket.description == "Goal\nRun main\nagain.\n- one\nx = 1"
+
+
+@pytest.mark.parametrize("present", [True, False])
+def test_a_ticket_without_description_has_an_empty_one(
+    record: Path, monkeypatch: pytest.MonkeyPatch, present: bool
+) -> None:
+    item = {key: value for key, value in ITEM.items() if key != "description"}
+    if present:
+        item["description"] = None
+    answer(monkeypatch, {"data": [item]})
+
+    assert tracker().read("ABC-218").description == ""
+
+
+def test_a_description_written_as_a_string_is_kept_as_it_is(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, {"data": [{**ITEM, "description": "  Line one\n\nLine two\n"}]})
+
+    assert tracker().read("ABC-218").description == "  Line one\n\nLine two\n"
+
+
+def test_a_description_ending_on_a_hard_break_or_holding_unknown_nodes_keeps_only_its_text(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    document = {
+        "type": "doc",
+        "content": [
+            {
+                "type": "orderedList",
+                "content": [
+                    {
+                        "type": "listItem",
+                        "content": [
+                            {
+                                "type": "bulletList",
+                                "content": [
+                                    {
+                                        "type": "listItem",
+                                        "content": [
+                                            {
+                                                "type": "paragraph",
+                                                "content": [
+                                                    {"type": "text", "text": "deep"}
+                                                ],
+                                            }
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "type": "paragraph",
+                "content": [
+                    {"type": "mention", "attrs": {"id": "1"}},
+                    {"type": "text", "text": 42},
+                    {"type": "text", "text": "end"},
+                    "stray",
+                    {"type": "hardBreak"},
+                ],
+            },
+        ],
+    }
+    answer(monkeypatch, {"data": [{**ITEM, "description": document}]})
+
+    assert tracker().read("ABC-218").description == "1. - deep\nend"
+
+
+SPEC_URL = "https://example.com/spec"
+
+
+def described_as(monkeypatch: pytest.MonkeyPatch, *blocks: dict[str, Any]) -> str:
+    """Return the description read from a ticket whose document holds `blocks`."""
+    document = {"type": "doc", "version": 1, "content": list(blocks)}
+    answer(monkeypatch, {"data": [{**ITEM, "description": document}]})
+    return tracker().read("ABC-218").description
+
+
+def paragraph(*inline: object) -> dict[str, Any]:
+    """Return an Atlassian paragraph node holding `inline`."""
+    return {"type": "paragraph", "content": list(inline)}
+
+
+def text(value: str, *marks: dict[str, Any]) -> dict[str, Any]:
+    """Return an Atlassian text node, with `marks` when given."""
+    node: dict[str, Any] = {"type": "text", "text": value}
+    if marks:
+        node["marks"] = list(marks)
+    return node
+
+
+def list_of(kind: str, *items: str, **attrs: object) -> dict[str, Any]:
+    """Return an Atlassian list node of `kind` whose items each hold one paragraph."""
+    node: dict[str, Any] = {
+        "type": kind,
+        "content": [
+            {"type": "listItem", "content": [paragraph(text(item))]} for item in items
+        ],
+    }
+    if attrs:
+        node["attrs"] = attrs
+    return node
+
+
+def test_a_pasted_link_card_in_a_paragraph_is_read_as_its_url(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    card = {"type": "inlineCard", "attrs": {"url": SPEC_URL}}
+
+    description = described_as(monkeypatch, paragraph(text("Follow the spec: "), card))
+
+    assert description == f"Follow the spec: {SPEC_URL}"
+
+
+@pytest.mark.parametrize("kind", ["blockCard", "embedCard"])
+def test_a_link_card_standing_as_a_block_is_read_as_its_url(
+    record: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    card = {"type": kind, "attrs": {"url": SPEC_URL}}
+
+    description = described_as(monkeypatch, paragraph(text("Follow the spec:")), card)
+
+    assert description == f"Follow the spec:\n{SPEC_URL}"
+
+
+def test_a_linked_text_is_followed_by_its_url_in_brackets(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    linked = text("the spec", {"type": "link", "attrs": {"href": SPEC_URL}})
+
+    description = described_as(monkeypatch, paragraph(text("Read "), linked, text(".")))
+
+    assert description == f"Read the spec ({SPEC_URL})."
+
+
+def test_a_linked_text_that_is_its_own_url_is_not_doubled(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    linked = text(SPEC_URL, {"type": "link", "attrs": {"href": SPEC_URL}})
+
+    description = described_as(monkeypatch, paragraph(text("See "), linked))
+
+    assert description == f"See {SPEC_URL}"
+
+
+@pytest.mark.parametrize(
+    ("kind", "shown"),
+    [("mention", "@Axia"), ("emoji", ":warning:"), ("status", "IN REVIEW")],
+)
+def test_a_mention_emoji_or_status_is_read_as_its_text(
+    record: Path, monkeypatch: pytest.MonkeyPatch, kind: str, shown: str
+) -> None:
+    node = {"type": kind, "attrs": {"text": shown}}
+
+    description = described_as(monkeypatch, paragraph(text("Ask "), node, text(" now")))
+
+    assert description == f"Ask {shown} now"
+
+
+def test_a_date_is_read_as_its_timestamp_in_milliseconds(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    date = {"type": "date", "attrs": {"timestamp": "1767225600000"}}
+
+    description = described_as(monkeypatch, paragraph(text("Due "), date))
+
+    assert description == "Due 1767225600000"
+
+
+def test_a_bullet_list_item_starts_with_a_dash(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    description = described_as(monkeypatch, list_of("bulletList", "one", "two"))
+
+    assert description == "- one\n- two"
+
+
+def test_an_ordered_list_item_starts_with_its_number_from_one(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    description = described_as(monkeypatch, list_of("orderedList", "one", "two"))
+
+    assert description == "1. one\n2. two"
+
+
+def test_an_ordered_list_with_a_start_order_numbers_its_items_from_it(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ordered = list_of("orderedList", "three", "four", order=3)
+
+    assert described_as(monkeypatch, ordered) == "3. three\n4. four"
+
+
+def test_a_nested_list_is_indented_by_two_spaces_under_its_item(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    nested = list_of("bulletList", "deep", "deeper")
+    parent = {"type": "listItem", "content": [paragraph(text("parent")), nested]}
+    sibling = {"type": "listItem", "content": [paragraph(text("next"))]}
+    ordered = {"type": "orderedList", "content": [parent, sibling]}
+
+    description = described_as(monkeypatch, ordered)
+
+    assert description == "1. parent\n  - deep\n  - deeper\n2. next"
+
+
+def task(value: str, state: object = "TODO", *nested: dict[str, Any]) -> dict[str, Any]:
+    """Return an Atlassian task item holding `value` inline, then `nested` blocks."""
+    return {
+        "type": "taskItem",
+        "attrs": {"localId": value, "state": state},
+        "content": [text(value), *nested],
+    }
+
+
+def test_a_task_list_puts_each_task_on_its_own_line_with_its_checkbox(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tasks = {
+        "type": "taskList",
+        "content": [task("Write tests"), task("Ship it", "DONE")],
+    }
+
+    description = described_as(monkeypatch, tasks, paragraph(text("Done when green.")))
+
+    assert description == "- [ ] Write tests\n- [x] Ship it\nDone when green."
+
+
+@pytest.mark.parametrize("attrs", [{}, {"state": None}, {"state": 1}, "DONE"])
+def test_a_task_without_a_well_formed_state_is_unchecked(
+    record: Path, monkeypatch: pytest.MonkeyPatch, attrs: object
+) -> None:
+    item = {"type": "taskItem", "attrs": attrs, "content": [text("Write tests")]}
+    tasks = {"type": "taskList", "content": [item]}
+
+    assert described_as(monkeypatch, tasks) == "- [ ] Write tests"
+
+
+def test_a_decision_list_puts_each_decision_on_its_own_line_after_a_dash(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    decisions = {
+        "type": "decisionList",
+        "content": [
+            {
+                "type": "decisionItem",
+                "attrs": {"state": "DECIDED"},
+                "content": [text(value)],
+            }
+            for value in ("Use Python", "Ship weekly")
+        ],
+    }
+
+    description = described_as(monkeypatch, decisions, paragraph(text("Then build.")))
+
+    assert description == "- Use Python\n- Ship weekly\nThen build."
+
+
+def test_a_task_list_nested_in_a_task_is_indented_by_two_spaces(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    nested = {"type": "taskList", "content": [task("deep", "DONE"), task("deeper")]}
+    tasks = {
+        "type": "taskList",
+        "content": [task("parent", "TODO", nested), task("next")],
+    }
+
+    description = described_as(monkeypatch, tasks)
+
+    assert description == "- [ ] parent\n  - [x] deep\n  - [ ] deeper\n- [ ] next"
+
+
+def test_a_task_list_beside_the_tasks_of_its_list_is_indented_by_two_spaces(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    nested = {"type": "taskList", "content": [task("deep", "DONE")]}
+    tasks = {"type": "taskList", "content": [task("parent"), nested, task("next")]}
+
+    description = described_as(monkeypatch, tasks)
+
+    assert description == "- [ ] parent\n  - [x] deep\n- [ ] next"
+
+
+@pytest.mark.parametrize("order", ["3", None, 2.5])
+def test_an_ordered_list_with_a_malformed_start_order_numbers_from_one(
+    record: Path, monkeypatch: pytest.MonkeyPatch, order: object
+) -> None:
+    ordered = list_of("orderedList", "one", "two", order=order)
+
+    assert described_as(monkeypatch, ordered) == "1. one\n2. two"
+
+
+@pytest.mark.parametrize(
+    "node",
+    [
+        {"type": "inlineCard"},
+        {"type": "inlineCard", "attrs": "https://example.com/spec"},
+        {"type": "blockCard", "attrs": {"url": 42}},
+        {"type": "embedCard", "attrs": {}},
+        {"type": "mention", "attrs": {"text": None}},
+        {"type": "emoji", "attrs": ["x"]},
+        {"type": "status"},
+        {"type": "date", "attrs": {"timestamp": 1767225600000}},
+        {"type": "date", "attrs": None},
+    ],
+)
+def test_a_node_whose_attributes_are_missing_or_malformed_reads_as_nothing(
+    record: Path, monkeypatch: pytest.MonkeyPatch, node: dict[str, Any]
+) -> None:
+    description = described_as(monkeypatch, paragraph(text("a"), node, text("b")))
+
+    assert description == "ab"
+
+
+@pytest.mark.parametrize(
+    "mark",
+    [
+        {"type": "link"},
+        {"type": "link", "attrs": None},
+        {"type": "link", "attrs": {"href": 42}},
+        {"type": "link", "attrs": {}},
+    ],
+)
+def test_a_link_mark_without_a_usable_url_keeps_only_its_text(
+    record: Path, monkeypatch: pytest.MonkeyPatch, mark: dict[str, Any]
+) -> None:
+    description = described_as(monkeypatch, paragraph(text("the spec", mark)))
+
+    assert description == "the spec"
+
+
+@pytest.mark.parametrize("description", [42, ["a"], True])
+def test_a_description_neither_text_nor_a_document_is_read_as_empty(
+    record: Path, monkeypatch: pytest.MonkeyPatch, description: object
+) -> None:
+    answer(monkeypatch, {"data": [{**ITEM, "description": description}]})
+
+    assert tracker().read("ABC-218").description == ""
 
 
 def test_a_ticket_that_only_blocks_others_has_no_blockers(

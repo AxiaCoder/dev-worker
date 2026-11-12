@@ -11,8 +11,11 @@ import json
 import os
 import re
 import subprocess
-from collections.abc import Sequence
-from typing import Annotated
+import textwrap
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from functools import partial
+from itertools import count, repeat
+from typing import Annotated, Any
 
 from pydantic import AwareDatetime, BaseModel, Field, ValidationError
 
@@ -26,6 +29,10 @@ REDACTED = "[token]"
 TWG_TIMEOUT_SECONDS = 60.0
 CLAIM_MARKER = "dev-worker claims this ticket for task "
 PAGE_SIZE = "100"
+TEXT_BLOCKS = frozenset({"paragraph", "heading", "codeBlock"})
+NESTED_INDENT = "  "
+LISTS = frozenset({"bulletList", "orderedList", "taskList", "decisionList"})
+DONE = "DONE"
 
 
 class _Status(BaseModel):
@@ -67,6 +74,8 @@ class _Item(BaseModel):
     status: _Status
     labels: list[str]
     issuelinks: list[_Link]
+    summary: str
+    description: object = None
 
 
 class _GetAnswer(BaseModel):
@@ -169,6 +178,150 @@ def _plain_text(body: object) -> str:
     return ""
 
 
+def _document_text(document: object) -> str:
+    """Return a ticket description as plain text, empty when it is absent.
+
+    The description is a string, kept as it is, or an Atlassian document, read as
+    markdown-like text:
+
+    - a line ends each paragraph, heading, code block, hard break and block or embed
+      card holding a URL;
+    - a link card reads as its URL, a text linked elsewhere as `text (url)`;
+    - a mention, emoji or status reads as its text, a date as its timestamp in
+      milliseconds;
+    - a bullet list item starts with `- `, an ordered one with its number, counted from
+      the list's start order or from 1; each nesting level is indented by two spaces;
+    - a task starts with `- [x] ` when its state is `DONE`, with `- [ ] ` otherwise, and a
+      decision with `- `; a task list placed among the tasks of another is indented by
+      two spaces under them;
+    - a node whose attributes are missing or malformed reads as nothing.
+
+    Leading and trailing blank space is removed from a document's text.
+    """
+    if isinstance(document, str):
+        return document
+    return _blocks_text(document).strip()
+
+
+def _blocks_text(node: object) -> str:
+    """Return the text of an Atlassian document node, with a line ending each text block."""
+    if isinstance(node, list):
+        return "".join(_blocks_text(child) for child in node)
+    if not isinstance(node, dict):
+        return ""
+    kind = node.get("type")
+    render = _RENDERERS.get(kind, _node_text)
+    own = render(node)
+    return own + "\n" if kind in TEXT_BLOCKS else own
+
+
+def _node_text(node: dict[Any, Any]) -> str:
+    """Return the text of `node` followed by the text of its content; a linked text names its URL."""
+    text = node.get("text")
+    own = text if isinstance(text, str) else ""
+    href = _link(node)
+    if href and href != own:
+        own += f" ({href})"
+    return own + _blocks_text(node.get("content"))
+
+
+def _link(node: dict[Any, Any]) -> str:
+    """Return the URL of the link mark of `node`, empty when it has none."""
+    marks = node.get("marks")
+    for mark in marks if isinstance(marks, list) else ():
+        if isinstance(mark, dict) and mark.get("type") == "link":
+            return _attribute(mark, name="href")
+    return ""
+
+
+def _attribute(node: dict[Any, Any], name: str) -> str:
+    """Return the string attribute `name` of `node`, empty when it is missing or not a string."""
+    attrs = node.get("attrs")
+    value = attrs.get(name) if isinstance(attrs, dict) else None
+    return value if isinstance(value, str) else ""
+
+
+def _block_card_text(node: dict[Any, Any]) -> str:
+    """Return the URL of a block or embed card as a line, empty when it has none."""
+    url = _attribute(node, name="url")
+    return url + "\n" if url else ""
+
+
+def _bullet_list_text(node: dict[Any, Any]) -> str:
+    """Return the items of a bullet list, each starting with `- `."""
+    return _list_text(node, repeat("- "))
+
+
+def _ordered_list_text(node: dict[Any, Any]) -> str:
+    """Return the items of an ordered list, numbered from its integer start order, or from 1."""
+    attrs = node.get("attrs")
+    order = attrs.get("order") if isinstance(attrs, dict) else None
+    start = order if isinstance(order, int) else 1
+    return _list_text(node, (f"{number}. " for number in count(start)))
+
+
+def _list_text(node: dict[Any, Any], markers: Iterator[str]) -> str:
+    """Return the items of a list, each starting with the next of `markers`.
+
+    The lines after an item's first are indented by `NESTED_INDENT`.
+    """
+    content = node.get("content")
+    items: Iterable[object] = content if isinstance(content, list) else ()
+    return "".join(_item_text(item, marker) for item, marker in zip(items, markers))
+
+
+def _item_text(item: object, marker: str) -> str:
+    """Return the text of a list item, starting with `marker`, its later lines indented."""
+    first, newline, rest = _blocks_text(item).partition("\n")
+    return marker + first + newline + textwrap.indent(rest, NESTED_INDENT)
+
+
+def _task_list_text(node: dict[Any, Any]) -> str:
+    """Return the tasks of a task list, each starting with its checkbox; a nested list is indented."""
+    content = node.get("content")
+    entries: Iterable[object] = content if isinstance(content, list) else ()
+    return "".join(_task_list_entry(entry) for entry in entries)
+
+
+def _task_list_entry(entry: object) -> str:
+    """Return a task with its checkbox, or any other entry of a task list indented."""
+    if isinstance(entry, dict) and entry.get("type") == "taskItem":
+        checked = _attribute(entry, name="state") == DONE
+        return _item_text(entry, "- [x] " if checked else "- [ ] ")
+    return textwrap.indent(_blocks_text(entry), NESTED_INDENT)
+
+
+def _inline_item_text(node: dict[Any, Any]) -> str:
+    """Return a task or decision as lines: its inline text on the first, nested lists below."""
+    content = node.get("content")
+    children: Iterable[object] = content if isinstance(content, list) else ()
+    text = ""
+    for child in children:
+        nests = isinstance(child, dict) and child.get("type") in LISTS
+        if nests and not text.endswith("\n"):
+            text += "\n"
+        text += _blocks_text(child)
+    return text if text.endswith("\n") else text + "\n"
+
+
+_RENDERERS: dict[object, Callable[[dict[Any, Any]], str]] = {
+    "hardBreak": lambda _: "\n",
+    "bulletList": _bullet_list_text,
+    "orderedList": _ordered_list_text,
+    "taskList": _task_list_text,
+    "taskItem": _inline_item_text,
+    "decisionList": _bullet_list_text,
+    "decisionItem": _inline_item_text,
+    "inlineCard": partial(_attribute, name="url"),
+    "blockCard": _block_card_text,
+    "embedCard": _block_card_text,
+    "mention": partial(_attribute, name="text"),
+    "emoji": partial(_attribute, name="text"),
+    "status": partial(_attribute, name="text"),
+    "date": partial(_attribute, name="timestamp"),
+}
+
+
 def _check_key(key: str) -> None:
     """Raise `TrackerError` when `key` is not a Jira ticket key such as `ABC-12`."""
     if not TICKET_KEY.fullmatch(key):
@@ -195,17 +348,21 @@ class JiraTracker:
         self._timeout = timeout
 
     def read(self, key: str) -> Ticket:
-        """Return the ticket `key`, with its status, labels and blockers.
+        """Return the ticket `key`, with its status, labels, blockers, title and description.
 
-        A blocker is a ticket linked to `key` by a "Blocks" link that blocks it. Raises
-        `TrackerError` when `key` is not a ticket key, the token variable is not set, `twg`
-        fails, or its answer cannot be read.
+        A blocker is a ticket linked to `key` by a "Blocks" link that blocks it. The
+        description is read as plain text (see `_document_text`). Raises `TrackerError`
+        when `key` is not a ticket key, the token variable is not set, `twg` fails, or its
+        answer cannot be read.
         """
         _check_key(key)
         answer = self._run(
             f"reading {key}",
-            ["jira", "workitem", "get", key, "--fields", "status,labels,issuelinks"],
-        )
+            [
+                "jira", "workitem", "get", key,
+                "--fields", "status,labels,issuelinks,summary,description",
+            ],
+        )  # fmt: skip
         try:
             item = _GetAnswer.model_validate(answer).data[0]
         except ValidationError as error:
@@ -224,6 +381,8 @@ class JiraTracker:
                 for link in item.issuelinks
                 if link.type.name == BLOCKS and link.inwardIssue is not None
             ),
+            title=item.summary,
+            description=_document_text(item.description),
         )
 
     def set_status(self, key: str, status: str) -> None:

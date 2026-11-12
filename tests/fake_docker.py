@@ -15,6 +15,9 @@ any existing one. `FAKE_DOCKER_CREATION_DELAY`, in seconds, is how long after `r
 called the daemon takes to make its container: until then the container does not exist,
 yet it will. A call on a container that does not exist fails with `No such container`.
 The state is written before the call is recorded.
+
+When `FAKE_DOCKER_ENV_PROBE` names a file, `create` writes to it, as a JSON object, the
+value it inherited of each variable named by an `--env` option.
 """
 
 import json
@@ -91,6 +94,15 @@ def main() -> int:
     """Record the call, write the canned answer of its subcommand, and return its exit code."""
     arguments = sys.argv[1:]
     record = Path(os.environ["FAKE_DOCKER_RECORD"])
+    probe = os.environ.get("FAKE_DOCKER_ENV_PROBE")
+    if probe and arguments[0] == "create":
+        names = [
+            arguments[index + 1]
+            for index, argument in enumerate(arguments)
+            if argument == "--env"
+        ]
+        values = {name: os.environ.get(name) for name in names}
+        Path(probe).write_text(json.dumps(values), "utf-8")
     state_setting = os.environ.get("FAKE_DOCKER_STATE")
     state = Path(state_setting) if state_setting else None
     failure = play(state, arguments) if state else None
