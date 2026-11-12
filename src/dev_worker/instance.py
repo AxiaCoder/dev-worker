@@ -137,6 +137,9 @@ class Repository(BaseModel):
     token_env: EnvName
 
 
+Provider = Literal["subscription", "api_key"]
+
+
 class Agent(BaseModel):
     """The AI agent a run starts in its container, how it signs in, and the variable holding its credential.
 
@@ -146,7 +149,7 @@ class Agent(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    provider: Literal["subscription", "api_key"]
+    provider: Provider
     token_env: EnvName
 
 

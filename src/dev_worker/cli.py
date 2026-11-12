@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from importlib.resources import as_file, files
 from pathlib import Path
+from typing import assert_never
 
 from pydantic import ValidationError
 
@@ -32,6 +33,7 @@ from dev_worker.header import HeaderError, WorkerFile, load_worker_file
 from dev_worker.instance import (
     Instance,
     InstanceError,
+    Provider,
     Repository,
     Tracker,
     load_instance,
@@ -70,10 +72,6 @@ TICKET_KEY = re.compile(r"(.+)-([1-9][0-9]*)")
 RECENT_RUNS = 10
 CLAIM_TAKE_LIMIT_SECONDS = 300
 CLAIM_EXPIRY_SECONDS = 600
-AGENT_CREDENTIALS = {
-    "subscription": ("CLAUDE_CODE_OAUTH_TOKEN", "Claude Code subscription token"),
-    "api_key": ("ANTHROPIC_API_KEY", "Anthropic API key"),
-}
 
 
 def failed(task_id: str | None, *errors: str) -> MandateOutput:
@@ -757,6 +755,17 @@ def rescue_left_worktree(instance: Instance, directory: Path) -> str | None:
     return f"The worktree left by an earlier run on the branch {branch}: {reason}"
 
 
+def agent_credential(provider: Provider) -> tuple[str, str]:
+    """Return the variable Claude Code reads the credential of `provider` from, and what that credential is called."""
+    match provider:
+        case "subscription":
+            return "CLAUDE_CODE_OAUTH_TOKEN", "Claude Code subscription token"
+        case "api_key":
+            return "ANTHROPIC_API_KEY", "Anthropic API key"
+        case _:  # pragma: no cover
+            assert_never(provider)
+
+
 def container_environment(instance: Instance) -> dict[str, str] | str:
     """Return the variables the container of `instance` receives, by name, or why one is missing.
 
@@ -767,7 +776,7 @@ def container_environment(instance: Instance) -> dict[str, str] | str:
     `api_key`. A token variable unset or empty gives the sentence naming it; no value is
     ever quoted.
     """
-    agent_variable, agent_service = AGENT_CREDENTIALS[instance.agent.provider]
+    agent_variable, agent_service = agent_credential(instance.agent.provider)
     tokens = (
         (agent_variable, instance.agent.token_env, agent_service),
         ("GH_TOKEN", instance.repository.token_env, "GitHub token"),
