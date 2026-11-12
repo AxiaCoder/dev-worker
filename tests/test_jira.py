@@ -1132,3 +1132,12 @@ def test_claims_on_a_key_that_is_not_a_ticket_key_are_refused(record: Path) -> N
     with pytest.raises(TrackerError, match="is not a Jira ticket key"):
         tracker().claims("abc-218", "To Do")
     assert not record.exists()
+
+
+def test_comment_whose_body_holds_a_nul_raises_a_tracker_error(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, {"ok": True, "data": {"id": "10043", "body": {}}})
+
+    with pytest.raises(TrackerError):
+        tracker().comment("ABC-218", "x\x00y")

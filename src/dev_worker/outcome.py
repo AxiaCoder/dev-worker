@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from dev_worker.container import ContainerExit
+from dev_worker.text import writable_text
 
 OUTCOME_FIELDS = ("outcome", "message")
 
@@ -31,8 +32,17 @@ def read_outcome(exited: ContainerExit, outcomes: Sequence[str]) -> Outcome | st
     Claude Code exited nonzero, gave no structured output, or one that does not match the
     schema. It quotes the `subtype` and `result` of the JSON result when they are
     strings, and the stderr of the container when its output is not JSON and it exited
-    nonzero.
+    nonzero. The message and the reason hold no NUL and encode as UTF-8: each NUL and
+    each character UTF-8 cannot encode is written as its backslash escape.
     """
+    found = _read(exited, outcomes)
+    if isinstance(found, Outcome):
+        return Outcome(found.outcome, writable_text(found.message))
+    return writable_text(found)
+
+
+def _read(exited: ContainerExit, outcomes: Sequence[str]) -> Outcome | str:
+    """Return the outcome the container `exited` reports, or why it reports none, its text as read."""
     try:
         answer = json.loads(exited.stdout)
     except (ValueError, RecursionError):

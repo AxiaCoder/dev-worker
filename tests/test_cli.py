@@ -5631,3 +5631,29 @@ def test_ticket_is_left_as_it_is_when_the_mandate_raises(
 
     assert stub.comments == []
     assert stub.moves == [IN_PROGRESS]
+
+
+@pytest.mark.parametrize("message", ["x\x00y", "x\ud800y"], ids=["nul", "surrogate"])
+def test_done_whose_summary_holds_a_nul_or_a_lone_surrogate_still_comments_moves_and_answers(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+    message: str,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    container.exited = ending_on("done", message)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed"
+    summary = answer["summary"]
+    assert isinstance(summary, str)
+    assert "\x00" not in summary
+    assert [key for key, _ in stub.comments] == ["DEMO-1"]
+    body = stub.comments[0][1]
+    assert "\x00" not in body
+    body.encode("utf-8")
+    assert stub.moves == [IN_PROGRESS, IN_REVIEW]

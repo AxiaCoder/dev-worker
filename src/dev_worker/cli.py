@@ -61,6 +61,7 @@ from dev_worker.run_journal import (
     take_lock,
     torn_tail,
 )
+from dev_worker.text import writable_text
 from dev_worker.tickets import Claim, Ticket, TicketTracker, TrackerError
 from dev_worker.validation import describe_validation_error
 from dev_worker.workspace import Workspace, WorkspaceError
@@ -84,11 +85,6 @@ def failed(task_id: str | None, *errors: str) -> MandateOutput:
         summary="The mandate could not be run.",
         errors=[writable_text(error) for error in errors],
     )
-
-
-def writable_text(text: str) -> str:
-    """Return `text` with every character UTF-8 cannot encode written as its backslash escape."""
-    return text.encode("utf-8", "backslashreplace").decode("utf-8")
 
 
 def deliver_ticket(

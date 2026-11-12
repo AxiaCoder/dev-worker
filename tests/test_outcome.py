@@ -147,3 +147,47 @@ def test_an_output_without_a_usable_outcome_gives_why(
     exited: ContainerExit, reason: str
 ) -> None:
     assert read_outcome(exited, OUTCOMES) == reason
+
+
+def assert_transmissible(text: str) -> None:
+    """Check that `text` holds no NUL and encodes as UTF-8."""
+    assert "\x00" not in text
+    text.encode("utf-8")
+
+
+@pytest.mark.parametrize("message", ["x\x00y", "x\ud800y"], ids=["nul", "surrogate"])
+def test_a_message_holding_a_nul_or_a_lone_surrogate_is_made_transmissible(
+    message: str,
+) -> None:
+    exited = ContainerExit(
+        0, result(structured_output={"outcome": "done", "message": message}), ""
+    )
+
+    found = read_outcome(exited, OUTCOMES)
+
+    assert isinstance(found, Outcome)
+    assert found.outcome == "done"
+    assert_transmissible(found.message)
+
+
+@pytest.mark.parametrize(
+    "exited",
+    [
+        pytest.param(ContainerExit(0, result(result="x\x00y"), ""), id="result-nul"),
+        pytest.param(
+            ContainerExit(0, result(result="x\ud800y"), ""), id="result-surrogate"
+        ),
+        pytest.param(ContainerExit(0, result(subtype="x\x00y"), ""), id="subtype-nul"),
+        pytest.param(
+            ContainerExit(0, result(subtype="x\ud800y"), ""), id="subtype-surrogate"
+        ),
+        pytest.param(ContainerExit(1, "boom", "x\x00y"), id="stderr-nul"),
+    ],
+)
+def test_a_reason_quoting_a_nul_or_a_lone_surrogate_is_made_transmissible(
+    exited: ContainerExit,
+) -> None:
+    found = read_outcome(exited, OUTCOMES)
+
+    assert isinstance(found, str)
+    assert_transmissible(found)

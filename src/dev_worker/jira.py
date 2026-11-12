@@ -402,8 +402,8 @@ class JiraTracker:
         """Post on the ticket `key` the claim comment naming `task_id`; return the comment id.
 
         Raises `TrackerError` when `key` is not a ticket key, the token variable is not set,
-        `twg` fails, or its answer cannot be read. After any `TrackerError` the comment may
-        still have been posted.
+        `body` holds a NUL, `twg` fails, or its answer cannot be read. After any
+        `TrackerError` the comment may still have been posted.
         """
         return self._comment(key, f"{CLAIM_MARKER}{task_id}", f"claiming {key}")
 
@@ -411,8 +411,8 @@ class JiraTracker:
         """Post on the ticket `key` a plain-text comment holding `body`.
 
         Raises `TrackerError` when `key` is not a ticket key, the token variable is not set,
-        `twg` fails, or its answer cannot be read. After any `TrackerError` the comment may
-        still have been posted.
+        `body` holds a NUL, `twg` fails, or its answer cannot be read. After any
+        `TrackerError` the comment may still have been posted.
         """
         self._comment(key, body, f"commenting on {key}")
 
@@ -561,8 +561,9 @@ class JiraTracker:
         """Run `twg` with `arguments` and JSON output, whatever its exit code.
 
         Returns its decoded answer (`_UNREADABLE` when not JSON), the finished process and
-        the token passed. Raises `TrackerError` when the token variable is not set, `twg`
-        cannot be started, or does not answer within the timeout.
+        the token passed. Raises `TrackerError` when the token variable is not set, an
+        argument cannot be passed to a process (it holds a NUL), `twg` cannot be started,
+        or does not answer within the timeout.
         """
         token = self._token()
         environment = {
@@ -596,6 +597,11 @@ class JiraTracker:
         except OSError as error:
             reason = (error.strerror or type(error).__name__).replace(token, REDACTED)
             raise TrackerError(f"twg could not be started: {reason}") from None
+        except ValueError:
+            raise TrackerError(
+                f"twg could not be given its arguments while {action}: "
+                "one holds a character a process argument cannot carry"
+            ) from None
         return _parse_json(done.stdout), done, token
 
 
