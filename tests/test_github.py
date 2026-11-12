@@ -3,6 +3,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +62,46 @@ def answer(
     monkeypatch.setenv("FAKE_GH_STDOUT", text)
     monkeypatch.setenv("FAKE_GH_STDERR", stderr)
     monkeypatch.setenv("FAKE_GH_EXIT", str(code))
+
+
+def answer_in_turn(
+    monkeypatch: pytest.MonkeyPatch, record: Path, *answers: object
+) -> Path:
+    """Have the fake answer each call with the next of `answers`, and return the log of calls.
+
+    An answer is a `GhFailure`, or else the stdout, as text or as a value given as JSON,
+    of a call that exits 0.
+    """
+    calls = record.with_name("calls.jsonl")
+    monkeypatch.setenv("FAKE_GH_CALLS", str(calls))
+    monkeypatch.setenv(
+        "FAKE_GH_ANSWERS", json.dumps([_fake_answer(item) for item in answers])
+    )
+    return calls
+
+
+@dataclass(frozen=True)
+class GhFailure:
+    """A call of the fake that writes `stderr` and exits with `exit`."""
+
+    stderr: str
+    exit: int = 1
+
+
+def _fake_answer(item: object) -> dict[str, object]:
+    """Return the answer of the fake for one item given to `answer_in_turn`."""
+    if isinstance(item, GhFailure):
+        return {"stdout": "", "stderr": item.stderr, "exit": item.exit}
+    stdout = item if isinstance(item, str) else json.dumps(item)
+    return {"stdout": stdout, "stderr": "", "exit": 0}
+
+
+def every_call(calls: Path) -> list[list[str]]:
+    """Return the arguments of each call the fake logged, in order."""
+    return [
+        json.loads(line)["argv"]
+        for line in calls.read_text(encoding="utf-8").splitlines()
+    ]
 
 
 def repository() -> GitHubRepository:
@@ -258,15 +299,92 @@ def test_a_rollup_of_the_wrong_shape_raises(
 def test_merge_squashes_the_pull_request_under_its_title(
     record: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    answer(monkeypatch, "✓ Squashed and merged pull request #42\n")
+    calls = answer_in_turn(
+        monkeypatch,
+        record,
+        "✓ Squashed and merged pull request #42\n",
+        {"state": "MERGED"},
+    )
 
     repository().merge(PULL)
 
-    assert called(record)["argv"] == [
+    assert every_call(calls)[0] == [
         "pr", "merge", "42", "--squash", "--match-head-commit", HEAD,
         "--subject", TITLE, "--repo", "octo/widgets",
     ]  # fmt: skip
     assert called(record)["env"]["GH_TOKEN"] == TOKEN
+
+
+def test_merge_reads_the_pull_request_again_and_returns_once_it_is_merged(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = answer_in_turn(
+        monkeypatch,
+        record,
+        "✓ Squashed and merged pull request #42\n",
+        {"state": "MERGED"},
+    )
+
+    repository().merge(PULL)
+
+    assert every_call(calls)[1:] == [
+        ["pr", "view", "42", "--json", "state", "--repo", "octo/widgets"],
+    ]
+
+
+def test_a_pull_request_left_open_by_a_merge_queue_is_not_told_as_merged(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer_in_turn(
+        monkeypatch,
+        record,
+        "✓ Pull request octo/widgets#42 will be added to the merge queue\n",
+        {"state": "OPEN"},
+    )
+
+    with pytest.raises(RepositoryError) as raised:
+        repository().merge(PULL)
+
+    assert type(raised.value) is RepositoryError
+    assert "#42" in str(raised.value)
+    assert "OPEN" in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("state", "said"),
+    [
+        ({"merged": True}, "cannot be read"),
+        ({"state": None}, "cannot be read"),
+        ("<html>", "is not JSON"),
+    ],
+)
+def test_a_state_read_again_that_cannot_be_read_is_not_told_as_merged(
+    record: Path, monkeypatch: pytest.MonkeyPatch, state: object, said: str
+) -> None:
+    answer_in_turn(
+        monkeypatch, record, "✓ Squashed and merged pull request #42\n", state
+    )
+
+    with pytest.raises(RepositoryError) as raised:
+        repository().merge(PULL)
+
+    assert type(raised.value) is RepositoryError
+    assert "#42" in str(raised.value)
+    assert said in str(raised.value)
+
+
+def test_a_state_that_gh_fails_to_read_again_is_not_told_as_merged(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer_in_turn(
+        monkeypatch, record, "✓ Squashed and merged\n", GhFailure("HTTP 502\n")
+    )
+
+    with pytest.raises(RepositoryError) as raised:
+        repository().merge(PULL)
+
+    assert type(raised.value) is RepositoryError
+    assert "HTTP 502" in str(raised.value)
 
 
 def test_a_merge_refused_because_the_head_moved_says_so(
@@ -468,7 +586,8 @@ def test_the_token_is_read_at_each_call_not_at_construction(
     monkeypatch.delenv("GITHUB_TOKEN")
     built = repository()
     monkeypatch.setenv("GITHUB_TOKEN", "first-token")
-    answer(monkeypatch, "")
+    merged = {"state": "MERGED"}
+    answer_in_turn(monkeypatch, record, "", merged, "", merged)
 
     built.merge(PULL)
     first = called(record)["env"]["GH_TOKEN"]
@@ -588,14 +707,17 @@ def test_check_access_is_bounded_by_default(
 
     def finish(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
         bounds.append(kwargs["timeout"])
-        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        merged = json.dumps({"state": "MERGED"})
+        return subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=merged, stderr=""
+        )
 
     monkeypatch.setattr("dev_worker.github.subprocess.run", finish)
 
     repository().check_access()
     repository().merge(PULL)
 
-    assert bounds == [60.0, 60.0]
+    assert bounds == [60.0, 60.0, 60.0]
 
 
 @pytest.mark.parametrize(

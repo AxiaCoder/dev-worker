@@ -60,7 +60,9 @@ class CodeRepository(Protocol):
     def merge(self, pull_request: PullRequest) -> None:
         """Merge `pull_request` as a single squashed commit titled `pull_request.title`, only while its head is still `pull_request.head`.
 
+        Returns only once the pull request is merged, not merely queued for a merge.
         Raises `HeadMovedError` when the head has moved: nothing was merged.
-        Raises `RepositoryError` on any other failure; after it the merge may still have
+        Raises `RepositoryError` on any other failure, and when the pull request is still
+        not merged once the host has answered; after it the merge may still have
         happened: the pull request is to be read again, not assumed open.
         """
