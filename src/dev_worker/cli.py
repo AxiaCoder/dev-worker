@@ -159,9 +159,15 @@ def make_tracker(tracker: Tracker) -> TicketTracker:
     return JiraTracker(tracker)
 
 
-def make_repository(repository: Repository) -> CodeRepository:
-    """Return the code repository that `repository` of an instance describes."""
-    return GitHubRepository(repository)
+def make_repository(
+    repository: Repository, token_env: str | None = None
+) -> CodeRepository:
+    """Return the code repository that `repository` of an instance describes.
+
+    It calls the repository with the token held by the variable `token_env` names, the
+    worker's token variable when `token_env` is `None`.
+    """
+    return GitHubRepository(repository, token_env=token_env)
 
 
 def make_workspace(repository: Repository, directory: Path) -> Workspace:
@@ -198,17 +204,23 @@ def unreachable_docker(instance: Instance, directory: Path) -> str | None:
 def unreachable_connector(instance: Instance) -> str | None:
     """Return why the tracker or then the repository of `instance` cannot be reached, `None` when both can.
 
-    Each is asked to check its access with the instance credentials; nothing is changed
-    on either. Never raises.
+    Each is asked to check its access with the instance credentials, the repository with
+    the worker's token and then the agent's, and the sentence names the token that
+    failed; nothing is changed on either. Never raises.
     """
     try:
         make_tracker(instance.tracker).check_access()
     except TrackerError as error:
         return f"The tracker cannot be reached: {error}"
-    try:
-        make_repository(instance.repository).check_access()
-    except RepositoryError as error:
-        return f"The repository cannot be reached: {error}"
+    tokens = (
+        ("worker's", instance.repository.worker_token_env),
+        ("agent's", instance.repository.agent_token_env),
+    )
+    for owner, token_env in tokens:
+        try:
+            make_repository(instance.repository, token_env).check_access()
+        except RepositoryError as error:
+            return f"The repository cannot be reached with the {owner} token: {error}"
     return None
 
 
@@ -769,8 +781,9 @@ def agent_credential(provider: Provider) -> tuple[str, str]:
 def container_environment(instance: Instance) -> dict[str, str] | str:
     """Return the variables the container of `instance` receives, by name, or why one is missing.
 
-    They are the agent credential, `GH_TOKEN` and `TWG_TOKEN`, holding the values of the
-    variables `token_env` names for the agent, the repository and the tracker, read now,
+    They are the agent credential, `GH_TOKEN` and `TWG_TOKEN`, holding the values, read
+    now, of the variables `agent.token_env`, `repository.agent_token_env` and
+    `tracker.token_env` name; the worker's repository token is never among them. Then
     `TWG_SITE` and `TWG_USER`, the tracker site and account, and `IS_SANDBOX` set to `1`,
     which lets Claude Code run in `bypassPermissions` mode as root. The agent credential is
     `CLAUDE_CODE_OAUTH_TOKEN` for the `subscription` provider and `ANTHROPIC_API_KEY` for
@@ -780,7 +793,7 @@ def container_environment(instance: Instance) -> dict[str, str] | str:
     agent_variable, agent_service = agent_credential(instance.agent.provider)
     tokens = (
         (agent_variable, instance.agent.token_env, agent_service),
-        ("GH_TOKEN", instance.repository.token_env, "GitHub token"),
+        ("GH_TOKEN", instance.repository.agent_token_env, "agent's GitHub token"),
         ("TWG_TOKEN", instance.tracker.token_env, "Jira token"),
     )
     environment: dict[str, str] = {}

@@ -170,7 +170,7 @@ def ready_tracker(monkeypatch: pytest.MonkeyPatch) -> None:
 def reachable_repository(monkeypatch: pytest.MonkeyPatch) -> ReachableRepository:
     """Make `run` and `health` use a `ReachableRepository` instead of the real repository; return it."""
     fake = ReachableRepository()
-    monkeypatch.setattr(cli, "make_repository", lambda repository: fake)
+    monkeypatch.setattr(cli, "make_repository", lambda *made: fake)
     return fake
 
 
@@ -310,7 +310,8 @@ class FakeContainer:
 def tokens(monkeypatch: pytest.MonkeyPatch) -> None:
     """Set the token variables the example instance names."""
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "agent-token")
-    monkeypatch.setenv("GITHUB_TOKEN", "github-token")
+    monkeypatch.setenv("GITHUB_AGENT_TOKEN", "github-token")
+    monkeypatch.setenv("GITHUB_WORKER_TOKEN", "worker-github-token")
     monkeypatch.setenv("JIRA_TOKEN", "jira-token")
 
 
@@ -1718,7 +1719,12 @@ def test_worktree_branch_follows_the_instance_branch_template(
 def test_make_workspace_keeps_the_mirror_and_worktree_in_the_instance_directory(
     tmp_path: Path,
 ) -> None:
-    repository = Repository(type="github", name="octo/widgets", token_env="T")
+    repository = Repository(
+        type="github",
+        name="octo/widgets",
+        agent_token_env="A",
+        worker_token_env="W",
+    )
 
     made = MAKE_WORKSPACE(repository, tmp_path)
 
@@ -1829,13 +1835,14 @@ def test_container_runs_claude_on_the_ticket_with_the_worker_rules_and_only_the_
             "IS_SANDBOX": "1",
         }
     ]
+    assert "worker-github-token" not in container.environments[0].values()
 
 
 @pytest.mark.parametrize(
     ("variable", "service"),
     [
         ("CLAUDE_CODE_OAUTH_TOKEN", "Claude Code subscription token"),
-        ("GITHUB_TOKEN", "GitHub token"),
+        ("GITHUB_AGENT_TOKEN", "agent's GitHub token"),
         ("JIRA_TOKEN", "Jira token"),
     ],
 )
@@ -5128,7 +5135,7 @@ def test_health_is_down_when_the_tracker_cannot_be_reached(
     tracker = Unreachable(TrackerError("twg could not be started: not found"))
     repository = Unreachable(RepositoryError("never asked"))
     monkeypatch.setattr(cli, "make_tracker", lambda made: tracker)
-    monkeypatch.setattr(cli, "make_repository", lambda made: repository)
+    monkeypatch.setattr(cli, "make_repository", lambda *made: repository)
 
     answer = health(monkeypatch, capsysbinary, instance)
 
@@ -5148,13 +5155,13 @@ def test_health_is_down_when_the_repository_cannot_be_reached(
     repository = Unreachable(
         RepositoryError("gh did not answer within 60 seconds while checking access")
     )
-    monkeypatch.setattr(cli, "make_repository", lambda made: repository)
+    monkeypatch.setattr(cli, "make_repository", lambda *made: repository)
 
     answer = health(monkeypatch, capsysbinary, instance)
 
     assert answer == {
         "status": "down",
-        "reason": "The repository cannot be reached: "
+        "reason": "The repository cannot be reached with the worker's token: "
         "gh did not answer within 60 seconds while checking access",
         "active": True,
     }
@@ -5168,7 +5175,7 @@ def test_health_checks_the_connectors_of_the_instance_with_its_token_variables(
     monkeypatch.setattr(cli, "make_tracker", MAKE_TRACKER)
     monkeypatch.setattr(cli, "make_repository", MAKE_REPOSITORY)
     monkeypatch.setenv("JIRA_TOKEN", "")
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_WORKER_TOKEN", raising=False)
 
     tracker_down = health(monkeypatch, capsysbinary, instance)
     monkeypatch.setattr(cli, "make_tracker", lambda made: ReadyTracker())
@@ -5179,10 +5186,33 @@ def test_health_checks_the_connectors_of_the_instance_with_its_token_variables(
         "which should hold the Jira token, is not set"
     )
     assert repository_down["reason"] == (
-        "The repository cannot be reached: the variable GITHUB_TOKEN, "
-        "which should hold the GitHub token, is not set"
+        "The repository cannot be reached with the worker's token: the variable "
+        "GITHUB_WORKER_TOKEN, which should hold the GitHub token, is not set"
     )
     assert not instance.with_suffix("").exists()
+
+
+def test_health_is_down_naming_the_agent_token_when_only_it_cannot_reach_the_repository(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    checked: list[str | None] = []
+
+    def make(made: Repository, token_env: str | None = None) -> object:
+        checked.append(token_env)
+        if token_env == "GITHUB_AGENT_TOKEN":
+            return Unreachable(RepositoryError("refused"))
+        return ReachableRepository()
+
+    monkeypatch.setattr(cli, "make_repository", make)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert answer["reason"] == (
+        "The repository cannot be reached with the agent's token: refused"
+    )
+    assert checked == ["GITHUB_WORKER_TOKEN", "GITHUB_AGENT_TOKEN"]
 
 
 def test_health_is_down_rather_than_degraded_when_a_connector_cannot_be_reached(
@@ -5205,10 +5235,37 @@ def test_health_is_down_rather_than_degraded_when_a_connector_cannot_be_reached(
 
 def test_make_repository_returns_a_github_repository() -> None:
     repository = Repository(
-        type="github", name="example/project", token_env="GITHUB_TOKEN"
+        type="github",
+        name="example/project",
+        agent_token_env="GITHUB_AGENT_TOKEN",
+        worker_token_env="GITHUB_WORKER_TOKEN",
     )
 
     assert isinstance(MAKE_REPOSITORY(repository), GitHubRepository)
+
+
+@pytest.mark.parametrize(
+    ("token_env", "read"),
+    [
+        (None, "GITHUB_WORKER_TOKEN"),
+        ("GITHUB_WORKER_TOKEN", "GITHUB_WORKER_TOKEN"),
+        ("GITHUB_AGENT_TOKEN", "GITHUB_AGENT_TOKEN"),
+    ],
+)
+def test_make_repository_reads_the_token_variable_it_is_given_or_the_worker_one(
+    monkeypatch: pytest.MonkeyPatch, token_env: str | None, read: str
+) -> None:
+    repository = Repository(
+        type="github",
+        name="example/project",
+        agent_token_env="GITHUB_AGENT_TOKEN",
+        worker_token_env="GITHUB_WORKER_TOKEN",
+    )
+    monkeypatch.delenv("GITHUB_AGENT_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_WORKER_TOKEN", raising=False)
+
+    with pytest.raises(RepositoryError, match=f"the variable {read},"):
+        MAKE_REPOSITORY(repository, token_env).check_access()
 
 
 def test_health_does_not_check_the_connectors_when_a_local_check_is_down(
@@ -5220,7 +5277,7 @@ def test_health_does_not_check_the_connectors_when_a_local_check_is_down(
     tracker = Unreachable(TrackerError("refused"))
     repository = Unreachable(RepositoryError("refused"))
     monkeypatch.setattr(cli, "make_tracker", lambda made: tracker)
-    monkeypatch.setattr(cli, "make_repository", lambda made: repository)
+    monkeypatch.setattr(cli, "make_repository", lambda *made: repository)
 
     answer = health(monkeypatch, capsysbinary, instance)
 
@@ -5240,7 +5297,7 @@ def test_health_is_degraded_when_both_connectors_can_be_reached(
     tracker = ReadyTracker()
     repository = ReachableRepository()
     monkeypatch.setattr(cli, "make_tracker", lambda made: tracker)
-    monkeypatch.setattr(cli, "make_repository", lambda made: repository)
+    monkeypatch.setattr(cli, "make_repository", lambda *made: repository)
 
     assert health(monkeypatch, capsysbinary, instance)["status"] == "degraded"
 

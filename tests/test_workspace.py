@@ -13,7 +13,12 @@ from dev_worker.instance import GitIdentity, Repository
 from dev_worker.workspace import Workspace, WorkspaceError
 
 TOKEN = "s3cret-token-value"
-REPOSITORY = Repository(type="github", name="octo/widgets", token_env="GITHUB_TOKEN")
+REPOSITORY = Repository(
+    type="github",
+    name="octo/widgets",
+    agent_token_env="AGENT_TOKEN",
+    worker_token_env="GITHUB_TOKEN",
+)
 BRANCH = "agent/DEMO-1"
 BRANCH_REF = f"refs/heads/{BRANCH}"
 IDENTITY = GitIdentity(name="Rescue Bot", email="bot@example.com")
@@ -823,6 +828,7 @@ def test_every_git_call_signs_in_through_gh_with_the_token_in_its_environment(
         return subprocess.CompletedProcess(arguments, 0, "", "")
 
     monkeypatch.setattr(workspace_module.subprocess, "run", record)
+    monkeypatch.setenv("AGENT_TOKEN", "agent-token-value")
 
     Workspace(REPOSITORY, tmp_path).refresh()
 

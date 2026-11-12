@@ -22,10 +22,18 @@ An instance is one YAML file that points the worker at a tracker project and a r
 6. Map every status key of the header to the status name your tracker really uses; two keys cannot share one status.
 7. Under `hold_merge_label`, name the ticket label that holds a merge back: a ticket carrying it keeps its pull request open.
 8. Under `agent.provider`, choose how the agent signs in: `subscription` for a Claude Code OAuth token, `api_key` for an Anthropic API key.
-9. Under `token_env`, write the name of the environment variable that holds each token — the tracker's, the repository's, and under `agent` the credential of its provider — and set that variable in the worker's environment. The file never holds a token. A run hands these tokens, the tracker site and its account to its container, and nothing else from the worker's environment.
+9. Write the name of the environment variable that holds each token — the tracker's under `tracker.token_env`, the credential of the agent's provider under `agent.token_env`, and two for the repository: the agent's under `repository.agent_token_env`, the worker's under `repository.worker_token_env`, each in its own variable — and set those variables in the worker's environment. The file never holds a token. A run hands the tracker token, the agent credential, the agent's repository token, the tracker site and its account to its container, and nothing else from the worker's environment: the worker's repository token stays with the worker, which merges with it (see [Protecting the base branch](#protecting-the-base-branch)).
 10. Optionally, tighten a limit under `limits`; a value above the header ceiling is refused.
 
 Real instances and secrets stay outside the repository: the file under `examples/` is fictional and is the only instance committed here.
+
+## Protecting the base branch
+
+Only the worker merges, and the guarantee holds only if the worker and the agent are two different GitHub accounts: a token acts with its account's role, so an agent token created on the worker's account would be let through too.
+
+On GitHub, in the repository's **Settings → Rules → Rulesets**, add a **New branch ruleset** that targets the default branch, turn on **Restrict updates**, and add the worker's role to its bypass list — for instance Repository admin, held by the worker's account — while the agent's account is a collaborator with Write only.
+
+On a repository owned by a user account, a collaborator cannot use a fine-grained token on it, so the agent's token is a classic token with the `repo` scope; it reaches every repository the agent's account can, so give that account access to this repository only — and it can still write to any public repository (issues, comments, pull requests), which a fine-grained token cannot. On a repository owned by an organization the agent's account is a member of, a fine-grained token limited to this repository, with **Contents** and **Pull requests** set to read and write, is enough. With this rule, a merge attempted with the agent's token is refused.
 
 ## Development
 

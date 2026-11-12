@@ -128,13 +128,19 @@ class Tracker(BaseModel):
 
 
 class Repository(BaseModel):
-    """The code repository of an instance and the environment variable holding its token."""
+    """The code repository of an instance and the environment variables holding its two tokens.
+
+    `agent_token_env` names the variable holding the agent's token, handed to the container
+    only; `worker_token_env` the one holding the worker's token, which the worker's code
+    keeps for the merge and every other call it makes to the repository.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     type: Literal["github"]
     name: Name
-    token_env: EnvName
+    agent_token_env: EnvName
+    worker_token_env: EnvName
 
 
 Provider = Literal["subscription", "api_key"]
@@ -254,6 +260,17 @@ def _limit_problems(limits: Mapping[str, int], header: Header) -> list[str]:
     return problems
 
 
+def _repository_problems(repository: Repository) -> list[str]:
+    """Return the sentence saying both repository tokens share a variable, if they do; no value is quoted."""
+    if repository.agent_token_env != repository.worker_token_env:
+        return []
+    problem = (
+        "repository.agent_token_env and repository.worker_token_env name the same"
+        " variable, the agent's and the worker's tokens need their own"
+    )
+    return [problem]
+
+
 def _yaml_reasons(error: yaml.YAMLError) -> str:
     """Return the reasons of a YAML failure, each led by `": "`, without the failing text.
 
@@ -279,7 +296,8 @@ def load_instance(path: Path, header: Header) -> Instance:
     Raises `InstanceError` when the file is not valid UTF-8, is not valid YAML (a key repeated
     within one mapping included), nests too deeply to be read, does not match the instance shape, maps a status key the header does not
     declare or leaves one unmapped, maps two status keys to the same real status name, sets
-    a limit the header has no ceiling for, or sets a limit above its ceiling. The message
+    a limit the header has no ceiling for, sets a limit above its ceiling, or names the
+    same variable for the agent's and the worker's repository tokens. The message
     names key paths, lines and columns, and quotes no value written in the file but a
     shared real status name.
     """
@@ -300,8 +318,10 @@ def load_instance(path: Path, header: Header) -> Instance:
     except ValidationError as error:
         description = _describe(error, root="instance", echo=False)
         raise InstanceError(f"invalid instance file: {description}") from None
-    problems = _status_problems(data.statuses, header) + _limit_problems(
-        data.limits, header
+    problems = (
+        _status_problems(data.statuses, header)
+        + _limit_problems(data.limits, header)
+        + _repository_problems(data.repository)
     )
     if problems:
         raise InstanceError(f"invalid instance file: {'; '.join(problems)}")

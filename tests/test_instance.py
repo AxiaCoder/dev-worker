@@ -31,7 +31,8 @@ tracker:
 repository:
   type: github
   name: example/project
-  token_env: GITHUB_TOKEN
+  agent_token_env: GITHUB_AGENT_TOKEN
+  worker_token_env: GITHUB_WORKER_TOKEN
 agent:
   provider: subscription
   token_env: CLAUDE_CODE_OAUTH_TOKEN
@@ -72,7 +73,8 @@ def test_valid_instance_loads(tmp_path: Path) -> None:
     assert instance.tracker.project == "ABC"
     assert instance.tracker.token_env == "JIRA_TOKEN"
     assert instance.repository.name == "example/project"
-    assert instance.repository.token_env == "GITHUB_TOKEN"
+    assert instance.repository.agent_token_env == "GITHUB_AGENT_TOKEN"
+    assert instance.repository.worker_token_env == "GITHUB_WORKER_TOKEN"
     assert instance.agent.provider == "subscription"
     assert instance.agent.token_env == "CLAUDE_CODE_OAUTH_TOKEN"
     assert instance.statuses == {
@@ -231,28 +233,46 @@ def test_every_problem_is_reported(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("section", "variable"),
+    ("location", "variable"),
     [
-        ("tracker", "JIRA_TOKEN"),
-        ("repository", "GITHUB_TOKEN"),
-        ("agent", "CLAUDE_CODE_OAUTH_TOKEN"),
+        ("tracker.token_env", "JIRA_TOKEN"),
+        ("repository.agent_token_env", "GITHUB_AGENT_TOKEN"),
+        ("repository.worker_token_env", "GITHUB_WORKER_TOKEN"),
+        ("agent.token_env", "CLAUDE_CODE_OAUTH_TOKEN"),
     ],
 )
 @pytest.mark.parametrize(
     "value", ["ghp_abcdef0123456789", "jira_token", "1TOKEN", "JIRA-TOKEN", "''"]
 )
 def test_token_env_not_a_variable_name_is_refused_without_echo(
-    tmp_path: Path, section: str, variable: str, value: str
+    tmp_path: Path, location: str, variable: str, value: str
 ) -> None:
-    text = VALID.replace(f"token_env: {variable}", f"token_env: {value}")
+    text = VALID.replace(f"token_env: {variable}\n", f"token_env: {value}\n")
 
     with pytest.raises(
-        InstanceError, match=f"{section}.token_env: .*name of an environment variable"
+        InstanceError, match=f"{location}: .*name of an environment variable"
     ) as caught:
         load(tmp_path, text)
 
     assert value not in str(caught.value)
     assert "(got" not in str(caught.value)
+
+
+def test_both_repository_tokens_in_one_variable_are_refused_without_echo(
+    tmp_path: Path,
+) -> None:
+    text = VALID.replace(
+        "worker_token_env: GITHUB_WORKER_TOKEN", "worker_token_env: GITHUB_AGENT_TOKEN"
+    )
+
+    with pytest.raises(InstanceError) as caught:
+        load(tmp_path, text)
+
+    message = str(caught.value)
+    assert "repository.agent_token_env" in message
+    assert "repository.worker_token_env" in message
+    assert "same variable" in message
+    assert "GITHUB_AGENT_TOKEN" not in message
 
 
 @pytest.mark.parametrize(
@@ -402,7 +422,9 @@ SECRET = "ghp_secret0123456789"
             "tracker.token",
         ),
         (
-            VALID.replace("  token_env: GITHUB_TOKEN\n", f"  token: {SECRET}\n"),
+            VALID.replace(
+                "  agent_token_env: GITHUB_AGENT_TOKEN\n", f"  token: {SECRET}\n"
+            ),
             "repository.token",
         ),
         (
