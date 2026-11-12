@@ -227,6 +227,8 @@ def test_agent_command_runs_claude_headless_with_the_rules_plugin_turns_and_sche
         "/plugin",
         "--max-turns",
         "40",
+        "--permission-mode",
+        "bypassPermissions",
         "--json-schema",
         json.dumps(outcome_schema(OUTCOMES)),
         "--output-format",

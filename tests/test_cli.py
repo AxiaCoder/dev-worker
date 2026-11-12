@@ -1826,6 +1826,7 @@ def test_container_runs_claude_on_the_ticket_with_the_worker_rules_and_only_the_
             "TWG_TOKEN": "jira-token",
             "TWG_SITE": "example.atlassian.net",
             "TWG_USER": "worker@example.com",
+            "IS_SANDBOX": "1",
         }
     ]
 
@@ -1903,6 +1904,7 @@ def test_container_of_an_api_key_agent_gets_the_key_as_anthropic_api_key_and_no_
             "TWG_TOKEN": "jira-token",
             "TWG_SITE": "example.atlassian.net",
             "TWG_USER": "worker@example.com",
+            "IS_SANDBOX": "1",
         }
     ]
 

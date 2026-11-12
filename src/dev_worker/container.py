@@ -90,7 +90,8 @@ def agent_command(
 
     `rules` is appended to its system prompt, `max_turns` caps its turns and `outcomes`
     are the outcomes it may end on (see `outcome_schema`); it loads the plugin mounted at
-    `PLUGIN_DIR` and answers in JSON.
+    `PLUGIN_DIR`, runs in `bypassPermissions` mode, never prompting for a permission, and
+    answers in JSON.
     """
     return (
         AGENT_PROGRAM,
@@ -102,6 +103,8 @@ def agent_command(
         PLUGIN_DIR,
         "--max-turns",
         str(max_turns),
+        "--permission-mode",
+        "bypassPermissions",
         "--json-schema",
         json.dumps(outcome_schema(outcomes)),
         "--output-format",
