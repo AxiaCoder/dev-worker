@@ -72,6 +72,14 @@ class _ViewAnswer(BaseModel):
     ]
 
 
+class _StateAnswer(BaseModel):
+    """The answer of `gh pr view --json state`."""
+
+    state: str
+
+
+MERGED = "MERGED"
+
 _UNREADABLE = object()
 
 
@@ -201,13 +209,15 @@ class GitHubRepository:
     def merge(self, pull_request: PullRequest) -> None:
         """Merge `pull_request` as one squashed commit whose subject is `pull_request.title`, which GitHub refuses once its head is not `pull_request.head`.
 
-        On a base branch that requires a merge queue, `gh` only enqueues the pull request,
-        and this returns as if it were merged.
+        Once `gh` has answered, the state of the pull request is read again; this returns
+        only when it is merged.
 
-        Raises `RepositoryError` when the token variable is not set or `gh` fails; when the
-        refusal is GitHub's for a moved head, it raises `HeadMovedError`, and nothing was
-        merged. After any other `RepositoryError` the merge may still have happened: the
-        pull request is to be read again, not assumed open.
+        Raises `RepositoryError` when the token variable is not set, `gh` fails, the state
+        read again cannot be read or is not merged (as when a merge queue only enqueued the
+        pull request); when the refusal is GitHub's for a moved head, it raises
+        `HeadMovedError`, and nothing was merged. After any other `RepositoryError` the
+        merge may still have happened: the pull request is to be read again, not assumed
+        open.
         """
         number = pull_request.number
         try:
@@ -231,6 +241,17 @@ class GitHubRepository:
                 f"the head of pull request #{number} has moved since commit "
                 f"{pull_request.head}; it was not merged"
             ) from None
+        action = f"reading the state of pull request #{number} after its merge"
+        answer = self._run_json(action, ["pr", "view", str(number), "--json", "state"])
+        try:
+            state = _StateAnswer.model_validate(answer).state
+        except ValidationError as error:
+            raise self._unreadable(action, error) from None
+        if state != MERGED:
+            raise RepositoryError(
+                f"pull request #{number} is not merged after gh merged it: its state "
+                f"is {state}; a merge queue may hold it"
+            )
 
     def _token(self) -> str:
         """Return the token held by the variable `token_env` names; raise `RepositoryError` if unset."""
