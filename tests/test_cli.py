@@ -5223,6 +5223,17 @@ def ending_on(outcome: str, message: str) -> ContainerExit:
     )
 
 
+def assert_blocked_run_fails(
+    answer: dict[str, object], instance: Path, reason: str
+) -> None:
+    """Check that a run left blocked fails naming `reason` and is journaled failed."""
+    assert_failed(answer, "task-1", reason)
+    assert [line["status"] for line in journal_lines(instance)] == [
+        "running",
+        "failed",
+    ]
+
+
 def test_done_merges_the_pull_request_once_the_container_is_gone_then_comments_and_moves_the_ticket_to_done(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
@@ -5293,7 +5304,7 @@ def test_done_on_a_ticket_carrying_the_hold_label_leaves_the_pull_request_open_a
     assert stub.moves == [IN_PROGRESS, IN_REVIEW]
 
 
-def test_done_without_a_pull_request_comments_why_and_moves_the_ticket_to_blocked(
+def test_done_without_a_pull_request_comments_why_moves_the_ticket_to_blocked_and_fails(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
@@ -5306,7 +5317,11 @@ def test_done_without_a_pull_request_comments_why_and_moves_the_ticket_to_blocke
         monkeypatch, capsysbinary, encode(valid_input()), instance=instance
     )
 
-    assert answer["errors"] == []
+    assert_blocked_run_fails(
+        answer,
+        instance,
+        "no open pull request has the branch agent/DEMO-1 as its head.",
+    )
     assert reachable_repository.calls == [("find_pull_request", "agent/DEMO-1")]
     assert stub.comments == [
         (
@@ -5323,7 +5338,7 @@ def test_done_without_a_pull_request_comments_why_and_moves_the_ticket_to_blocke
 @pytest.mark.parametrize(
     ("ci", "state"), [("failed", "failed"), ("running", "has not finished")]
 )
-def test_done_whose_ci_has_not_passed_is_not_merged_and_moves_the_ticket_to_blocked(
+def test_done_whose_ci_has_not_passed_is_not_merged_moves_the_ticket_to_blocked_and_fails(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
@@ -5334,8 +5349,13 @@ def test_done_whose_ci_has_not_passed_is_not_merged_and_moves_the_ticket_to_bloc
     stub = serve(monkeypatch, demo_ticket())
     reachable_repository.ci = ci
 
-    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
 
+    assert_blocked_run_fails(
+        answer, instance, f"the CI of the pull request {PULL.url} {state}"
+    )
     assert [name for name, _ in reachable_repository.calls] == [
         "find_pull_request",
         "read_ci",
@@ -5377,7 +5397,7 @@ def test_done_whose_ci_has_not_passed_is_not_merged_and_moves_the_ticket_to_bloc
         ),
     ],
 )
-def test_done_whose_repository_step_fails_comments_the_reason_and_moves_the_ticket_to_blocked(
+def test_done_whose_repository_step_fails_comments_the_reason_moves_the_ticket_to_blocked_and_fails(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
@@ -5393,13 +5413,13 @@ def test_done_whose_repository_step_fails_comments_the_reason_and_moves_the_tick
         monkeypatch, capsysbinary, encode(valid_input()), instance=instance
     )
 
-    assert answer["errors"] == []
+    assert_blocked_run_fails(answer, instance, str(error))
     assert [name for name, _ in reachable_repository.calls] == calls
     assert stub.comments == [("DEMO-1", f"{SUMMARY}\n\nThe ticket is blocked: {error}")]
     assert stub.moves == [IN_PROGRESS, BLOCKED]
 
 
-def test_done_whose_merge_fails_says_it_may_have_been_merged_and_moves_the_ticket_to_blocked(
+def test_done_whose_merge_fails_says_it_may_have_been_merged_moves_the_ticket_to_blocked_and_fails(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
@@ -5410,8 +5430,15 @@ def test_done_whose_merge_fails_says_it_may_have_been_merged_and_moves_the_ticke
         "gh did not answer within 60 seconds while merging pull request #7"
     )
 
-    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
 
+    assert_blocked_run_fails(
+        answer,
+        instance,
+        "gh did not answer within 60 seconds while merging pull request #7",
+    )
     assert [name for name, _ in reachable_repository.calls] == [
         "find_pull_request",
         "read_ci",
@@ -5430,7 +5457,7 @@ def test_done_whose_merge_fails_says_it_may_have_been_merged_and_moves_the_ticke
     assert stub.moves == [IN_PROGRESS, BLOCKED]
 
 
-def test_done_whose_ticket_cannot_be_read_again_is_not_merged_and_moves_it_to_blocked(
+def test_done_whose_ticket_cannot_be_read_again_is_not_merged_moves_it_to_blocked_and_fails(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
@@ -5449,7 +5476,9 @@ def test_done_whose_ticket_cannot_be_read_again_is_not_merged_and_moves_it_to_bl
         monkeypatch, capsysbinary, encode(valid_input()), instance=instance
     )
 
-    assert answer["errors"] == []
+    assert_blocked_run_fails(
+        answer, instance, "twg failed while reading DEMO-1: timeout"
+    )
     assert [name for name, _ in reachable_repository.calls] == [
         "find_pull_request",
         "read_ci",
