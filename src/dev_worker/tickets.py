@@ -1,4 +1,4 @@
-"""The ticket tracker as the rest of the worker sees it: read a ticket, claim it, change its status."""
+"""The ticket tracker as the rest of the worker sees it: read a ticket, claim it, comment on it, change its status."""
 
 from dataclasses import dataclass
 from datetime import datetime
@@ -51,7 +51,7 @@ class Claim:
 
 
 class TicketTracker(Protocol):
-    """A ticket tracker: reads a ticket by key, claims it for a run and changes its status."""
+    """A ticket tracker: reads a ticket by key, claims it for a run, comments on it and changes its status."""
 
     def check_access(self) -> None:
         """Raise `TrackerError` when the tracker cannot be reached with the instance credentials; change nothing."""
@@ -74,6 +74,14 @@ class TicketTracker(Protocol):
 
         Each claim carries the server time it was created at. A ticket that never entered `status` by a change of status gives all its claims.
         Raises `TrackerError` when they cannot be read.
+        """
+        ...
+
+    def comment(self, key: str, body: str) -> None:
+        """Post on the ticket `key` a plain-text comment holding `body`.
+
+        Raises `TrackerError` on failure. After any `TrackerError` the comment may still
+        have been posted.
         """
         ...
 

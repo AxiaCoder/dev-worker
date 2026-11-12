@@ -4,7 +4,8 @@ A run pulls its image when the daemon does not have it, within the time left in 
 run, then creates one container with `docker create --rm`, the worktree bind-mounted at
 `WORKDIR` and the plugin checkout bind-mounted read only at `PLUGIN_DIR`, nothing else
 mounted, then starts it; `--rm` has Docker remove it once it
-ends. The container runs Claude Code headless on the ticket (see `agent_command`), and
+ends. The container runs Claude Code headless on the ticket (see `agent_command`); what
+it writes to stdout and its exit code are handed back (see `ContainerExit`). It
 receives no environment variable but those the run names, whose values never appear on
 the docker command line. The container is named, so that a run reaching its duration ceiling, or
 interrupted, can remove it by force: created before it is started, it exists by then,
@@ -23,7 +24,9 @@ import subprocess
 import time
 import uuid
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
+from typing import NoReturn
 
 from dev_worker.github import failure_reason
 from dev_worker.tickets import Ticket
@@ -34,6 +37,7 @@ PLUGIN_DIR = "/plugin"
 AGENT_PROGRAM = "claude"
 NAME_PREFIX = "dev-worker-"
 OWNER_LABEL = "dev-worker.instance"
+DOCKER_FAILURE_CODES = (125, 126, 127)
 
 
 class ContainerError(Exception):
@@ -41,6 +45,15 @@ class ContainerError(Exception):
 
     The message is a sentence saying why.
     """
+
+
+@dataclass(frozen=True)
+class ContainerExit:
+    """How a container that ran ended: its exit code, and what it wrote to stdout and stderr."""
+
+    code: int
+    stdout: str
+    stderr: str
 
 
 def ticket_prompt(ticket: Ticket) -> str:
@@ -144,8 +157,8 @@ class Container:
         plugin: Path,
         command: Sequence[str],
         environment: Mapping[str, str],
-    ) -> None:
-        """Run `command` in a new container with `worktree` mounted, and wait for it to end.
+    ) -> ContainerExit:
+        """Run `command` in a new container with `worktree` mounted, wait for it to end and return how it ended.
 
         The plugin checkout `plugin` is mounted read only at `PLUGIN_DIR`. The container
         receives the variables of `environment`, by name and value, and no other; the
@@ -154,10 +167,12 @@ class Container:
         The image is pulled when it is missing, then the container is created and
         started. `time_left` is the time left in the run, in seconds, counted from the
         call; it bounds the pull and the run of the container, and a container still
-        there when it runs out is removed by force. Raises `ContainerError` when the
-        image cannot be pulled, the container cannot be created or started, exits
-        nonzero, or `time_left` runs out, whether the container could then be removed
-        or not. Any other exception raised meanwhile, such as `KeyboardInterrupt`, has
+        there when it runs out is removed by force. A container that ends with any exit
+        code but those `DOCKER_FAILURE_CODES` holds, by which docker reports it could not
+        run the command, is returned, its output kept. Raises `ContainerError` when the
+        image cannot be pulled, the container cannot be created or started, docker
+        exits with one of `DOCKER_FAILURE_CODES`, or `time_left` runs out, whether the
+        container could then be removed or not. Any other exception raised meanwhile, such as `KeyboardInterrupt`, has
         the container removed by force and is raised again; a removal that fails is
         added to it as a note.
         """
@@ -193,13 +208,17 @@ class Container:
                     f"the run reached its ceiling before the container {name} "
                     "was started",
                 )
-            self._docker(
+            done = self._execute(
                 "running the container",
                 "start",
                 "--attach",
                 name,
                 timeout=start_time_left,
             )
+            if done.returncode in DOCKER_FAILURE_CODES:
+                raise ContainerError(
+                    f"docker failed while running the container: {failure_reason(done)}"
+                )
         except subprocess.TimeoutExpired:
             self._remove_at_ceiling(
                 name,
@@ -216,6 +235,7 @@ class Container:
                     f"the container {name} could not be removed: {removal_error}"
                 )
             raise
+        return ContainerExit(done.returncode, done.stdout, done.stderr)
 
     def running(self) -> list[str]:
         """Return the names of the containers of the owner still running, in Docker's order.
@@ -289,7 +309,7 @@ class Container:
                 "reached its ceiling"
             ) from None
 
-    def _remove_at_ceiling(self, name: str, reached: str) -> None:
+    def _remove_at_ceiling(self, name: str, reached: str) -> NoReturn:
         """Remove the container `name` by force, then raise `ContainerError` from `reached`.
 
         `reached` is the sentence saying where the run was at its ceiling; the error
@@ -319,11 +339,31 @@ class Container:
     ) -> str:
         """Run docker with `arguments` and return what it wrote to stdout.
 
+        Raises what `_execute` raises, and `ContainerError` when docker exits nonzero.
+        """
+        done = self._execute(
+            action, *arguments, timeout=timeout, environment=environment
+        )
+        if done.returncode != 0:
+            raise ContainerError(
+                f"docker failed while {action}: {failure_reason(done)}"
+            )
+        return done.stdout
+
+    def _execute(
+        self,
+        action: str,
+        *arguments: str,
+        timeout: float | None = None,
+        environment: Mapping[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run docker with `arguments` and return the finished process, whatever its exit code.
+
         `action` names the call in error sentences. `environment` is added to the
         environment docker inherits. `timeout` bounds the call, in
         seconds, `self._timeout` when None; a call reaching it is stopped and raises
         `subprocess.TimeoutExpired` when `timeout` was given, `ContainerError` otherwise.
-        Raises `ContainerError` when docker cannot be started or exits nonzero.
+        Raises `ContainerError` when docker cannot be started.
         """
         try:
             done = subprocess.run(
@@ -345,8 +385,4 @@ class Container:
         except OSError as error:
             reason = error.strerror or type(error).__name__
             raise ContainerError(f"docker could not be started: {reason}") from None
-        if done.returncode != 0:
-            raise ContainerError(
-                f"docker failed while {action}: {failure_reason(done)}"
-            )
-        return done.stdout
+        return done

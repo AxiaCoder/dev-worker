@@ -11,6 +11,7 @@ import pytest
 from dev_worker.container import (
     Container,
     ContainerError,
+    ContainerExit,
     agent_command,
     mount_option,
     outcome_schema,
@@ -330,7 +331,7 @@ def test_a_container_that_cannot_be_created_raises_naming_why(
     assert [call[0] for call in calls(record)] == ["image", "create"]
 
 
-def test_a_container_that_cannot_be_started_or_exits_nonzero_raises_naming_why(
+def test_a_container_whose_command_docker_cannot_run_raises_naming_why(
     record: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     answer(monkeypatch, "start", stderr="exec failed\n", code=126)
@@ -342,6 +343,32 @@ def test_a_container_that_cannot_be_started_or_exits_nonzero_raises_naming_why(
         "docker failed while running the container: exec failed"
     )
     assert [call[0] for call in calls(record)] == ["image", "create", "start"]
+
+
+@pytest.mark.parametrize("code", [125, 127])
+def test_docker_exiting_with_a_code_of_its_own_raises_naming_why(
+    record: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, code: int
+) -> None:
+    answer(monkeypatch, "start", stderr="daemon error\n", code=code)
+
+    with pytest.raises(
+        ContainerError,
+        match="^docker failed while running the container: daemon error$",
+    ):
+        container().run(tmp_path, 60, PLUGIN, COMMAND, {})
+
+
+@pytest.mark.parametrize("code", [0, 1])
+def test_a_container_that_ends_gives_back_its_exit_code_and_output(
+    record: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, code: int
+) -> None:
+    answer(
+        monkeypatch, "start", stdout='{"type": "result"}', stderr="note\n", code=code
+    )
+
+    exited = container().run(tmp_path, 60, PLUGIN, COMMAND, {})
+
+    assert exited == ContainerExit(code, '{"type": "result"}', "note\n")
 
 
 def test_a_container_still_running_when_the_time_is_up_is_removed_by_its_name(

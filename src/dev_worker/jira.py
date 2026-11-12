@@ -405,13 +405,28 @@ class JiraTracker:
         `twg` fails, or its answer cannot be read. After any `TrackerError` the comment may
         still have been posted.
         """
+        return self._comment(key, f"{CLAIM_MARKER}{task_id}", f"claiming {key}")
+
+    def comment(self, key: str, body: str) -> None:
+        """Post on the ticket `key` a plain-text comment holding `body`.
+
+        Raises `TrackerError` when `key` is not a ticket key, the token variable is not set,
+        `twg` fails, or its answer cannot be read. After any `TrackerError` the comment may
+        still have been posted.
+        """
+        self._comment(key, body, f"commenting on {key}")
+
+    def _comment(self, key: str, body: str, action: str) -> int:
+        """Post on the ticket `key` a plain-text comment holding `body`; return the comment id.
+
+        `action` names the call in error sentences. Raises as `comment` does.
+        """
         _check_key(key)
-        action = f"claiming {key}"
         answer = self._run(
             action,
             [
                 "jira", "workitem", "comment", "create", "--issue-id", key,
-                "--body", f"{CLAIM_MARKER}{task_id}", "--body-format", "plain",
+                f"--body={body}", "--body-format", "plain",
             ],
         )  # fmt: skip
         return _validate(_CreatedAnswer, answer, action).data.id
