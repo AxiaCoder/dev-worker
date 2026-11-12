@@ -13,7 +13,11 @@ tracker:
 repository:
   type: github
   name: example-org/example-app
-  token_env: GITHUB_TOKEN
+  # Two tokens, each in its own variable. The agent's goes to the container: it can push
+  # branches and open pull requests, but cannot update the base branch. The worker's stays
+  # with the worker, which merges with it.
+  agent_token_env: GITHUB_AGENT_TOKEN
+  worker_token_env: GITHUB_WORKER_TOKEN
 
 # The AI agent a run starts in its container: how it signs in, and the name of the environment
 # variable that holds its credential, never the credential itself.

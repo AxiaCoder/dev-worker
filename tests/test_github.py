@@ -15,7 +15,13 @@ from dev_worker.repositories import HeadMovedError, PullRequest, RepositoryError
 
 FAKE_GH = Path(__file__).with_name("fake_gh.py")
 TOKEN = "s3cret-token-value"
-REPOSITORY = Repository(type="github", name="octo/widgets", token_env="GITHUB_TOKEN")
+AGENT_TOKEN = "agent-token-value"
+REPOSITORY = Repository(
+    type="github",
+    name="octo/widgets",
+    agent_token_env="AGENT_TOKEN",
+    worker_token_env="GITHUB_TOKEN",
+)
 HEAD = "0123456789abcdef0123456789abcdef01234567"
 MOVED = "fedcba9876543210fedcba9876543210fedcba98"
 TITLE = "feat: the widgets page lists the widgets"
@@ -633,6 +639,32 @@ def test_check_access_asks_gh_for_the_active_github_account_only(
         "auth", "status", "--active", "--hostname", "github.com",
     ]  # fmt: skip
     assert called(record)["env"] == {"GH_TOKEN": TOKEN, "GH_PROMPT_DISABLED": "1"}
+
+
+def test_calls_use_the_worker_token_not_the_agent_token(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AGENT_TOKEN", AGENT_TOKEN)
+    merged = {"state": "MERGED"}
+    answer_in_turn(monkeypatch, record, "", merged)
+
+    repository().merge(PULL)
+
+    assert called(record)["env"]["GH_TOKEN"] == TOKEN
+
+
+def test_check_access_uses_the_token_variable_it_is_given(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AGENT_TOKEN", AGENT_TOKEN)
+    answer(monkeypatch, "github.com\n  ✓ Logged in to github.com\n")
+    agent = GitHubRepository(
+        REPOSITORY, command=[sys.executable, str(FAKE_GH)], token_env="AGENT_TOKEN"
+    )
+
+    agent.check_access()
+
+    assert called(record)["env"]["GH_TOKEN"] == AGENT_TOKEN
 
 
 def test_a_token_gh_cannot_sign_in_with_refuses_access_without_echoing_it(

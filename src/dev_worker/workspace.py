@@ -264,8 +264,8 @@ class Workspace:
             raise WorkspaceError(f"{error}; then {cleanup_error}") from error
 
     def _token(self) -> str:
-        """Return the token held by the variable `token_env` names; raise `WorkspaceError` if unset."""
-        name = self._repository.token_env
+        """Return the token held by the variable `worker_token_env` names; raise `WorkspaceError` if unset."""
+        name = self._repository.worker_token_env
         token = os.environ.get(name)
         if not token:
             raise WorkspaceError(

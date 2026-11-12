@@ -104,10 +104,10 @@ class GitHubRepository:
     """A `CodeRepository` for the GitHub repository `repository`, through the `gh` command line.
 
     `command` is the program and leading arguments that run `gh`. Each call passes
-    `GH_PROMPT_DISABLED` and, as `GH_TOKEN`, the value of the variable
-    `repository.token_env` names, read at call time; each call on the repository also
-    passes `--repo` with the repository name. `timeout` is the bound of each call, in
-    seconds.
+    `GH_PROMPT_DISABLED` and, as `GH_TOKEN`, the value of the variable `token_env`
+    names, read at call time: `repository.worker_token_env` unless another is given. Each
+    call on the repository also passes `--repo` with the repository name. `timeout` is the
+    bound of each call, in seconds.
     """
 
     def __init__(
@@ -115,11 +115,15 @@ class GitHubRepository:
         repository: Repository,
         command: Sequence[str] = ("gh",),
         timeout: float = GH_TIMEOUT_SECONDS,
+        token_env: str | None = None,
     ) -> None:
-        """Keep `repository`, `command` and `timeout` for later calls; nothing is run or read yet."""
+        """Keep `repository`, `command`, `timeout` and the token variable for later calls; nothing is run or read yet."""
         self._repository = repository
         self._command = tuple(command)
         self._timeout = timeout
+        self._token_env = (
+            repository.worker_token_env if token_env is None else token_env
+        )
 
     def check_access(self) -> None:
         """Raise `RepositoryError` unless `gh` is signed in to github.com with the instance token.
@@ -255,7 +259,7 @@ class GitHubRepository:
 
     def _token(self) -> str:
         """Return the token held by the variable `token_env` names; raise `RepositoryError` if unset."""
-        name = self._repository.token_env
+        name = self._token_env
         token = os.environ.get(name)
         if not token:
             raise RepositoryError(
