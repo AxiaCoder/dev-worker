@@ -11,8 +11,11 @@ import json
 import os
 import re
 import subprocess
-from collections.abc import Sequence
-from typing import Annotated
+import textwrap
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from functools import partial
+from itertools import count, repeat
+from typing import Annotated, Any
 
 from pydantic import AwareDatetime, BaseModel, Field, ValidationError
 
@@ -27,6 +30,7 @@ TWG_TIMEOUT_SECONDS = 60.0
 CLAIM_MARKER = "dev-worker claims this ticket for task "
 PAGE_SIZE = "100"
 TEXT_BLOCKS = frozenset({"paragraph", "heading", "codeBlock"})
+NESTED_INDENT = "  "
 
 
 class _Status(BaseModel):
@@ -175,9 +179,19 @@ def _plain_text(body: object) -> str:
 def _document_text(document: object) -> str:
     """Return a ticket description as plain text, empty when it is absent.
 
-    The description is a string, kept as it is, or an Atlassian document, whose text
-    nodes are joined with a line ending each paragraph, heading, code block and hard
-    break; leading and trailing blank space is removed from a document's text.
+    The description is a string, kept as it is, or an Atlassian document, read as
+    markdown-like text:
+
+    - a line ends each paragraph, heading, code block, hard break and block or embed
+      card holding a URL;
+    - a link card reads as its URL, a text linked elsewhere as `text (url)`;
+    - a mention, emoji or status reads as its text, a date as its timestamp in
+      milliseconds;
+    - a bullet list item starts with `- `, an ordered one with its number, counted from
+      the list's start order or from 1; each nesting level is indented by two spaces;
+    - a node whose attributes are missing or malformed reads as nothing.
+
+    Leading and trailing blank space is removed from a document's text.
     """
     if isinstance(document, str):
         return document
@@ -191,12 +205,84 @@ def _blocks_text(node: object) -> str:
     if not isinstance(node, dict):
         return ""
     kind = node.get("type")
-    if kind == "hardBreak":
-        return "\n"
+    render = _RENDERERS.get(kind, _node_text)
+    own = render(node)
+    return own + "\n" if kind in TEXT_BLOCKS else own
+
+
+def _node_text(node: dict[Any, Any]) -> str:
+    """Return the text of `node` followed by the text of its content; a linked text names its URL."""
     text = node.get("text")
     own = text if isinstance(text, str) else ""
-    own += _blocks_text(node.get("content"))
-    return own + "\n" if kind in TEXT_BLOCKS else own
+    href = _link(node)
+    if href and href != own:
+        own += f" ({href})"
+    return own + _blocks_text(node.get("content"))
+
+
+def _link(node: dict[Any, Any]) -> str:
+    """Return the URL of the link mark of `node`, empty when it has none."""
+    marks = node.get("marks")
+    for mark in marks if isinstance(marks, list) else ():
+        if isinstance(mark, dict) and mark.get("type") == "link":
+            return _attribute(mark, name="href")
+    return ""
+
+
+def _attribute(node: dict[Any, Any], name: str) -> str:
+    """Return the string attribute `name` of `node`, empty when it is missing or not a string."""
+    attrs = node.get("attrs")
+    value = attrs.get(name) if isinstance(attrs, dict) else None
+    return value if isinstance(value, str) else ""
+
+
+def _block_card_text(node: dict[Any, Any]) -> str:
+    """Return the URL of a block or embed card as a line, empty when it has none."""
+    url = _attribute(node, name="url")
+    return url + "\n" if url else ""
+
+
+def _bullet_list_text(node: dict[Any, Any]) -> str:
+    """Return the items of a bullet list, each starting with `- `."""
+    return _list_text(node, repeat("- "))
+
+
+def _ordered_list_text(node: dict[Any, Any]) -> str:
+    """Return the items of an ordered list, numbered from its integer start order, or from 1."""
+    attrs = node.get("attrs")
+    order = attrs.get("order") if isinstance(attrs, dict) else None
+    start = order if isinstance(order, int) else 1
+    return _list_text(node, (f"{number}. " for number in count(start)))
+
+
+def _list_text(node: dict[Any, Any], markers: Iterator[str]) -> str:
+    """Return the items of a list, each starting with the next of `markers`.
+
+    The lines after an item's first are indented by `NESTED_INDENT`.
+    """
+    content = node.get("content")
+    items: Iterable[object] = content if isinstance(content, list) else ()
+    return "".join(_item_text(item, marker) for item, marker in zip(items, markers))
+
+
+def _item_text(item: object, marker: str) -> str:
+    """Return the text of a list item, starting with `marker`, its later lines indented."""
+    first, newline, rest = _blocks_text(item).partition("\n")
+    return marker + first + newline + textwrap.indent(rest, NESTED_INDENT)
+
+
+_RENDERERS: dict[object, Callable[[dict[Any, Any]], str]] = {
+    "hardBreak": lambda _: "\n",
+    "bulletList": _bullet_list_text,
+    "orderedList": _ordered_list_text,
+    "inlineCard": partial(_attribute, name="url"),
+    "blockCard": _block_card_text,
+    "embedCard": _block_card_text,
+    "mention": partial(_attribute, name="text"),
+    "emoji": partial(_attribute, name="text"),
+    "status": partial(_attribute, name="text"),
+    "date": partial(_attribute, name="timestamp"),
+}
 
 
 def _check_key(key: str) -> None:

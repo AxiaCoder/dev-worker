@@ -334,7 +334,7 @@ def test_a_description_written_as_an_atlassian_document_is_read_as_plain_text(
 
     ticket = tracker().read("ABC-218")
 
-    assert ticket.description == "Goal\nRun main\nagain.\none\nx = 1"
+    assert ticket.description == "Goal\nRun main\nagain.\n- one\nx = 1"
 
 
 @pytest.mark.parametrize("present", [True, False])
@@ -403,7 +403,193 @@ def test_a_description_ending_on_a_hard_break_or_holding_unknown_nodes_keeps_onl
     }
     answer(monkeypatch, {"data": [{**ITEM, "description": document}]})
 
-    assert tracker().read("ABC-218").description == "deep\nend"
+    assert tracker().read("ABC-218").description == "1. - deep\nend"
+
+
+SPEC_URL = "https://example.com/spec"
+
+
+def described_as(monkeypatch: pytest.MonkeyPatch, *blocks: dict[str, Any]) -> str:
+    """Return the description read from a ticket whose document holds `blocks`."""
+    document = {"type": "doc", "version": 1, "content": list(blocks)}
+    answer(monkeypatch, {"data": [{**ITEM, "description": document}]})
+    return tracker().read("ABC-218").description
+
+
+def paragraph(*inline: object) -> dict[str, Any]:
+    """Return an Atlassian paragraph node holding `inline`."""
+    return {"type": "paragraph", "content": list(inline)}
+
+
+def text(value: str, *marks: dict[str, Any]) -> dict[str, Any]:
+    """Return an Atlassian text node, with `marks` when given."""
+    node: dict[str, Any] = {"type": "text", "text": value}
+    if marks:
+        node["marks"] = list(marks)
+    return node
+
+
+def list_of(kind: str, *items: str, **attrs: object) -> dict[str, Any]:
+    """Return an Atlassian list node of `kind` whose items each hold one paragraph."""
+    node: dict[str, Any] = {
+        "type": kind,
+        "content": [
+            {"type": "listItem", "content": [paragraph(text(item))]} for item in items
+        ],
+    }
+    if attrs:
+        node["attrs"] = attrs
+    return node
+
+
+def test_a_pasted_link_card_in_a_paragraph_is_read_as_its_url(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    card = {"type": "inlineCard", "attrs": {"url": SPEC_URL}}
+
+    description = described_as(monkeypatch, paragraph(text("Follow the spec: "), card))
+
+    assert description == f"Follow the spec: {SPEC_URL}"
+
+
+@pytest.mark.parametrize("kind", ["blockCard", "embedCard"])
+def test_a_link_card_standing_as_a_block_is_read_as_its_url(
+    record: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    card = {"type": kind, "attrs": {"url": SPEC_URL}}
+
+    description = described_as(monkeypatch, paragraph(text("Follow the spec:")), card)
+
+    assert description == f"Follow the spec:\n{SPEC_URL}"
+
+
+def test_a_linked_text_is_followed_by_its_url_in_brackets(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    linked = text("the spec", {"type": "link", "attrs": {"href": SPEC_URL}})
+
+    description = described_as(monkeypatch, paragraph(text("Read "), linked, text(".")))
+
+    assert description == f"Read the spec ({SPEC_URL})."
+
+
+def test_a_linked_text_that_is_its_own_url_is_not_doubled(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    linked = text(SPEC_URL, {"type": "link", "attrs": {"href": SPEC_URL}})
+
+    description = described_as(monkeypatch, paragraph(text("See "), linked))
+
+    assert description == f"See {SPEC_URL}"
+
+
+@pytest.mark.parametrize(
+    ("kind", "shown"),
+    [("mention", "@Axia"), ("emoji", ":warning:"), ("status", "IN REVIEW")],
+)
+def test_a_mention_emoji_or_status_is_read_as_its_text(
+    record: Path, monkeypatch: pytest.MonkeyPatch, kind: str, shown: str
+) -> None:
+    node = {"type": kind, "attrs": {"text": shown}}
+
+    description = described_as(monkeypatch, paragraph(text("Ask "), node, text(" now")))
+
+    assert description == f"Ask {shown} now"
+
+
+def test_a_date_is_read_as_its_timestamp_in_milliseconds(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    date = {"type": "date", "attrs": {"timestamp": "1767225600000"}}
+
+    description = described_as(monkeypatch, paragraph(text("Due "), date))
+
+    assert description == "Due 1767225600000"
+
+
+def test_a_bullet_list_item_starts_with_a_dash(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    description = described_as(monkeypatch, list_of("bulletList", "one", "two"))
+
+    assert description == "- one\n- two"
+
+
+def test_an_ordered_list_item_starts_with_its_number_from_one(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    description = described_as(monkeypatch, list_of("orderedList", "one", "two"))
+
+    assert description == "1. one\n2. two"
+
+
+def test_an_ordered_list_with_a_start_order_numbers_its_items_from_it(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ordered = list_of("orderedList", "three", "four", order=3)
+
+    assert described_as(monkeypatch, ordered) == "3. three\n4. four"
+
+
+def test_a_nested_list_is_indented_by_two_spaces_under_its_item(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    nested = list_of("bulletList", "deep", "deeper")
+    parent = {"type": "listItem", "content": [paragraph(text("parent")), nested]}
+    sibling = {"type": "listItem", "content": [paragraph(text("next"))]}
+    ordered = {"type": "orderedList", "content": [parent, sibling]}
+
+    description = described_as(monkeypatch, ordered)
+
+    assert description == "1. parent\n  - deep\n  - deeper\n2. next"
+
+
+@pytest.mark.parametrize("order", ["3", None, 2.5])
+def test_an_ordered_list_with_a_malformed_start_order_numbers_from_one(
+    record: Path, monkeypatch: pytest.MonkeyPatch, order: object
+) -> None:
+    ordered = list_of("orderedList", "one", "two", order=order)
+
+    assert described_as(monkeypatch, ordered) == "1. one\n2. two"
+
+
+@pytest.mark.parametrize(
+    "node",
+    [
+        {"type": "inlineCard"},
+        {"type": "inlineCard", "attrs": "https://example.com/spec"},
+        {"type": "blockCard", "attrs": {"url": 42}},
+        {"type": "embedCard", "attrs": {}},
+        {"type": "mention", "attrs": {"text": None}},
+        {"type": "emoji", "attrs": ["x"]},
+        {"type": "status"},
+        {"type": "date", "attrs": {"timestamp": 1767225600000}},
+        {"type": "date", "attrs": None},
+    ],
+)
+def test_a_node_whose_attributes_are_missing_or_malformed_reads_as_nothing(
+    record: Path, monkeypatch: pytest.MonkeyPatch, node: dict[str, Any]
+) -> None:
+    description = described_as(monkeypatch, paragraph(text("a"), node, text("b")))
+
+    assert description == "ab"
+
+
+@pytest.mark.parametrize(
+    "mark",
+    [
+        {"type": "link"},
+        {"type": "link", "attrs": None},
+        {"type": "link", "attrs": {"href": 42}},
+        {"type": "link", "attrs": {}},
+    ],
+)
+def test_a_link_mark_without_a_usable_url_keeps_only_its_text(
+    record: Path, monkeypatch: pytest.MonkeyPatch, mark: dict[str, Any]
+) -> None:
+    description = described_as(monkeypatch, paragraph(text("the spec", mark)))
+
+    assert description == "the spec"
 
 
 @pytest.mark.parametrize("description", [42, ["a"], True])
