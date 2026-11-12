@@ -5763,6 +5763,32 @@ def test_done_whose_worktree_cannot_be_removed_still_merges_and_moves_the_ticket
     assert stub.moves == [IN_PROGRESS, MERGED]
 
 
+def test_done_whose_worktree_cannot_be_removed_and_ticket_ends_blocked_reports_both_reasons(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    reachable_repository: ReachableRepository,
+) -> None:
+    serve(monkeypatch, demo_ticket())
+    workspace.fail = "close"
+    reachable_repository.ci = "running"
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    errors: Any = answer["errors"]
+    assert answer["status"] == "failed"
+    assert sorted(errors) == [
+        (
+            "The run ended on 'done' but its ticket is blocked: the CI of the pull "
+            f"request {PULL.url} has not finished; it was not merged."
+        ),
+        "The worktree cannot be removed: close broke",
+    ]
+
+
 def test_comment_that_fails_is_reported_and_the_ticket_is_still_moved(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],

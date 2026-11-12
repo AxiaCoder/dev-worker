@@ -620,7 +620,8 @@ def run_under_lock(
     `settle_ticket`): by the outcome the run ended on when it is usable and its work
     rescued, as `blocked` with the reason otherwise, a `running` line that cannot be
     written included. A run that ended on `done` but whose ticket is left blocked fails,
-    the reason as its error, and is journaled `failed`. A tracker failure while
+    the reason as its first error ahead of the errors its output already carried, and
+    is journaled `failed`. A tracker failure while
     settling adds its reason to `errors`. An exception raised by `handler` leaves the
     ticket as it is.
     """
@@ -668,7 +669,9 @@ def run_under_lock(
     blocking, errors = settle_ticket(ticket_key, ending, instance, worker, tracker)
     if blocking is not None:
         output = failed(
-            task_id, f"The run ended on 'done' but its ticket is blocked: {blocking}"
+            task_id,
+            f"The run ended on 'done' but its ticket is blocked: {blocking}",
+            *output.errors,
         )
     output = with_errors(output, errors)
     entry |= {"status": output.status, "duration": time.monotonic() - mandate_began}
