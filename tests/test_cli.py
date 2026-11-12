@@ -5780,7 +5780,7 @@ def test_done_whose_worktree_cannot_be_removed_and_ticket_ends_blocked_reports_b
 
     errors: Any = answer["errors"]
     assert answer["status"] == "failed"
-    assert sorted(errors) == [
+    assert errors == [
         (
             "The run ended on 'done' but its ticket is blocked: the CI of the pull "
             f"request {PULL.url} has not finished; it was not merged."
