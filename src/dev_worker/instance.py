@@ -137,6 +137,17 @@ class Repository(BaseModel):
     token_env: EnvName
 
 
+class Agent(BaseModel):
+    """The AI agent a run starts in its container, and the environment variable holding its token.
+
+    `token_env` names the variable holding the Claude Code OAuth token.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    token_env: EnvName
+
+
 class Container(BaseModel):
     """The container a run starts: `image` is its image, pinned by a tag or a digest."""
 
@@ -161,6 +172,7 @@ class _InstanceData(BaseModel):
 
     tracker: Tracker
     repository: Repository
+    agent: Agent
     branch: BranchTemplate
     container: Container
     git: GitIdentity
@@ -182,6 +194,7 @@ class Instance:
 
     tracker: Tracker
     repository: Repository
+    agent: Agent
     branch: str
     container: Container
     git: GitIdentity
@@ -290,6 +303,7 @@ def load_instance(path: Path, header: Header) -> Instance:
     return Instance(
         tracker=data.tracker,
         repository=data.repository,
+        agent=data.agent,
         branch=data.branch,
         container=data.container,
         git=data.git,

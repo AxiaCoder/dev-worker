@@ -5,7 +5,7 @@ import runpy
 import shutil
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 
 from dev_worker import cli, run_journal
-from dev_worker.container import Container, ContainerError
+from dev_worker.container import Container, ContainerError, agent_command
 from dev_worker.contract import MandateInput, MandateOutput
 from dev_worker.github import GitHubRepository
 from dev_worker.header import HeaderError, Plugin
@@ -73,7 +73,14 @@ class ReadyTracker:
 
     def read(self, key: str) -> Ticket:
         """Return the ticket `key`, ready and unblocked."""
-        return Ticket(key=key, status="To Do", labels=(), blockers=())
+        return Ticket(
+            key=key,
+            status="To Do",
+            labels=(),
+            blockers=(),
+            title="Add a login page",
+            description="The page asks for an email.",
+        )
 
     def claim(self, key: str, task_id: str) -> int:
         """Return the claim id 1."""
@@ -201,6 +208,8 @@ class FakeContainer:
         self.images: list[str] = []
         self.directories: list[Path] = []
         self.calls: list[tuple[object, ...]] = []
+        self.commands: list[tuple[str, ...]] = []
+        self.environments: list[dict[str, str]] = []
 
     def make(self, image: str, directory: Path) -> "FakeContainer":
         """Record `image` and `directory`; return this fake, in place of `cli.make_container`."""
@@ -217,8 +226,17 @@ class FakeContainer:
         """Record the check."""
         self._step("check_access")
 
-    def run(self, worktree: Path, time_left: float, plugin: Path) -> None:
-        """Record the run on `worktree` with `time_left` seconds left and `plugin` mounted."""
+    def run(
+        self,
+        worktree: Path,
+        time_left: float,
+        plugin: Path,
+        command: Sequence[str],
+        environment: Mapping[str, str],
+    ) -> None:
+        """Record the run on `worktree` with `time_left` seconds left and `plugin` mounted, then its command and environment."""
+        self.commands.append(tuple(command))
+        self.environments.append(dict(environment))
         self._step("run", worktree, time_left, plugin)
 
     def check_none_running(self) -> None:
@@ -228,6 +246,14 @@ class FakeContainer:
     def kill_running(self) -> None:
         """Record the killing of the containers of the instance still running."""
         self._step("kill_running")
+
+
+@pytest.fixture(autouse=True)
+def tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Set the token variables the example instance names."""
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "agent-token")
+    monkeypatch.setenv("GITHUB_TOKEN", "github-token")
+    monkeypatch.setenv("JIRA_TOKEN", "jira-token")
 
 
 @pytest.fixture(autouse=True)
@@ -435,7 +461,14 @@ def serve(
 
 def demo_ticket(status: str = "To Do", *blockers: Blocker) -> Ticket:
     """Return the ticket DEMO-1 in `status`, blocked by `blockers`."""
-    return Ticket(key="DEMO-1", status=status, labels=(), blockers=blockers)
+    return Ticket(
+        key="DEMO-1",
+        status=status,
+        labels=(),
+        blockers=blockers,
+        title="",
+        description="",
+    )
 
 
 def test_run_reads_the_mandate_ticket_from_the_tracker_of_the_instance(
@@ -934,7 +967,14 @@ class TimedTracker(ReadyTracker):
             self.clock[0] += self.reread_seconds
             self.wall[0] += self.reread_seconds + self.reread_suspended_seconds
         status = self.status_after_claim if self.claimed else "To Do"
-        return Ticket(key=key, status=status, labels=(), blockers=())
+        return Ticket(
+            key=key,
+            status=status,
+            labels=(),
+            blockers=(),
+            title="",
+            description="",
+        )
 
     def claim(self, key: str, task_id: str) -> int:
         """Keep the claim of `task_id`, created at `own_created`, then `later`; return its id."""
@@ -1677,6 +1717,73 @@ def test_container_runs_from_the_instance_image_on_the_worktree_before_the_manda
             [("run", workspace.worktree, 1800, CHECKOUT)],
         )
     ]
+
+
+def test_container_runs_claude_on_the_ticket_with_the_worker_rules_and_only_the_run_variables(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+) -> None:
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed"
+    worker = cli.load_worker()
+    ticket = ReadyTracker().read("DEMO-1")
+    assert container.commands == [
+        agent_command(
+            ticket,
+            worker.body,
+            40,
+            ["done", "blocked", "needs_human", "abandoned"],
+        )
+    ]
+    assert container.environments == [
+        {
+            "CLAUDE_CODE_OAUTH_TOKEN": "agent-token",
+            "GH_TOKEN": "github-token",
+            "TWG_TOKEN": "jira-token",
+            "TWG_SITE": "example.atlassian.net",
+            "TWG_USER": "worker@example.com",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("variable", "service"),
+    [
+        ("CLAUDE_CODE_OAUTH_TOKEN", "Claude Code"),
+        ("GITHUB_TOKEN", "GitHub"),
+        ("JIRA_TOKEN", "Jira"),
+    ],
+)
+def test_a_token_variable_unset_fails_the_run_naming_it_without_starting_the_container(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+    variable: str,
+    service: str,
+) -> None:
+    monkeypatch.setenv(variable, "")
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(
+        answer,
+        "task-1",
+        f"The container was not started: the variable {variable}, which should "
+        f"hold the {service} token, is not set.",
+    )
+    assert container.commands == []
+    errors = json.dumps(answer["errors"])
+    assert not any(
+        value in errors for value in ("agent-token", "github-token", "jira-token")
+    )
 
 
 def test_run_prepares_the_plugin_the_header_names_in_the_instance_directory(

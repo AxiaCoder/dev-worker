@@ -32,6 +32,8 @@ repository:
   type: github
   name: example/project
   token_env: GITHUB_TOKEN
+agent:
+  token_env: CLAUDE_CODE_OAUTH_TOKEN
 branch: agent/{key}
 container:
   image: python:3.12-slim

@@ -21,7 +21,7 @@ An instance is one YAML file that points the worker at a tracker project and a r
 5. Under `git`, set the `name` and `email` of the commits the worker makes; use the account's noreply address, so that a push is not refused for exposing a private email.
 6. Map every status key of the header to the status name your tracker really uses; two keys cannot share one status.
 7. Under `hold_merge_label`, name the ticket label that holds a merge back: a ticket carrying it keeps its pull request open.
-8. Under `token_env`, write the name of the environment variable that holds each token, and set that variable in the worker's environment. The file never holds a token.
+8. Under `token_env`, write the name of the environment variable that holds each token — the tracker's, the repository's, and under `agent` the Claude Code OAuth token — and set that variable in the worker's environment. The file never holds a token. A run hands these tokens, the tracker site and its account to its container, and nothing else from the worker's environment.
 9. Optionally, tighten a limit under `limits`; a value above the header ceiling is refused.
 
 Real instances and secrets stay outside the repository: the file under `examples/` is fictional and is the only instance committed here.

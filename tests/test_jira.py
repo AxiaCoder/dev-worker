@@ -41,6 +41,8 @@ ITEM: dict[str, Any] = {
     "status": {"name": "À faire", "statusCategory": {"key": "new"}},
     "labels": ["hold-merge", "backend"],
     "url": "https://example.atlassian.net/browse/ABC-218",
+    "summary": "Add a login page",
+    "description": "The page asks for an email.",
 }
 TICKET = {
     "apiVersion": "v2",
@@ -83,11 +85,13 @@ def test_read_returns_status_labels_and_blockers(
         status="À faire",
         labels=("hold-merge", "backend"),
         blockers=(Blocker("ABC-217", "Terminé"), Blocker("ABC-219", "En cours")),
+        title="Add a login page",
+        description="The page asks for an email.",
     )
     called = json.loads(record.read_text(encoding="utf-8"))
     assert called["argv"] == [
         "jira", "workitem", "get", "ABC-218",
-        "--fields", "status,labels,issuelinks",
+        "--fields", "status,labels,issuelinks,summary,description",
         "--output", "json", "--output-summary", "none",
     ]  # fmt: skip
     assert called["env"] == {
@@ -285,6 +289,64 @@ def test_a_ticket_without_links_or_labels_has_no_blockers(
     ticket = tracker().read("ABC-218")
 
     assert (ticket.labels, ticket.blockers) == ((), ())
+
+
+def test_a_description_written_as_an_atlassian_document_is_read_as_plain_text(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    document = {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            {
+                "type": "heading",
+                "attrs": {"level": 2},
+                "content": [{"type": "text", "text": "Goal"}],
+            },
+            {
+                "type": "paragraph",
+                "content": [
+                    {"type": "text", "text": "Run "},
+                    {"type": "text", "text": "main", "marks": [{"type": "code"}]},
+                    {"type": "hardBreak"},
+                    {"type": "text", "text": "again."},
+                ],
+            },
+            {
+                "type": "bulletList",
+                "content": [
+                    {
+                        "type": "listItem",
+                        "content": [
+                            {
+                                "type": "paragraph",
+                                "content": [{"type": "text", "text": "one"}],
+                            }
+                        ],
+                    }
+                ],
+            },
+            {"type": "codeBlock", "content": [{"type": "text", "text": "x = 1"}]},
+            {"type": "rule"},
+        ],
+    }
+    answer(monkeypatch, {"data": [{**ITEM, "description": document}]})
+
+    ticket = tracker().read("ABC-218")
+
+    assert ticket.description == "Goal\nRun main\nagain.\none\nx = 1"
+
+
+@pytest.mark.parametrize("present", [True, False])
+def test_a_ticket_without_description_has_an_empty_one(
+    record: Path, monkeypatch: pytest.MonkeyPatch, present: bool
+) -> None:
+    item = {key: value for key, value in ITEM.items() if key != "description"}
+    if present:
+        item["description"] = None
+    answer(monkeypatch, {"data": [item]})
+
+    assert tracker().read("ABC-218").description == ""
 
 
 def test_a_ticket_that_only_blocks_others_has_no_blockers(

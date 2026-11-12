@@ -26,6 +26,7 @@ REDACTED = "[token]"
 TWG_TIMEOUT_SECONDS = 60.0
 CLAIM_MARKER = "dev-worker claims this ticket for task "
 PAGE_SIZE = "100"
+TEXT_BLOCKS = frozenset({"paragraph", "heading", "codeBlock"})
 
 
 class _Status(BaseModel):
@@ -67,6 +68,8 @@ class _Item(BaseModel):
     status: _Status
     labels: list[str]
     issuelinks: list[_Link]
+    summary: str
+    description: object = None
 
 
 class _GetAnswer(BaseModel):
@@ -169,6 +172,33 @@ def _plain_text(body: object) -> str:
     return ""
 
 
+def _document_text(document: object) -> str:
+    """Return a ticket description as plain text, empty when it is absent.
+
+    The description is a string, kept as it is, or an Atlassian document, whose text
+    nodes are joined with a line ending each paragraph, heading, code block and hard
+    break; leading and trailing blank space is removed from a document's text.
+    """
+    if isinstance(document, str):
+        return document
+    return _blocks_text(document).strip()
+
+
+def _blocks_text(node: object) -> str:
+    """Return the text of an Atlassian document node, with a line ending each text block."""
+    if isinstance(node, list):
+        return "".join(_blocks_text(child) for child in node)
+    if not isinstance(node, dict):
+        return ""
+    kind = node.get("type")
+    if kind == "hardBreak":
+        return "\n"
+    text = node.get("text")
+    own = text if isinstance(text, str) else ""
+    own += _blocks_text(node.get("content"))
+    return own + "\n" if kind in TEXT_BLOCKS else own
+
+
 def _check_key(key: str) -> None:
     """Raise `TrackerError` when `key` is not a Jira ticket key such as `ABC-12`."""
     if not TICKET_KEY.fullmatch(key):
@@ -195,17 +225,21 @@ class JiraTracker:
         self._timeout = timeout
 
     def read(self, key: str) -> Ticket:
-        """Return the ticket `key`, with its status, labels and blockers.
+        """Return the ticket `key`, with its status, labels, blockers, title and description.
 
-        A blocker is a ticket linked to `key` by a "Blocks" link that blocks it. Raises
-        `TrackerError` when `key` is not a ticket key, the token variable is not set, `twg`
-        fails, or its answer cannot be read.
+        A blocker is a ticket linked to `key` by a "Blocks" link that blocks it. The
+        description is read as plain text (see `_document_text`). Raises `TrackerError`
+        when `key` is not a ticket key, the token variable is not set, `twg` fails, or its
+        answer cannot be read.
         """
         _check_key(key)
         answer = self._run(
             f"reading {key}",
-            ["jira", "workitem", "get", key, "--fields", "status,labels,issuelinks"],
-        )
+            [
+                "jira", "workitem", "get", key,
+                "--fields", "status,labels,issuelinks,summary,description",
+            ],
+        )  # fmt: skip
         try:
             item = _GetAnswer.model_validate(answer).data[0]
         except ValidationError as error:
@@ -224,6 +258,8 @@ class JiraTracker:
                 for link in item.issuelinks
                 if link.type.name == BLOCKS and link.inwardIssue is not None
             ),
+            title=item.summary,
+            description=_document_text(item.description),
         )
 
     def set_status(self, key: str, status: str) -> None:

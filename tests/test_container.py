@@ -8,13 +8,31 @@ from typing import Any
 
 import pytest
 
-from dev_worker.container import Container, ContainerError, mount_option
+from dev_worker.container import (
+    Container,
+    ContainerError,
+    agent_command,
+    mount_option,
+    outcome_schema,
+    ticket_prompt,
+)
+from dev_worker.tickets import Ticket
 
 FAKE_DOCKER = Path(__file__).with_name("fake_docker.py")
 IMAGE = "example/agent:1.0.0"
 NAME = re.compile(r"dev-worker-[0-9a-f]{32}")
 OWNER = "/srv/instances/demo"
 PLUGIN = Path("instance", "plugin")
+COMMAND = ("claude", "-p", "Ticket: ABC-1")
+OUTCOMES = ("done", "blocked", "needs_human", "abandoned")
+TICKET = Ticket(
+    key="ABC-1",
+    status="To Do",
+    labels=(),
+    blockers=(),
+    title="Add a login page",
+    description="The page asks for an email.\nThen a password.",
+)
 
 
 @pytest.fixture
@@ -105,7 +123,7 @@ def test_run_creates_one_named_disposable_container_of_its_owner_with_only_the_w
 ) -> None:
     worktree = tmp_path / "worktree"
 
-    container().run(worktree, 60, PLUGIN)
+    container().run(worktree, 60, PLUGIN, COMMAND, {})
 
     _, create, start = calls(record)
     assert create[:5] == ["create", "--pull", "never", "--rm", "--name"]
@@ -121,13 +139,78 @@ def test_run_creates_one_named_disposable_container_of_its_owner_with_only_the_w
         "--workdir",
         "/workspace",
         IMAGE,
-        "true",
+        *COMMAND,
     ]
     assert start == ["start", "--attach", name]
 
 
+def test_run_passes_each_variable_by_name_only_and_its_value_through_docker_environment(
+    record: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probe = tmp_path / "environment.json"
+    monkeypatch.setenv("FAKE_DOCKER_ENV_PROBE", str(probe))
+    environment = {"GH_TOKEN": "s3cret-gh", "TWG_SITE": "example.atlassian.net"}
+
+    container().run(tmp_path, 60, PLUGIN, COMMAND, environment)
+
+    _, create, _ = calls(record)
+    image_at = create.index(IMAGE)
+    assert create[image_at - 4 : image_at] == [
+        "--env",
+        "GH_TOKEN",
+        "--env",
+        "TWG_SITE",
+    ]
+    assert not any("s3cret-gh" in argument for argument in create)
+    assert json.loads(probe.read_text("utf-8")) == environment
+
+
+def test_ticket_prompt_holds_the_key_title_and_description() -> None:
+    assert ticket_prompt(TICKET) == (
+        "Ticket: ABC-1\n"
+        "Title: Add a login page\n"
+        "\n"
+        "Description:\n"
+        "The page asks for an email.\nThen a password.\n"
+    )
+
+
+def test_outcome_schema_requires_one_of_the_outcomes_and_a_message() -> None:
+    assert outcome_schema(OUTCOMES) == {
+        "type": "object",
+        "properties": {
+            "outcome": {"type": "string", "enum": list(OUTCOMES)},
+            "message": {"type": "string"},
+        },
+        "required": ["outcome", "message"],
+        "additionalProperties": False,
+    }
+
+
+def test_agent_command_runs_claude_headless_with_the_rules_plugin_turns_and_schema() -> (
+    None
+):
+    command = agent_command(TICKET, "# Worker\nRules.\n", 40, OUTCOMES)
+
+    assert command == (
+        "claude",
+        "-p",
+        ticket_prompt(TICKET),
+        "--append-system-prompt",
+        "# Worker\nRules.\n",
+        "--plugin-dir",
+        "/plugin",
+        "--max-turns",
+        "40",
+        "--json-schema",
+        json.dumps(outcome_schema(OUTCOMES)),
+        "--output-format",
+        "json",
+    )
+
+
 def test_an_image_the_daemon_has_is_not_pulled(record: Path, tmp_path: Path) -> None:
-    container().run(tmp_path, 60, PLUGIN)
+    container().run(tmp_path, 60, PLUGIN, COMMAND, {})
 
     assert calls(record)[0] == INSPECT
     assert [call[0] for call in calls(record)] == ["image", "create", "start"]
@@ -138,7 +221,7 @@ def test_an_image_the_daemon_lacks_is_pulled_before_the_container_is_created(
 ) -> None:
     answer(monkeypatch, "image", stderr="No such image\n", code=1)
 
-    container().run(tmp_path, 60, PLUGIN)
+    container().run(tmp_path, 60, PLUGIN, COMMAND, {})
 
     inspect, pull, create, start = calls(record)
     assert inspect == INSPECT
@@ -154,7 +237,7 @@ def test_an_image_that_cannot_be_pulled_raises_naming_why_and_creates_no_contain
     answer(monkeypatch, "pull", stderr="manifest unknown\n", code=1)
 
     with pytest.raises(ContainerError) as raised:
-        container().run(tmp_path, 60, PLUGIN)
+        container().run(tmp_path, 60, PLUGIN, COMMAND, {})
 
     assert str(raised.value) == (
         f"docker failed while pulling the image {IMAGE}: manifest unknown"
@@ -170,7 +253,7 @@ def test_an_image_still_being_pulled_when_the_time_is_up_raises_and_creates_no_c
     began = time.monotonic()
 
     with pytest.raises(ContainerError) as raised:
-        container().run(tmp_path, 0.5, PLUGIN)
+        container().run(tmp_path, 0.5, PLUGIN, COMMAND, {})
 
     assert time.monotonic() - began < 5
     assert str(raised.value) == (
@@ -186,16 +269,16 @@ def test_an_interrupted_pull_raises_again_without_removing_any_container(
     interrupt(monkeypatch, "pull")
 
     with pytest.raises(KeyboardInterrupt):
-        container().run(tmp_path, 60, PLUGIN)
+        container().run(tmp_path, 60, PLUGIN, COMMAND, {})
 
     assert [call[0] for call in calls(record)] == ["image"]
 
 
 def test_each_run_names_its_container_anew(record: Path, tmp_path: Path) -> None:
-    container().run(tmp_path, 60, PLUGIN)
+    container().run(tmp_path, 60, PLUGIN, COMMAND, {})
     first = created(record)
     record.unlink()
-    container().run(tmp_path, 60, PLUGIN)
+    container().run(tmp_path, 60, PLUGIN, COMMAND, {})
 
     assert first != created(record)
 
@@ -215,7 +298,7 @@ def test_a_container_that_cannot_be_created_raises_naming_why(
     answer(monkeypatch, "create", stderr="Unable to find image\n", code=125)
 
     with pytest.raises(ContainerError) as raised:
-        container().run(tmp_path, 60, PLUGIN)
+        container().run(tmp_path, 60, PLUGIN, COMMAND, {})
 
     assert str(raised.value) == (
         "docker failed while creating the container: Unable to find image"
@@ -229,7 +312,7 @@ def test_a_container_that_cannot_be_started_or_exits_nonzero_raises_naming_why(
     answer(monkeypatch, "start", stderr="exec failed\n", code=126)
 
     with pytest.raises(ContainerError) as raised:
-        container().run(tmp_path, 60, PLUGIN)
+        container().run(tmp_path, 60, PLUGIN, COMMAND, {})
 
     assert str(raised.value) == (
         "docker failed while running the container: exec failed"
@@ -243,7 +326,7 @@ def test_a_container_still_running_when_the_time_is_up_is_removed_by_its_name(
     answer(monkeypatch, "start", sleep=5)
 
     with pytest.raises(ContainerError) as raised:
-        container().run(tmp_path, 1.5, PLUGIN)
+        container().run(tmp_path, 1.5, PLUGIN, COMMAND, {})
 
     name = created(record)
     assert [call[0] for call in calls(record)] == ["image", "create", "start", "rm"]
@@ -262,7 +345,7 @@ def test_the_time_spent_creating_the_container_counts_against_the_ceiling(
     began = time.monotonic()
 
     with pytest.raises(ContainerError):
-        container().run(tmp_path, 4, PLUGIN)
+        container().run(tmp_path, 4, PLUGIN, COMMAND, {})
 
     assert time.monotonic() - began < 5.5
     assert "start" in [call[0] for call in calls(record)]
@@ -274,7 +357,7 @@ def test_a_ceiling_reached_while_the_container_is_created_removes_it_unstarted(
     answer(monkeypatch, "create", sleep=1)
 
     with pytest.raises(ContainerError) as raised:
-        container().run(tmp_path, 0.5, PLUGIN)
+        container().run(tmp_path, 0.5, PLUGIN, COMMAND, {})
 
     name = created(record)
     assert [call[0] for call in calls(record)] == ["image", "create", "rm"]
@@ -292,7 +375,7 @@ def test_a_container_that_cannot_be_removed_when_the_ceiling_comes_before_its_st
     answer(monkeypatch, "rm", stderr="permission denied\n", code=1)
 
     with pytest.raises(ContainerError) as raised:
-        container().run(tmp_path, 0.5, PLUGIN)
+        container().run(tmp_path, 0.5, PLUGIN, COMMAND, {})
 
     name = created(record)
     assert str(raised.value) == (
@@ -309,7 +392,7 @@ def test_a_container_that_cannot_be_removed_when_the_time_is_up_raises_naming_wh
     answer(monkeypatch, "rm", stderr="permission denied\n", code=1)
 
     with pytest.raises(ContainerError) as raised:
-        container().run(tmp_path, 1.5, PLUGIN)
+        container().run(tmp_path, 1.5, PLUGIN, COMMAND, {})
 
     name = created(record)
     assert str(raised.value) == (
@@ -338,7 +421,7 @@ def test_an_interrupted_run_removes_its_container_and_raises_again(
     interrupt(monkeypatch, subcommand)
 
     with pytest.raises(KeyboardInterrupt) as raised:
-        container().run(tmp_path, 60, PLUGIN)
+        container().run(tmp_path, 60, PLUGIN, COMMAND, {})
 
     remove = calls(record)[-1]
     assert remove[:2] == ["rm", "--force"]
@@ -353,7 +436,7 @@ def test_an_interrupted_run_whose_container_cannot_be_removed_notes_why(
     answer(monkeypatch, "rm", stderr="permission denied\n", code=1)
 
     with pytest.raises(KeyboardInterrupt) as raised:
-        container().run(tmp_path, 60, PLUGIN)
+        container().run(tmp_path, 60, PLUGIN, COMMAND, {})
 
     name = created(record)
     note = (
@@ -476,7 +559,7 @@ def test_a_ceiling_reached_before_the_daemon_made_the_container_leaves_no_contai
     answer(monkeypatch, "start", sleep=10)
 
     with pytest.raises(ContainerError):
-        container().run(tmp_path, 0.5, PLUGIN)
+        container().run(tmp_path, 0.5, PLUGIN, COMMAND, {})
 
     assert left_over(daemon) == []
 
@@ -514,6 +597,6 @@ def test_an_interruption_before_the_daemon_made_the_container_leaves_no_containe
     interrupt_once_the_container_is_asked_to_start(record, monkeypatch)
 
     with pytest.raises(KeyboardInterrupt):
-        container().run(tmp_path, 60, PLUGIN)
+        container().run(tmp_path, 60, PLUGIN, COMMAND, {})
 
     assert left_over(daemon) == []

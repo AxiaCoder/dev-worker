@@ -4,7 +4,9 @@ A run pulls its image when the daemon does not have it, within the time left in 
 run, then creates one container with `docker create --rm`, the worktree bind-mounted at
 `WORKDIR` and the plugin checkout bind-mounted read only at `PLUGIN_DIR`, nothing else
 mounted, then starts it; `--rm` has Docker remove it once it
-ends. The container is named, so that a run reaching its duration ceiling, or
+ends. The container runs Claude Code headless on the ticket (see `agent_command`), and
+receives no environment variable but those the run names, whose values never appear on
+the docker command line. The container is named, so that a run reaching its duration ceiling, or
 interrupted, can remove it by force: created before it is started, it exists by then,
 and once removed it can no longer start. It is labelled
 `OWNER_LABEL` with the instance that started it, so that the running containers of an
@@ -15,18 +17,21 @@ the container is bounded by
 
 import csv
 import io
+import json
+import os
 import subprocess
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from dev_worker.github import failure_reason
+from dev_worker.tickets import Ticket
 
 DOCKER_TIMEOUT_SECONDS = 60.0
 WORKDIR = "/workspace"
 PLUGIN_DIR = "/plugin"
-RUN_COMMAND = ("true",)
+AGENT_PROGRAM = "claude"
 NAME_PREFIX = "dev-worker-"
 OWNER_LABEL = "dev-worker.instance"
 
@@ -36,6 +41,59 @@ class ContainerError(Exception):
 
     The message is a sentence saying why.
     """
+
+
+def ticket_prompt(ticket: Ticket) -> str:
+    """Return the prompt of a run on `ticket`: its key, title and description."""
+    return (
+        f"Ticket: {ticket.key}\n"
+        f"Title: {ticket.title}\n"
+        "\n"
+        f"Description:\n{ticket.description}\n"
+    )
+
+
+def outcome_schema(outcomes: Sequence[str]) -> dict[str, object]:
+    """Return the JSON schema of the outcome a run ends on.
+
+    The outcome is an object holding exactly `outcome`, one of `outcomes`, and `message`,
+    a string: the summary of the work on `done`, the reason otherwise.
+    """
+    return {
+        "type": "object",
+        "properties": {
+            "outcome": {"type": "string", "enum": list(outcomes)},
+            "message": {"type": "string"},
+        },
+        "required": ["outcome", "message"],
+        "additionalProperties": False,
+    }
+
+
+def agent_command(
+    ticket: Ticket, rules: str, max_turns: int, outcomes: Sequence[str]
+) -> tuple[str, ...]:
+    """Return the command that runs Claude Code headless on `ticket` in the container.
+
+    `rules` is appended to its system prompt, `max_turns` caps its turns and `outcomes`
+    are the outcomes it may end on (see `outcome_schema`); it loads the plugin mounted at
+    `PLUGIN_DIR` and answers in JSON.
+    """
+    return (
+        AGENT_PROGRAM,
+        "-p",
+        ticket_prompt(ticket),
+        "--append-system-prompt",
+        rules,
+        "--plugin-dir",
+        PLUGIN_DIR,
+        "--max-turns",
+        str(max_turns),
+        "--json-schema",
+        json.dumps(outcome_schema(outcomes)),
+        "--output-format",
+        "json",
+    )
 
 
 def mount_option(source: Path, target: str = WORKDIR, readonly: bool = False) -> str:
@@ -79,10 +137,19 @@ class Container:
             "reaching the Docker daemon", "version", "--format", "{{.Server.Version}}"
         )
 
-    def run(self, worktree: Path, time_left: float, plugin: Path) -> None:
-        """Run `RUN_COMMAND` in a new container with `worktree` mounted, and wait for it to end.
+    def run(
+        self,
+        worktree: Path,
+        time_left: float,
+        plugin: Path,
+        command: Sequence[str],
+        environment: Mapping[str, str],
+    ) -> None:
+        """Run `command` in a new container with `worktree` mounted, and wait for it to end.
 
-        The plugin checkout `plugin` is mounted read only at `PLUGIN_DIR`.
+        The plugin checkout `plugin` is mounted read only at `PLUGIN_DIR`. The container
+        receives the variables of `environment`, by name and value, and no other; the
+        values are handed to docker through its environment, never on its command line.
 
         The image is pulled when it is missing, then the container is created and
         started. `time_left` is the time left in the run, in seconds, counted from the
@@ -114,8 +181,10 @@ class Container:
                 mount_option(plugin, PLUGIN_DIR, readonly=True),
                 "--workdir",
                 WORKDIR,
+                *(option for name in environment for option in ("--env", name)),
                 self._image,
-                *RUN_COMMAND,
+                *command,
+                environment=environment,
             )
             start_time_left = deadline - time.monotonic()
             if start_time_left <= 0:
@@ -242,11 +311,16 @@ class Container:
         self._docker(f"removing the container {name}", "rm", "--force", name)
 
     def _docker(
-        self, action: str, *arguments: str, timeout: float | None = None
+        self,
+        action: str,
+        *arguments: str,
+        timeout: float | None = None,
+        environment: Mapping[str, str] | None = None,
     ) -> str:
         """Run docker with `arguments` and return what it wrote to stdout.
 
-        `action` names the call in error sentences. `timeout` bounds the call, in
+        `action` names the call in error sentences. `environment` is added to the
+        environment docker inherits. `timeout` bounds the call, in
         seconds, `self._timeout` when None; a call reaching it is stopped and raises
         `subprocess.TimeoutExpired` when `timeout` was given, `ContainerError` otherwise.
         Raises `ContainerError` when docker cannot be started or exits nonzero.
@@ -260,6 +334,7 @@ class Container:
                 errors="replace",
                 check=False,
                 timeout=self._timeout if timeout is None else timeout,
+                env=None if environment is None else {**os.environ, **environment},
             )
         except subprocess.TimeoutExpired:
             if timeout is not None:
