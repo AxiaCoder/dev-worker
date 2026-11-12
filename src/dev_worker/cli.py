@@ -771,7 +771,8 @@ def container_environment(instance: Instance) -> dict[str, str] | str:
 
     They are the agent credential, `GH_TOKEN` and `TWG_TOKEN`, holding the values of the
     variables `token_env` names for the agent, the repository and the tracker, read now,
-    and `TWG_SITE` and `TWG_USER`, the tracker site and account. The agent credential is
+    `TWG_SITE` and `TWG_USER`, the tracker site and account, and `IS_SANDBOX` set to `1`,
+    which lets Claude Code run in `bypassPermissions` mode as root. The agent credential is
     `CLAUDE_CODE_OAUTH_TOKEN` for the `subscription` provider and `ANTHROPIC_API_KEY` for
     `api_key`. A token variable unset or empty gives the sentence naming it; no value is
     ever quoted.
@@ -793,6 +794,7 @@ def container_environment(instance: Instance) -> dict[str, str] | str:
         environment[name] = value
     environment["TWG_SITE"] = instance.tracker.site
     environment["TWG_USER"] = instance.tracker.user
+    environment["IS_SANDBOX"] = "1"
     return environment
 
 
