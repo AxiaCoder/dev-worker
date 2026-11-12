@@ -544,6 +544,83 @@ def test_a_nested_list_is_indented_by_two_spaces_under_its_item(
     assert description == "1. parent\n  - deep\n  - deeper\n2. next"
 
 
+def task(value: str, state: object = "TODO", *nested: dict[str, Any]) -> dict[str, Any]:
+    """Return an Atlassian task item holding `value` inline, then `nested` blocks."""
+    return {
+        "type": "taskItem",
+        "attrs": {"localId": value, "state": state},
+        "content": [text(value), *nested],
+    }
+
+
+def test_a_task_list_puts_each_task_on_its_own_line_with_its_checkbox(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tasks = {
+        "type": "taskList",
+        "content": [task("Write tests"), task("Ship it", "DONE")],
+    }
+
+    description = described_as(monkeypatch, tasks, paragraph(text("Done when green.")))
+
+    assert description == "- [ ] Write tests\n- [x] Ship it\nDone when green."
+
+
+@pytest.mark.parametrize("attrs", [{}, {"state": None}, {"state": 1}, "DONE"])
+def test_a_task_without_a_well_formed_state_is_unchecked(
+    record: Path, monkeypatch: pytest.MonkeyPatch, attrs: object
+) -> None:
+    item = {"type": "taskItem", "attrs": attrs, "content": [text("Write tests")]}
+    tasks = {"type": "taskList", "content": [item]}
+
+    assert described_as(monkeypatch, tasks) == "- [ ] Write tests"
+
+
+def test_a_decision_list_puts_each_decision_on_its_own_line_after_a_dash(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    decisions = {
+        "type": "decisionList",
+        "content": [
+            {
+                "type": "decisionItem",
+                "attrs": {"state": "DECIDED"},
+                "content": [text(value)],
+            }
+            for value in ("Use Python", "Ship weekly")
+        ],
+    }
+
+    description = described_as(monkeypatch, decisions, paragraph(text("Then build.")))
+
+    assert description == "- Use Python\n- Ship weekly\nThen build."
+
+
+def test_a_task_list_nested_in_a_task_is_indented_by_two_spaces(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    nested = {"type": "taskList", "content": [task("deep", "DONE"), task("deeper")]}
+    tasks = {
+        "type": "taskList",
+        "content": [task("parent", "TODO", nested), task("next")],
+    }
+
+    description = described_as(monkeypatch, tasks)
+
+    assert description == "- [ ] parent\n  - [x] deep\n  - [ ] deeper\n- [ ] next"
+
+
+def test_a_task_list_beside_the_tasks_of_its_list_is_indented_by_two_spaces(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    nested = {"type": "taskList", "content": [task("deep", "DONE")]}
+    tasks = {"type": "taskList", "content": [task("parent"), nested, task("next")]}
+
+    description = described_as(monkeypatch, tasks)
+
+    assert description == "- [ ] parent\n  - [x] deep\n- [ ] next"
+
+
 @pytest.mark.parametrize("order", ["3", None, 2.5])
 def test_an_ordered_list_with_a_malformed_start_order_numbers_from_one(
     record: Path, monkeypatch: pytest.MonkeyPatch, order: object

@@ -31,6 +31,8 @@ CLAIM_MARKER = "dev-worker claims this ticket for task "
 PAGE_SIZE = "100"
 TEXT_BLOCKS = frozenset({"paragraph", "heading", "codeBlock"})
 NESTED_INDENT = "  "
+LISTS = frozenset({"bulletList", "orderedList", "taskList", "decisionList"})
+DONE = "DONE"
 
 
 class _Status(BaseModel):
@@ -189,6 +191,9 @@ def _document_text(document: object) -> str:
       milliseconds;
     - a bullet list item starts with `- `, an ordered one with its number, counted from
       the list's start order or from 1; each nesting level is indented by two spaces;
+    - a task starts with `- [x] ` when its state is `DONE`, with `- [ ] ` otherwise, and a
+      decision with `- `; a task list placed among the tasks of another is indented by
+      two spaces under them;
     - a node whose attributes are missing or malformed reads as nothing.
 
     Leading and trailing blank space is removed from a document's text.
@@ -271,10 +276,42 @@ def _item_text(item: object, marker: str) -> str:
     return marker + first + newline + textwrap.indent(rest, NESTED_INDENT)
 
 
+def _task_list_text(node: dict[Any, Any]) -> str:
+    """Return the tasks of a task list, each starting with its checkbox; a nested list is indented."""
+    content = node.get("content")
+    entries: Iterable[object] = content if isinstance(content, list) else ()
+    return "".join(_task_list_entry(entry) for entry in entries)
+
+
+def _task_list_entry(entry: object) -> str:
+    """Return a task with its checkbox, or any other entry of a task list indented."""
+    if isinstance(entry, dict) and entry.get("type") == "taskItem":
+        checked = _attribute(entry, name="state") == DONE
+        return _item_text(entry, "- [x] " if checked else "- [ ] ")
+    return textwrap.indent(_blocks_text(entry), NESTED_INDENT)
+
+
+def _inline_item_text(node: dict[Any, Any]) -> str:
+    """Return a task or decision as lines: its inline text on the first, nested lists below."""
+    content = node.get("content")
+    children: Iterable[object] = content if isinstance(content, list) else ()
+    text = ""
+    for child in children:
+        nests = isinstance(child, dict) and child.get("type") in LISTS
+        if nests and not text.endswith("\n"):
+            text += "\n"
+        text += _blocks_text(child)
+    return text if text.endswith("\n") else text + "\n"
+
+
 _RENDERERS: dict[object, Callable[[dict[Any, Any]], str]] = {
     "hardBreak": lambda _: "\n",
     "bulletList": _bullet_list_text,
     "orderedList": _ordered_list_text,
+    "taskList": _task_list_text,
+    "taskItem": _inline_item_text,
+    "decisionList": _bullet_list_text,
+    "decisionItem": _inline_item_text,
     "inlineCard": partial(_attribute, name="url"),
     "blockCard": _block_card_text,
     "embedCard": _block_card_text,
