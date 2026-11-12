@@ -1833,9 +1833,9 @@ def test_container_runs_claude_on_the_ticket_with_the_worker_rules_and_only_the_
 @pytest.mark.parametrize(
     ("variable", "service"),
     [
-        ("CLAUDE_CODE_OAUTH_TOKEN", "Claude Code"),
-        ("GITHUB_TOKEN", "GitHub"),
-        ("JIRA_TOKEN", "Jira"),
+        ("CLAUDE_CODE_OAUTH_TOKEN", "Claude Code subscription token"),
+        ("GITHUB_TOKEN", "GitHub token"),
+        ("JIRA_TOKEN", "Jira token"),
     ],
 )
 @pytest.mark.parametrize("unset", [True, False], ids=["unset", "empty"])
@@ -1861,7 +1861,75 @@ def test_a_token_variable_unset_fails_the_run_naming_it_without_starting_the_con
         answer,
         "task-1",
         f"The container was not started: the variable {variable}, which should "
-        f"hold the {service} token, is not set.",
+        f"hold the {service}, is not set.",
+    )
+    assert container.commands == []
+    errors = json.dumps(answer["errors"])
+    assert not any(
+        value in errors for value in ("agent-token", "github-token", "jira-token")
+    )
+
+
+def use_api_key(instance: Path) -> None:
+    """Make the agent of the instance file at `instance` sign in with the API key in `ANTHROPIC_KEY`."""
+    text = instance.read_text(encoding="utf-8")
+    instance.write_text(
+        text.replace(
+            "  provider: subscription\n  token_env: CLAUDE_CODE_OAUTH_TOKEN\n",
+            "  provider: api_key\n  token_env: ANTHROPIC_KEY\n",
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_container_of_an_api_key_agent_gets_the_key_as_anthropic_api_key_and_no_oauth_token(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+) -> None:
+    use_api_key(instance)
+    monkeypatch.setenv("ANTHROPIC_KEY", "agent-key")
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed"
+    assert container.environments == [
+        {
+            "ANTHROPIC_API_KEY": "agent-key",
+            "GH_TOKEN": "github-token",
+            "TWG_TOKEN": "jira-token",
+            "TWG_SITE": "example.atlassian.net",
+            "TWG_USER": "worker@example.com",
+        }
+    ]
+
+
+@pytest.mark.parametrize("unset", [True, False], ids=["unset", "empty"])
+def test_an_api_key_variable_unset_fails_the_run_naming_it_without_starting_the_container(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+    unset: bool,
+) -> None:
+    use_api_key(instance)
+    if unset:
+        monkeypatch.delenv("ANTHROPIC_KEY", raising=False)
+    else:
+        monkeypatch.setenv("ANTHROPIC_KEY", "")
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(
+        answer,
+        "task-1",
+        "The container was not started: the variable ANTHROPIC_KEY, which should "
+        "hold the Anthropic API key, is not set.",
     )
     assert container.commands == []
     errors = json.dumps(answer["errors"])
@@ -5667,7 +5735,7 @@ def test_missing_token_comments_why_and_moves_the_ticket_to_blocked(
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN")
     reason = (
         "The container was not started: the variable CLAUDE_CODE_OAUTH_TOKEN, which "
-        "should hold the Claude Code token, is not set."
+        "should hold the Claude Code subscription token, is not set."
     )
 
     answer = run_mandate(

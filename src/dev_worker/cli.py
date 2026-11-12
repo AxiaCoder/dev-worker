@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from importlib.resources import as_file, files
 from pathlib import Path
+from typing import assert_never
 
 from pydantic import ValidationError
 
@@ -32,6 +33,7 @@ from dev_worker.header import HeaderError, WorkerFile, load_worker_file
 from dev_worker.instance import (
     Instance,
     InstanceError,
+    Provider,
     Repository,
     Tracker,
     load_instance,
@@ -753,18 +755,32 @@ def rescue_left_worktree(instance: Instance, directory: Path) -> str | None:
     return f"The worktree left by an earlier run on the branch {branch}: {reason}"
 
 
+def agent_credential(provider: Provider) -> tuple[str, str]:
+    """Return the variable Claude Code reads the credential of `provider` from, and what that credential is called."""
+    match provider:
+        case "subscription":
+            return "CLAUDE_CODE_OAUTH_TOKEN", "Claude Code subscription token"
+        case "api_key":
+            return "ANTHROPIC_API_KEY", "Anthropic API key"
+        case _:  # pragma: no cover
+            assert_never(provider)
+
+
 def container_environment(instance: Instance) -> dict[str, str] | str:
     """Return the variables the container of `instance` receives, by name, or why one is missing.
 
-    They are `CLAUDE_CODE_OAUTH_TOKEN`, `GH_TOKEN` and `TWG_TOKEN`, holding the values of
-    the variables `token_env` names for the agent, the repository and the tracker, read
-    now, and `TWG_SITE` and `TWG_USER`, the tracker site and account. A token variable
-    unset or empty gives the sentence naming it; no value is ever quoted.
+    They are the agent credential, `GH_TOKEN` and `TWG_TOKEN`, holding the values of the
+    variables `token_env` names for the agent, the repository and the tracker, read now,
+    and `TWG_SITE` and `TWG_USER`, the tracker site and account. The agent credential is
+    `CLAUDE_CODE_OAUTH_TOKEN` for the `subscription` provider and `ANTHROPIC_API_KEY` for
+    `api_key`. A token variable unset or empty gives the sentence naming it; no value is
+    ever quoted.
     """
+    agent_variable, agent_service = agent_credential(instance.agent.provider)
     tokens = (
-        ("CLAUDE_CODE_OAUTH_TOKEN", instance.agent.token_env, "Claude Code"),
-        ("GH_TOKEN", instance.repository.token_env, "GitHub"),
-        ("TWG_TOKEN", instance.tracker.token_env, "Jira"),
+        (agent_variable, instance.agent.token_env, agent_service),
+        ("GH_TOKEN", instance.repository.token_env, "GitHub token"),
+        ("TWG_TOKEN", instance.tracker.token_env, "Jira token"),
     )
     environment: dict[str, str] = {}
     for name, variable, service in tokens:
@@ -772,7 +788,7 @@ def container_environment(instance: Instance) -> dict[str, str] | str:
         if not value:
             return (
                 f"The container was not started: the variable {variable}, which "
-                f"should hold the {service} token, is not set."
+                f"should hold the {service}, is not set."
             )
         environment[name] = value
     environment["TWG_SITE"] = instance.tracker.site

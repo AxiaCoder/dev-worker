@@ -137,14 +137,19 @@ class Repository(BaseModel):
     token_env: EnvName
 
 
-class Agent(BaseModel):
-    """The AI agent a run starts in its container, and the environment variable holding its token.
+Provider = Literal["subscription", "api_key"]
 
-    `token_env` names the variable holding the Claude Code OAuth token.
+
+class Agent(BaseModel):
+    """The AI agent a run starts in its container, how it signs in, and the variable holding its credential.
+
+    `provider` is `subscription` for a Claude Code OAuth token or `api_key` for an
+    Anthropic API key; `token_env` names the variable holding that credential.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    provider: Provider
     token_env: EnvName
 
 

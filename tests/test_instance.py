@@ -33,6 +33,7 @@ repository:
   name: example/project
   token_env: GITHUB_TOKEN
 agent:
+  provider: subscription
   token_env: CLAUDE_CODE_OAUTH_TOKEN
 branch: agent/{key}
 container:
@@ -72,6 +73,7 @@ def test_valid_instance_loads(tmp_path: Path) -> None:
     assert instance.tracker.token_env == "JIRA_TOKEN"
     assert instance.repository.name == "example/project"
     assert instance.repository.token_env == "GITHUB_TOKEN"
+    assert instance.agent.provider == "subscription"
     assert instance.agent.token_env == "CLAUDE_CODE_OAUTH_TOKEN"
     assert instance.statuses == {
         "ready": "To Do",
@@ -307,6 +309,15 @@ def test_blank_name_is_refused(
     assert "input_value" not in str(caught.value)
 
 
+def test_agent_signing_in_with_an_api_key_loads(tmp_path: Path) -> None:
+    instance = load(
+        tmp_path,
+        VALID.replace("  provider: subscription\n", "  provider: api_key\n"),
+    )
+
+    assert instance.agent.provider == "api_key"
+
+
 def test_status_name_with_surrounding_blanks_is_kept_as_written(
     tmp_path: Path,
 ) -> None:
@@ -335,8 +346,19 @@ def test_status_name_with_surrounding_blanks_is_kept_as_written(
         ),
         (VALID.split("statuses:")[0], "statuses: Field required"),
         (
-            VALID.replace("agent:\n  token_env: CLAUDE_CODE_OAUTH_TOKEN\n", ""),
+            VALID.replace(
+                "agent:\n  provider: subscription\n  token_env: CLAUDE_CODE_OAUTH_TOKEN\n",
+                "",
+            ),
             "agent: Field required",
+        ),
+        (
+            VALID.replace("  provider: subscription\n", ""),
+            "agent.provider: Field required",
+        ),
+        (
+            VALID.replace("  provider: subscription\n", "  provider: oauth\n"),
+            "agent.provider: Input should be 'subscription' or 'api_key'",
         ),
         (
             VALID.replace(
