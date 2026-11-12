@@ -5525,6 +5525,68 @@ def test_ticket_that_cannot_be_moved_at_the_end_is_reported_with_its_status_unkn
     assert stub.moves == [IN_PROGRESS, IN_REVIEW]
 
 
+def test_ticket_is_commented_on_before_it_is_moved_at_the_end(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    calls: list[str] = []
+    post, move = stub.comment, stub.set_status
+
+    def spy_comment(key: str, body: str) -> None:
+        calls.append("comment")
+        post(key, body)
+
+    def spy_move(key: str, status: str) -> None:
+        calls.append(status)
+        move(key, status)
+
+    monkeypatch.setattr(stub, "comment", spy_comment)
+    monkeypatch.setattr(stub, "set_status", spy_move)
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert calls == ["In Progress", "comment", "In Review"]
+
+
+def test_comment_and_move_that_both_fail_at_the_end_are_both_reported_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    container.exited = ending_on("blocked", "No spec.")
+    stub.comment_error = TrackerError("comment broke.")
+    move = stub.set_status
+
+    def refuse_blocked(key: str, status: str) -> None:
+        move(key, status)
+        if status == "Blocked":
+            raise TrackerError("move broke.")
+
+    monkeypatch.setattr(stub, "set_status", refuse_blocked)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "failed"
+    assert answer["errors"] == [
+        "The run ended on the outcome 'blocked': No spec.",
+        (
+            "Ticket 'DEMO-1' cannot be commented on: comment broke. "
+            "The comment may have been posted."
+        ),
+        (
+            "Ticket 'DEMO-1' cannot be moved to 'Blocked': move broke. "
+            "Its status is unknown and is to be read again in the tracker."
+        ),
+    ]
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
+
+
 def test_ticket_is_never_moved_back_to_ready(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],

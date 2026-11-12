@@ -345,7 +345,7 @@ def test_a_container_whose_command_docker_cannot_run_raises_naming_why(
     assert [call[0] for call in calls(record)] == ["image", "create", "start"]
 
 
-@pytest.mark.parametrize("code", [125, 127])
+@pytest.mark.parametrize("code", [125, 126, 127])
 def test_docker_exiting_with_a_code_of_its_own_raises_naming_why(
     record: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, code: int
 ) -> None:
@@ -358,7 +358,7 @@ def test_docker_exiting_with_a_code_of_its_own_raises_naming_why(
         container().run(tmp_path, 60, PLUGIN, COMMAND, {})
 
 
-@pytest.mark.parametrize("code", [0, 1])
+@pytest.mark.parametrize("code", [0, 1, 124, 128])
 def test_a_container_that_ends_gives_back_its_exit_code_and_output(
     record: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, code: int
 ) -> None:
