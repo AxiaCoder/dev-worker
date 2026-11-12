@@ -33,6 +33,7 @@ repository:
   name: example/project
   token_env: GITHUB_TOKEN
 agent:
+  provider: subscription
   token_env: CLAUDE_CODE_OAUTH_TOKEN
 branch: agent/{key}
 container:
@@ -335,7 +336,10 @@ def test_status_name_with_surrounding_blanks_is_kept_as_written(
         ),
         (VALID.split("statuses:")[0], "statuses: Field required"),
         (
-            VALID.replace("agent:\n  token_env: CLAUDE_CODE_OAUTH_TOKEN\n", ""),
+            VALID.replace(
+                "agent:\n  provider: subscription\n  token_env: CLAUDE_CODE_OAUTH_TOKEN\n",
+                "",
+            ),
             "agent: Field required",
         ),
         (

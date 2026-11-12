@@ -1833,9 +1833,9 @@ def test_container_runs_claude_on_the_ticket_with_the_worker_rules_and_only_the_
 @pytest.mark.parametrize(
     ("variable", "service"),
     [
-        ("CLAUDE_CODE_OAUTH_TOKEN", "Claude Code"),
-        ("GITHUB_TOKEN", "GitHub"),
-        ("JIRA_TOKEN", "Jira"),
+        ("CLAUDE_CODE_OAUTH_TOKEN", "Claude Code subscription token"),
+        ("GITHUB_TOKEN", "GitHub token"),
+        ("JIRA_TOKEN", "Jira token"),
     ],
 )
 @pytest.mark.parametrize("unset", [True, False], ids=["unset", "empty"])
@@ -1861,7 +1861,7 @@ def test_a_token_variable_unset_fails_the_run_naming_it_without_starting_the_con
         answer,
         "task-1",
         f"The container was not started: the variable {variable}, which should "
-        f"hold the {service} token, is not set.",
+        f"hold the {service}, is not set.",
     )
     assert container.commands == []
     errors = json.dumps(answer["errors"])
@@ -5667,7 +5667,7 @@ def test_missing_token_comments_why_and_moves_the_ticket_to_blocked(
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN")
     reason = (
         "The container was not started: the variable CLAUDE_CODE_OAUTH_TOKEN, which "
-        "should hold the Claude Code token, is not set."
+        "should hold the Claude Code subscription token, is not set."
     )
 
     answer = run_mandate(

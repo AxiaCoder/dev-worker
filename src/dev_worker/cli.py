@@ -70,6 +70,10 @@ TICKET_KEY = re.compile(r"(.+)-([1-9][0-9]*)")
 RECENT_RUNS = 10
 CLAIM_TAKE_LIMIT_SECONDS = 300
 CLAIM_EXPIRY_SECONDS = 600
+AGENT_CREDENTIALS = {
+    "subscription": ("CLAUDE_CODE_OAUTH_TOKEN", "Claude Code subscription token"),
+    "api_key": ("ANTHROPIC_API_KEY", "Anthropic API key"),
+}
 
 
 def failed(task_id: str | None, *errors: str) -> MandateOutput:
@@ -756,15 +760,18 @@ def rescue_left_worktree(instance: Instance, directory: Path) -> str | None:
 def container_environment(instance: Instance) -> dict[str, str] | str:
     """Return the variables the container of `instance` receives, by name, or why one is missing.
 
-    They are `CLAUDE_CODE_OAUTH_TOKEN`, `GH_TOKEN` and `TWG_TOKEN`, holding the values of
-    the variables `token_env` names for the agent, the repository and the tracker, read
-    now, and `TWG_SITE` and `TWG_USER`, the tracker site and account. A token variable
-    unset or empty gives the sentence naming it; no value is ever quoted.
+    They are the agent credential, `GH_TOKEN` and `TWG_TOKEN`, holding the values of the
+    variables `token_env` names for the agent, the repository and the tracker, read now,
+    and `TWG_SITE` and `TWG_USER`, the tracker site and account. The agent credential is
+    `CLAUDE_CODE_OAUTH_TOKEN` for the `subscription` provider and `ANTHROPIC_API_KEY` for
+    `api_key`. A token variable unset or empty gives the sentence naming it; no value is
+    ever quoted.
     """
+    agent_variable, agent_service = AGENT_CREDENTIALS[instance.agent.provider]
     tokens = (
-        ("CLAUDE_CODE_OAUTH_TOKEN", instance.agent.token_env, "Claude Code"),
-        ("GH_TOKEN", instance.repository.token_env, "GitHub"),
-        ("TWG_TOKEN", instance.tracker.token_env, "Jira"),
+        (agent_variable, instance.agent.token_env, agent_service),
+        ("GH_TOKEN", instance.repository.token_env, "GitHub token"),
+        ("TWG_TOKEN", instance.tracker.token_env, "Jira token"),
     )
     environment: dict[str, str] = {}
     for name, variable, service in tokens:
@@ -772,7 +779,7 @@ def container_environment(instance: Instance) -> dict[str, str] | str:
         if not value:
             return (
                 f"The container was not started: the variable {variable}, which "
-                f"should hold the {service} token, is not set."
+                f"should hold the {service}, is not set."
             )
         environment[name] = value
     environment["TWG_SITE"] = instance.tracker.site
