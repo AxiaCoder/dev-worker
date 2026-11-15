@@ -118,9 +118,11 @@ def agent_command(
 def verdict_schema() -> dict[str, object]:
     """Return the JSON schema of the verdict a guard review ends on.
 
-    The verdict is an object holding exactly `defects`, a list of objects each holding
-    exactly `file`, a string, `line`, an integer from 1, and `summary`, a string. An
-    empty list means the review found no reachable defect.
+    The verdict is an object holding exactly `reviewed`, a boolean, `reason`, a string,
+    and `defects`, a list of objects each holding exactly `file`, a string, `line`, an
+    integer from 1, and `summary`, a string. `reviewed` false means the review did not
+    take place, `reason` saying why; `reviewed` true with an empty list means the review
+    found no reachable defect.
     """
     defect = {
         "type": "object",
@@ -134,8 +136,12 @@ def verdict_schema() -> dict[str, object]:
     }
     return {
         "type": "object",
-        "properties": {"defects": {"type": "array", "items": defect}},
-        "required": ["defects"],
+        "properties": {
+            "reviewed": {"type": "boolean"},
+            "reason": {"type": "string"},
+            "defects": {"type": "array", "items": defect},
+        },
+        "required": ["reviewed", "reason", "defects"],
         "additionalProperties": False,
     }
 
@@ -149,16 +155,21 @@ def review_prompt(base: str, head: str) -> str:
         f"`git diff {base}...{head}` and `git log {base}..{head}`, and read the files "
         "around it as you need.\n"
         "\n"
-        "No pull request is named and no token is given: do not use `gh` or reach the "
-        "network. Change nothing: the checkout is read only.\n"
+        "The CI of the change has already passed. `gh` and the network are not "
+        "available: no pull request is named and no token is given, so do not run `gh` "
+        "or reach the network, and review only from the local git diff. Change nothing: "
+        "the checkout is read only.\n"
         "\n"
         "Judge only reachable defects: a bug, a security flaw or a broken behaviour that "
         "a real input or a real use of the code can reach. Leave style, naming and "
         "suggestions out.\n"
         "\n"
-        "Answer by the schema: one entry per reachable defect, with the path of its file "
-        "relative to the repository root, its line in the head commit and a one-sentence "
-        "summary; an empty list when there is none.\n"
+        "Answer by the schema. When the review was done, `reviewed` is true, `reason` "
+        "is empty and `defects` holds one entry per reachable defect, with the path of "
+        "its file relative to the repository root, its line in the head commit and a "
+        "one-sentence summary; an empty list when there is none. When the review could "
+        "not be done, `reviewed` is false, `reason` says why and `defects` is empty: "
+        "never an empty list in place of a review that did not take place.\n"
     )
 
 

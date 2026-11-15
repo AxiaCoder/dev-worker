@@ -61,7 +61,12 @@ SUMMARY = "The login page asks for an email."
 DONE = json.dumps(
     {"type": "result", "structured_output": {"outcome": "done", "message": SUMMARY}}
 )
-NO_DEFECT = json.dumps({"type": "result", "structured_output": {"defects": []}})
+NO_DEFECT = json.dumps(
+    {
+        "type": "result",
+        "structured_output": {"reviewed": True, "reason": "", "defects": []},
+    }
+)
 BASE_COMMIT = "89abcdef0123456789abcdef0123456789abcdef"
 
 
@@ -6186,7 +6191,16 @@ def review_verdict(*defects: dict[str, object]) -> ContainerExit:
     """Return a guard review container that ended on a verdict listing `defects`."""
     return ContainerExit(
         0,
-        json.dumps({"type": "result", "structured_output": {"defects": list(defects)}}),
+        json.dumps(
+            {
+                "type": "result",
+                "structured_output": {
+                    "reviewed": True,
+                    "reason": "",
+                    "defects": list(defects),
+                },
+            }
+        ),
         "",
     )
 
@@ -6275,10 +6289,46 @@ def test_done_whose_review_finds_defects_is_not_merged_and_lists_them_in_the_com
     ("verdict", "reason"),
     [
         pytest.param(
-            ContainerExit(0, json.dumps({"structured_output": {"defects": 3}}), ""),
+            ContainerExit(
+                0,
+                json.dumps(
+                    {
+                        "structured_output": {
+                            "reviewed": True,
+                            "reason": "",
+                            "defects": 3,
+                        }
+                    }
+                ),
+                "",
+            ),
             "gave no verdict: the structured output of Claude Code does not match "
             "the verdict schema: its defects are missing or not a list.",
             id="off-schema",
+        ),
+        pytest.param(
+            ContainerExit(0, json.dumps({"structured_output": {"defects": []}}), ""),
+            "gave no verdict: the structured output of Claude Code does not match "
+            "the verdict schema: its reviewed is missing or not a boolean.",
+            id="reviewed-missing",
+        ),
+        pytest.param(
+            ContainerExit(
+                0,
+                json.dumps(
+                    {
+                        "structured_output": {
+                            "reviewed": False,
+                            "reason": "gh pr checks needs a token.",
+                            "defects": [],
+                        }
+                    }
+                ),
+                "",
+            ),
+            "gave no verdict: the review did not take place: gh pr checks needs a "
+            "token..",
+            id="not-reviewed",
         ),
         pytest.param(
             ContainerExit(
@@ -6567,7 +6617,7 @@ def test_done_whose_review_gives_no_verdict_and_whose_checkout_cannot_be_deleted
     reason = (
         f"the guard review of the pull request {PULL.url} gave no verdict: the "
         "structured output of Claude Code does not match the verdict schema: its "
-        "defects are missing or not a list."
+        "reviewed is missing or not a boolean."
     )
     assert answer["status"] == "failed"
     assert answer["errors"] == [

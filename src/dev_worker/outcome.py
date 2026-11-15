@@ -15,7 +15,7 @@ from dev_worker.container import DEFECT_FIELDS, ContainerExit
 from dev_worker.text import writable_text
 
 OUTCOME_FIELDS = ("outcome", "message")
-VERDICT_FIELDS = ("defects",)
+VERDICT_FIELDS = ("reviewed", "reason", "defects")
 
 
 @dataclass(frozen=True)
@@ -57,11 +57,13 @@ def read_verdict(exited: ContainerExit) -> tuple[Defect, ...] | str:
     """Return the reachable defects the guard review in the container `exited` reports, or why it reports no verdict.
 
     The verdict is valid when Claude Code exited 0 and wrote a JSON object whose
-    `structured_output` holds exactly `defects`, a list of objects each holding exactly
-    `file`, a string, `line`, an integer from 1, and `summary`, a string; an empty list
-    is a review that found no reachable defect. Otherwise the reason is a clause saying
-    why, as `read_outcome` gives it. The file, the summary and the reason are made
-    writable as `read_outcome` makes its message.
+    `structured_output` holds exactly `reviewed`, a boolean, `reason`, a string, and
+    `defects`, a list of objects each holding exactly `file`, a string, `line`, an
+    integer from 1, and `summary`, a string, and when `reviewed` is true: an empty list
+    is then a review that found no reachable defect. Otherwise the reason is a clause
+    saying why, as `read_outcome` gives it; a `reviewed` false gives "the review did not
+    take place: " followed by the `reason` of the verdict. The file, the summary and the
+    reason are made writable as `read_outcome` makes its message.
     """
     found = _structured_output(exited)
     if isinstance(found, str):
@@ -73,6 +75,8 @@ def read_verdict(exited: ContainerExit) -> tuple[Defect, ...] | str:
             "the structured output of Claude Code does not match the verdict "
             f"schema: {problem}"
         )
+    if not verdict["reviewed"]:
+        return writable_text(f"the review did not take place: {verdict['reason']}")
     return tuple(
         Defect(
             writable_text(defect["file"]),
@@ -156,6 +160,10 @@ def _verdict_problem(found: object) -> str | None:
     extra = _extra_fields(found, VERDICT_FIELDS)
     if extra:
         return f"it holds the unexpected field {extra}"
+    if not isinstance(found.get("reviewed"), bool):
+        return "its reviewed is missing or not a boolean"
+    if not isinstance(found.get("reason"), str):
+        return "its reason is missing or not a string"
     defects = found.get("defects")
     if not isinstance(defects, list):
         return "its defects are missing or not a list"

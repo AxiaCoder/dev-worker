@@ -199,12 +199,22 @@ VERDICT_MISMATCH = (
 
 
 def verdict(**fields: object) -> ContainerExit:
-    """Return a container that exited 0 with `fields` as its structured output."""
-    return ContainerExit(0, result(structured_output=fields), "")
+    """Return a container that exited 0 with a review that took place, overridden by `fields`, as its structured output."""
+    return ContainerExit(
+        0, result(structured_output={"reviewed": True, "reason": "", **fields}), ""
+    )
 
 
 def test_a_verdict_without_defects_is_an_empty_list() -> None:
     assert read_verdict(verdict(defects=[])) == ()
+
+
+def test_a_review_that_did_not_take_place_gives_no_verdict_naming_why() -> None:
+    found = read_verdict(
+        verdict(reviewed=False, reason="gh is not available\x00.", defects=[])
+    )
+
+    assert found == "the review did not take place: gh is not available\\x00."
 
 
 def test_a_verdict_lists_its_defects_in_order() -> None:
@@ -258,6 +268,23 @@ GOOD = {"file": "a.py", "line": 1, "summary": "Bug."}
             verdict(defects=[], verdict="ok"),
             f"{VERDICT_MISMATCH}it holds the unexpected field verdict",
             id="extra-field",
+        ),
+        pytest.param(
+            ContainerExit(
+                0, result(structured_output={"reason": "", "defects": []}), ""
+            ),
+            f"{VERDICT_MISMATCH}its reviewed is missing or not a boolean",
+            id="missing-reviewed",
+        ),
+        pytest.param(
+            verdict(reviewed="true", defects=[]),
+            f"{VERDICT_MISMATCH}its reviewed is missing or not a boolean",
+            id="reviewed-not-boolean",
+        ),
+        pytest.param(
+            verdict(reason=None, defects=[]),
+            f"{VERDICT_MISMATCH}its reason is missing or not a string",
+            id="reason-not-string",
         ),
         pytest.param(
             verdict(),
