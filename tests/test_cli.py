@@ -579,7 +579,7 @@ def test_run_reads_the_mandate_ticket_from_the_tracker_of_the_instance(
     )
 
     assert answer["status"] == "completed"
-    assert stub.reads == ["DEMO-1", "DEMO-1", "DEMO-1"]
+    assert stub.reads == ["DEMO-1", "DEMO-1", "DEMO-1", "DEMO-1"]
     assert [tracker.project for tracker in stub.trackers] == ["DEMO"]
     assert stub.trackers[0].token_env == "JIRA_TOKEN"
 
@@ -6573,6 +6573,70 @@ def test_done_on_a_ticket_carrying_the_hold_label_runs_no_review(
 
     assert container.readonly == [False]
     assert ("close_review",) not in workspace.calls
+
+
+def test_done_whose_ticket_gets_the_hold_label_during_the_review_is_left_open(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    run = container.run
+
+    def label_during_review(*arguments: Any, readonly: bool = False) -> ContainerExit:
+        if readonly:
+            stub.answer = replace(demo_ticket("In Progress"), labels=("hold-merge",))
+        return run(*arguments, readonly=readonly)
+
+    monkeypatch.setattr(container, "run", label_during_review)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["errors"] == []
+    assert container.readonly == [False, True]
+    assert "merge" not in [name for name, _ in reachable_repository.calls]
+    assert stub.comments == [
+        (
+            "DEMO-1",
+            (
+                f"{SUMMARY}\n\nThe pull request {PULL.url} is left open: the ticket "
+                "carries the label 'hold-merge', which holds its merge back."
+            ),
+        )
+    ]
+    assert stub.moves == [IN_PROGRESS, IN_REVIEW]
+
+
+def test_done_whose_ticket_cannot_be_read_after_the_review_is_blocked_and_not_merged(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    run = container.run
+
+    def tracker_down_after_review(
+        *arguments: Any, readonly: bool = False
+    ) -> ContainerExit:
+        if readonly:
+            stub.answer = TrackerError("the tracker is down.")
+        return run(*arguments, readonly=readonly)
+
+    monkeypatch.setattr(container, "run", tracker_down_after_review)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_blocked_run_fails(answer, instance, "the tracker is down.")
+    assert "merge" not in [name for name, _ in reachable_repository.calls]
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
 
 
 UNDELETED = "The review checkout cannot be deleted: close_review broke"

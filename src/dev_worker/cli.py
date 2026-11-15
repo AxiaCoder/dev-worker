@@ -419,11 +419,12 @@ def land_done(
     The open pull request whose head is the run branch (see `run_branch`) is found, its
     CI read once, the ticket read again through `tracker`, then the pull request given
     its guard review (see `review_pull_request`), in the instance directory `directory`
-    within the time the run started at `began` has left, and merged as one squashed
-    commit under its title, tied to the reviewed head commit. The status key is `done`
-    once merged; the one the header of `worker` ties the `done` outcome to when the
-    ticket carries the `hold_merge_label` of `instance`, the pull request left open and
-    not reviewed; the one it ties `blocked` to when there is no pull request, its CI has
+    within the time the run started at `began` has left, the ticket read once more, and
+    the pull request merged as one squashed commit under its title, tied to the reviewed
+    head commit. The status key is `done` once merged; the one the header of `worker`
+    ties the `done` outcome to when the ticket carries the `hold_merge_label` of
+    `instance` at either read, the pull request left open, and not reviewed when it
+    carries it at the first read; the one it ties `blocked` to when there is no pull request, its CI has
     not passed, the review found a reachable defect or gave no verdict, or a step fails,
     the pull request left open and nothing retried. The body is `summary` followed by
     what happened, the defects found listed; after a merge that failed for a reason
@@ -460,12 +461,12 @@ def land_done(
         held = instance.hold_merge_label in tracker.read(key).labels
     except (RepositoryError, TrackerError) as error:
         return blocked(str(error))
+    left_open = (
+        f"{summary}\n\nThe pull request {pull_request.url} is left open: the "
+        f"ticket carries the label {instance.hold_merge_label!r}, which holds its "
+        "merge back."
+    )
     if held:
-        left_open = (
-            f"{summary}\n\nThe pull request {pull_request.url} is left open: the "
-            f"ticket carries the label {instance.hold_merge_label!r}, which holds its "
-            "merge back."
-        )
         return outcomes.done, left_open, None, errors
     reason, removal = review_pull_request(
         pull_request, instance, worker, directory, began
@@ -474,6 +475,12 @@ def land_done(
         errors.append(removal)
     if reason is not None:
         return blocked(reason)
+    try:
+        held = instance.hold_merge_label in tracker.read(key).labels
+    except TrackerError as error:
+        return blocked(str(error))
+    if held:
+        return outcomes.done, left_open, None, errors
     try:
         repository.merge(pull_request)
     except HeadMovedError as error:
