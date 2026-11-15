@@ -20,7 +20,13 @@ from typing import assert_never
 
 from pydantic import ValidationError
 
-from dev_worker.container import Container, ContainerError, agent_command
+from dev_worker.container import (
+    WORKDIR,
+    Container,
+    ContainerError,
+    agent_command,
+    review_command,
+)
 from dev_worker.contract import (
     CONTRACT_VERSION,
     Health,
@@ -39,9 +45,14 @@ from dev_worker.instance import (
     load_instance,
 )
 from dev_worker.jira import JiraTracker
-from dev_worker.outcome import Outcome, read_outcome
+from dev_worker.outcome import Outcome, read_outcome, read_verdict
 from dev_worker.plugin import PluginCheckout, PluginError
-from dev_worker.repositories import CodeRepository, HeadMovedError, RepositoryError
+from dev_worker.repositories import (
+    CodeRepository,
+    HeadMovedError,
+    PullRequest,
+    RepositoryError,
+)
 from dev_worker.run_journal import (
     GUARD_FILE,
     JOURNAL_FILE,
@@ -400,27 +411,37 @@ def land_done(
     instance: Instance,
     worker: WorkerFile,
     tracker: TicketTracker,
-) -> tuple[str, str, str | None]:
-    """Merge the pull request of a run on the ticket `key` that ended on `done`; return the status key the ticket goes to, the body of its comment and why it is blocked.
+    directory: Path,
+    began: float,
+) -> tuple[str, str, str | None, list[str]]:
+    """Merge the pull request of a run on the ticket `key` that ended on `done`; return the status key the ticket goes to, the body of its comment, why it is blocked, and the errors that did not block it.
 
     The open pull request whose head is the run branch (see `run_branch`) is found, its
-    CI read once, the ticket read again through `tracker`, then the pull request merged
-    as one squashed commit under its title. The status key is `done` once merged; the one
-    the header of `worker` ties the `done` outcome to when the ticket carries the
-    `hold_merge_label` of `instance`, the pull request left open; the one it ties
-    `blocked` to when there is no pull request, its CI has not passed, or a step fails,
-    nothing retried. The body is `summary` followed by what happened; after a merge that
-    failed for a reason other than a moved head, it says the merge may have happened.
-    The reason the ticket is blocked is `None` unless it goes to the `blocked` status key.
+    CI read once, the ticket read again through `tracker`, then the pull request given
+    its guard review (see `review_pull_request`), in the instance directory `directory`
+    within the time the run started at `began` has left, and merged as one squashed
+    commit under its title, tied to the reviewed head commit. The status key is `done`
+    once merged; the one the header of `worker` ties the `done` outcome to when the
+    ticket carries the `hold_merge_label` of `instance`, the pull request left open and
+    not reviewed; the one it ties `blocked` to when there is no pull request, its CI has
+    not passed, the review found a reachable defect or gave no verdict, or a step fails,
+    the pull request left open and nothing retried. The body is `summary` followed by
+    what happened, the defects found listed; after a merge that failed for a reason
+    other than a moved head, it says the merge may have happened. The reason the ticket
+    is blocked is `None` unless it goes to the `blocked` status key. The errors hold why
+    the review checkout could not be deleted, which neither blocks the ticket nor holds
+    the merge back.
     """
     outcomes = worker.header.outcomes
+    errors: list[str] = []
 
-    def blocked(reason: str) -> tuple[str, str, str]:
+    def blocked(reason: str) -> tuple[str, str, str, list[str]]:
         """Return the landing of a ticket blocked for `reason`."""
         return (
             outcomes.blocked,
             f"{summary}\n\nThe ticket is blocked: {reason}",
             reason,
+            errors,
         )
 
     branch = run_branch(instance, key)
@@ -445,7 +466,14 @@ def land_done(
             f"ticket carries the label {instance.hold_merge_label!r}, which holds its "
             "merge back."
         )
-        return outcomes.done, left_open, None
+        return outcomes.done, left_open, None, errors
+    reason, removal = review_pull_request(
+        pull_request, instance, worker, directory, began
+    )
+    if removal is not None:
+        errors.append(removal)
+    if reason is not None:
+        return blocked(reason)
     try:
         repository.merge(pull_request)
     except HeadMovedError as error:
@@ -455,7 +483,7 @@ def land_done(
             f"the pull request {pull_request.url} cannot be merged: {error} It may "
             "have been merged and is to be read again."
         )
-    return "done", f"{summary}\n\nMerged: {pull_request.url}", None
+    return "done", f"{summary}\n\nMerged: {pull_request.url}", None, errors
 
 
 def settle_ticket(
@@ -464,31 +492,35 @@ def settle_ticket(
     instance: Instance,
     worker: WorkerFile,
     tracker: TicketTracker,
+    directory: Path,
+    began: float,
 ) -> tuple[str | None, list[str]]:
     """Comment on the ticket `key` then move it as the run's `ending` says; return why a `done` run left it blocked, and why either step failed.
 
     `ending` is the outcome the run ended on, usable, or why it ended without one. The
-    `done` outcome first has its pull request merged, and the ticket is commented on and
-    moved as `land_done` says. The comment is made writable as UTF-8 whatever it
+    `done` outcome first has its pull request reviewed and merged, in the instance
+    directory `directory` within the time the run started at `began` has left, and the
+    ticket is commented on and moved as `land_done` says. The comment is made writable as UTF-8 whatever it
     carries. Any other outcome has its message posted and the ticket
     moved to the real status of the status key the header of `worker` ties it to; a
     reason is posted and the ticket moved as the `blocked` outcome is. The ticket is
     moved even when the comment fails, and never to the real status of the `ready` key.
     After a tracker failure the sentence says whether the comment may have been posted,
     or that the status is unknown. The reason a `done` run left the ticket blocked is the
-    one `land_done` gives, `None` for any other ending.
+    one `land_done` gives, `None` for any other ending; the errors `land_done` gives
+    that did not block it come first among the errors.
     """
     tied = worker.header.outcomes.model_dump()
     blocking: str | None = None
+    errors: list[str] = []
     if isinstance(ending, Outcome) and ending.outcome == "done":
-        status_key, body, blocking = land_done(
-            key, ending.message, instance, worker, tracker
+        status_key, body, blocking, errors = land_done(
+            key, ending.message, instance, worker, tracker, directory, began
         )
     elif isinstance(ending, Outcome):
         status_key, body = tied[ending.outcome], ending.message
     else:
         status_key, body = tied["blocked"], ending
-    errors: list[str] = []
     try:
         tracker.comment(key, writable_text(body))
     except TrackerError as error:
@@ -634,7 +666,8 @@ def run_under_lock(
     Once its ticket is taken, the run settles it before the final line is written (see
     `settle_ticket`): by the outcome the run ended on when it is usable and its work
     rescued, as `blocked` with the reason otherwise, a `running` line that cannot be
-    written included. A run that ended on `done` but whose ticket is left blocked fails,
+    written included. A `done` run has its pull request given its guard review, after
+    its worktree is removed and within the time left since `began`, before it is merged. A run that ended on `done` but whose ticket is left blocked fails,
     the reason as its first error ahead of the errors its output already carried, and
     is journaled `failed`. A tracker failure while
     settling adds its reason to `errors`. An exception raised by `handler` leaves the
@@ -675,13 +708,17 @@ def run_under_lock(
         append_entry(directory, entry)
     except OSError as error:
         reason = f"Journal in '{directory}' cannot be written: {os_reason(error)}"
-        _, errors = settle_ticket(ticket_key, reason, instance, worker, tracker)
+        _, errors = settle_ticket(
+            ticket_key, reason, instance, worker, tracker, directory, began
+        )
         return with_errors(failed(task_id, reason), errors)
     mandate_began = time.monotonic()
     output, ending = run_in_worktree(
         handler, mandate, instance, worker, ticket, directory, began
     )
-    blocking, errors = settle_ticket(ticket_key, ending, instance, worker, tracker)
+    blocking, errors = settle_ticket(
+        ticket_key, ending, instance, worker, tracker, directory, began
+    )
     if blocking is not None:
         output = failed(
             task_id,
@@ -791,11 +828,51 @@ def container_environment(instance: Instance) -> dict[str, str] | str:
     ever quoted.
     """
     agent_variable, agent_service = agent_credential(instance.agent.provider)
-    tokens = (
-        (agent_variable, instance.agent.token_env, agent_service),
-        ("GH_TOKEN", instance.repository.agent_token_env, "agent's GitHub token"),
-        ("TWG_TOKEN", instance.tracker.token_env, "Jira token"),
+    environment = read_tokens(
+        (
+            (agent_variable, instance.agent.token_env, agent_service),
+            ("GH_TOKEN", instance.repository.agent_token_env, "agent's GitHub token"),
+            ("TWG_TOKEN", instance.tracker.token_env, "Jira token"),
+        )
     )
+    if isinstance(environment, str):
+        return environment
+    environment["TWG_SITE"] = instance.tracker.site
+    environment["TWG_USER"] = instance.tracker.user
+    environment["IS_SANDBOX"] = "1"
+    return environment
+
+
+def review_environment(instance: Instance) -> dict[str, str] | str:
+    """Return the variables the guard review container of `instance` receives, by name, or why one is missing.
+
+    They are the agent credential, as `container_environment` gives it, `IS_SANDBOX`
+    set to `1`, and `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_0` and `GIT_CONFIG_VALUE_0`, which
+    mark `WORKDIR` as a git `safe.directory` so that git reads the mounted checkout owned
+    by another user; no repository or tracker token is among them.
+    """
+    agent_variable, agent_service = agent_credential(instance.agent.provider)
+    environment = read_tokens(
+        ((agent_variable, instance.agent.token_env, agent_service),)
+    )
+    if isinstance(environment, str):
+        return environment
+    environment["IS_SANDBOX"] = "1"
+    environment["GIT_CONFIG_COUNT"] = "1"
+    environment["GIT_CONFIG_KEY_0"] = "safe.directory"
+    environment["GIT_CONFIG_VALUE_0"] = WORKDIR
+    return environment
+
+
+def read_tokens(
+    tokens: Sequence[tuple[str, str, str]],
+) -> dict[str, str] | str:
+    """Return each token of `tokens` by the name it is handed over under, or why one is missing.
+
+    Each entry of `tokens` is the name a token is handed over under, the variable it is
+    read from now, and what it is called. A variable unset or empty gives the sentence
+    naming it; no value is ever quoted.
+    """
     environment: dict[str, str] = {}
     for name, variable, service in tokens:
         value = os.environ.get(variable)
@@ -805,10 +882,139 @@ def container_environment(instance: Instance) -> dict[str, str] | str:
                 f"should hold the {service}, is not set."
             )
         environment[name] = value
-    environment["TWG_SITE"] = instance.tracker.site
-    environment["TWG_USER"] = instance.tracker.user
-    environment["IS_SANDBOX"] = "1"
     return environment
+
+
+def review_pull_request(
+    pull_request: PullRequest,
+    instance: Instance,
+    worker: WorkerFile,
+    directory: Path,
+    began: float,
+) -> tuple[str | None, str | None]:
+    """Run the guard review of `pull_request`; return why it is not to be merged, None when the review found no reachable defect, and why its checkout could not be deleted, None when it was.
+
+    `directory` is the instance directory of `instance`. The plugin the header of
+    `worker` names is prepared (see `PluginCheckout.prepare`), the mirror refreshed and
+    the review checkout made at the commit `pull_request.head` (see
+    `Workspace.open_review`); one disposable container then runs, with the checkout
+    mounted read only, the review of the change from the base branch of `pull_request`
+    to that commit (see `run_review`). The review checkout is deleted afterwards,
+    whatever happened (see `Workspace.close_review`); a deletion that fails is returned
+    apart, never as a reason, and added to an exception raised meanwhile as a note. The
+    reason lists the defects the review found, or says why it gave no verdict.
+    """
+    try:
+        plugin = make_plugin(directory).prepare(worker.header.plugin)
+    except PluginError as error:
+        reason = (
+            f"the guard review of the pull request {pull_request.url} did not run, "
+            f"its plugin cannot be fetched: {error}"
+        )
+        return reason, None
+    workspace = make_workspace(instance.repository, directory)
+    try:
+        reason = review_checkout(
+            pull_request, instance, workspace, plugin, directory, began
+        )
+    except BaseException as error:
+        removal = remove_review_checkout(workspace)
+        if removal is not None:
+            error.add_note(removal)
+        raise
+    return reason, remove_review_checkout(workspace)
+
+
+def remove_review_checkout(workspace: Workspace) -> str | None:
+    """Delete the review checkout of `workspace`; return why it failed, or None."""
+    try:
+        workspace.close_review()
+    except WorkspaceError as error:
+        return f"The review checkout cannot be deleted: {error}"
+    return None
+
+
+def review_checkout(
+    pull_request: PullRequest,
+    instance: Instance,
+    workspace: Workspace,
+    plugin: Path,
+    directory: Path,
+    began: float,
+) -> str | None:
+    """Make the review checkout of `pull_request` in `workspace`, then review it; return why it is not to be merged, or None.
+
+    A mirror that cannot be refreshed or a checkout that cannot be made gives the
+    reason; otherwise the review runs (see `run_review`). The checkout is left for the
+    caller to delete.
+    """
+    try:
+        workspace.refresh()
+        base = workspace.open_review(pull_request.base, pull_request.head)
+    except WorkspaceError as error:
+        return (
+            f"the guard review of the pull request {pull_request.url} did not run, "
+            f"its checkout cannot be made: {error}"
+        )
+    return run_review(
+        pull_request, base, instance, workspace.review, plugin, directory, began
+    )
+
+
+def run_review(
+    pull_request: PullRequest,
+    base: str,
+    instance: Instance,
+    checkout: Path,
+    plugin: Path,
+    directory: Path,
+    began: float,
+) -> str | None:
+    """Run the guard review container on `checkout` for the time left in the run; return why `pull_request` is not to be merged, or None.
+
+    The container of `instance`, kept in `directory`, mounts `checkout` read only and
+    the plugin checkout `plugin` read only; it runs the review of the change from the
+    commit `base` to the commit `pull_request.head` (see `review_command`) within the
+    `review_max_turns` limit of `instance`, and receives only the variables
+    `review_environment` gives. The time left is `run_timeout_seconds` minus the seconds
+    elapsed since `began`, the `time.monotonic()` reading taken when the run started;
+    none left, the container is not started. The verdict is read from what the container
+    wrote (see `read_verdict`): no defect gives None; defects give a reason listing each
+    as `file:line summary`; a container that cannot be run, reaches the ceiling or gives
+    no valid verdict gives the reason it gave none.
+    """
+    url = pull_request.url
+    ceiling = instance.limits["run_timeout_seconds"]
+    left = ceiling - (time.monotonic() - began)
+    if left <= 0:
+        return (
+            f"the guard review of the pull request {url} did not run: the run "
+            f"ceiling of {ceiling} seconds was reached before it."
+        )
+    environment = review_environment(instance)
+    if isinstance(environment, str):
+        return f"the guard review of the pull request {url} did not run. {environment}"
+    command = review_command(
+        base, pull_request.head, instance.limits["review_max_turns"]
+    )
+    try:
+        exited = make_container(instance.container.image, directory).run(
+            checkout, left, plugin, command, environment, readonly=True
+        )
+    except ContainerError as error:
+        return f"the guard review of the pull request {url} failed: {error}."
+    verdict = read_verdict(exited)
+    if isinstance(verdict, str):
+        return f"the guard review of the pull request {url} gave no verdict: {verdict}."
+    if not verdict:
+        return None
+    findings = "\n".join(
+        f"- {defect.file}:{defect.line} {defect.summary}" for defect in verdict
+    )
+    return (
+        f"the guard review of the pull request {url} found reachable defects; it "
+        f"was not merged.\n{findings}"
+    )
 
 
 def run_container(

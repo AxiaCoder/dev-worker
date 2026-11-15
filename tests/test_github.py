@@ -26,13 +26,18 @@ HEAD = "0123456789abcdef0123456789abcdef01234567"
 MOVED = "fedcba9876543210fedcba9876543210fedcba98"
 TITLE = "feat: the widgets page lists the widgets"
 PULL = PullRequest(
-    number=42, url="https://github.com/octo/widgets/pull/42", head=HEAD, title=TITLE
+    number=42,
+    url="https://github.com/octo/widgets/pull/42",
+    head=HEAD,
+    title=TITLE,
+    base="main",
 )
 LISTED = {
     "number": 42,
     "url": "https://github.com/octo/widgets/pull/42",
     "headRefOid": HEAD,
     "title": TITLE,
+    "baseRefName": "main",
 }
 
 
@@ -128,7 +133,7 @@ def test_find_pull_request_returns_the_open_pull_request_of_the_branch(
     assert found == PULL
     assert called(record)["argv"] == [
         "pr", "list", "--head=feat/widgets", "--state", "open",
-        "--json", "number,url,headRefOid,title", "--repo", "octo/widgets",
+        "--json", "number,url,headRefOid,title,baseRefName", "--repo", "octo/widgets",
     ]  # fmt: skip
     assert called(record)["env"] == {"GH_TOKEN": TOKEN, "GH_PROMPT_DISABLED": "1"}
 
@@ -184,6 +189,10 @@ def test_a_branch_that_looks_like_a_flag_stays_the_head_value(
         ([{"number": 42, "url": "u", "headRefOid": 7}], "0.headRefOid"),
         ([{"number": 42, "url": "u", "headRefOid": HEAD}], "0.title"),
         ([{"number": 42, "url": "u", "headRefOid": HEAD, "title": 7}], "0.title"),
+        (
+            [{"number": 42, "url": "u", "headRefOid": HEAD, "title": TITLE}],
+            "0.baseRefName",
+        ),
     ],
 )
 def test_a_listing_of_the_wrong_shape_raises(

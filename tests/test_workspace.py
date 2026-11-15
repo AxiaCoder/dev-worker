@@ -849,3 +849,78 @@ def test_every_git_call_signs_in_through_gh_with_the_token_in_its_environment(
         "remote.origin.url",
         "https://github.com/octo/widgets.git",
     ]
+
+
+def test_open_review_checks_out_the_head_commit_in_a_repository_of_its_own(
+    space: Workspace, work: Path
+) -> None:
+    base = git("-C", work, "rev-parse", "HEAD")
+    git("-C", work, "checkout", "--quiet", "-b", BRANCH)
+    (work / "change.txt").write_text("changed", encoding="utf-8")
+    git("-C", work, "add", "change.txt")
+    head = commit(work, "change")
+    git("-C", work, "push", "--quiet", "origin", BRANCH)
+    space.refresh()
+    space.review.mkdir()
+    (space.review / "leftover.txt").write_text("old", encoding="utf-8")
+
+    found = space.open_review("main", head)
+
+    assert found == base
+    review = space.review
+    assert (review / ".git").is_dir()
+    assert not (review / "leftover.txt").exists()
+    assert (review / "change.txt").read_text(encoding="utf-8") == "changed"
+    assert git("-C", review, "rev-parse", "HEAD") == head
+    assert git("-C", review, "rev-parse", "--abbrev-ref", "HEAD") == "HEAD"
+    assert git("-C", review, "diff", "--name-only", f"{base}...{head}") == (
+        "change.txt"
+    )
+
+
+def test_open_review_without_the_head_commit_fails_naming_it(
+    space: Workspace,
+) -> None:
+    space.refresh()
+
+    with pytest.raises(WorkspaceError, match="checking out the reviewed commit"):
+        space.open_review("main", "f" * 40)
+
+
+def test_open_review_without_the_base_branch_fails_naming_it(
+    space: Workspace, work: Path
+) -> None:
+    space.refresh()
+
+    with pytest.raises(WorkspaceError, match="reading the base branch gone"):
+        space.open_review("gone", git("-C", work, "rev-parse", "HEAD"))
+
+
+def test_close_review_deletes_the_checkout_and_its_read_only_objects(
+    space: Workspace, work: Path
+) -> None:
+    space.refresh()
+    space.open_review("main", git("-C", work, "rev-parse", "HEAD"))
+
+    space.close_review()
+    space.close_review()
+
+    assert not space.review.exists()
+
+
+def test_close_review_that_cannot_delete_the_checkout_fails_naming_why(
+    space: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    space.review.mkdir()
+
+    def refuse(path: Path) -> None:
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr(shutil, "rmtree", refuse)
+
+    with pytest.raises(WorkspaceError) as raised:
+        space.close_review()
+
+    assert str(raised.value) == (
+        f"the review checkout '{space.review}' cannot be deleted: Access is denied"
+    )

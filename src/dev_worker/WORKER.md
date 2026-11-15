@@ -13,6 +13,7 @@ outcomes:
 ceilings:
   run_timeout_seconds: 1800
   max_turns: 60
+  review_max_turns: 40
 plugin:
   repository: https://github.com/AxiaCoder/claude-config.git
   tag: atelier--v1.0.0

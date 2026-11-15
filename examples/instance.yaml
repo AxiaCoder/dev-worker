@@ -50,6 +50,7 @@ statuses:
 # The ticket label that holds a merge back: with it, the pull request stays open.
 hold_merge_label: hold-merge
 
-# Optional. Each limit may only tighten the header ceiling of the same name.
+# Optional. Each limit may only tighten the header ceiling of the same name; review_max_turns
+# caps the turns of the guard review a pull request gets before its merge.
 limits:
   max_turns: 40

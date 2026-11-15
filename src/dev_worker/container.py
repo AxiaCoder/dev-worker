@@ -2,9 +2,10 @@
 
 A run pulls its image when the daemon does not have it, within the time left in the
 run, then creates one container with `docker create --rm`, the worktree bind-mounted at
-`WORKDIR` and the plugin checkout bind-mounted read only at `PLUGIN_DIR`, nothing else
-mounted, then starts it; `--rm` has Docker remove it once it
-ends. The container runs Claude Code headless on the ticket (see `agent_command`); what
+`WORKDIR`, read only for a guard review, and the plugin checkout bind-mounted read only
+at `PLUGIN_DIR`, nothing else mounted, then starts it; `--rm` has Docker remove it once
+it ends. The container runs Claude Code headless on the ticket (see `agent_command`), or
+on the review of a change (see `review_command`); what
 it writes to stdout and its exit code are handed back (see `ContainerExit`). It
 receives no environment variable but those the run names, whose values never appear on
 the docker command line. The container is named, so that a run reaching its duration ceiling, or
@@ -38,6 +39,8 @@ AGENT_PROGRAM = "claude"
 NAME_PREFIX = "dev-worker-"
 OWNER_LABEL = "dev-worker.instance"
 DOCKER_FAILURE_CODES = (125, 126, 127)
+REVIEWER_AGENT = "atelier:reviewer"
+DEFECT_FIELDS = ("file", "line", "summary")
 
 
 class ContainerError(Exception):
@@ -112,6 +115,79 @@ def agent_command(
     )
 
 
+def verdict_schema() -> dict[str, object]:
+    """Return the JSON schema of the verdict a guard review ends on.
+
+    The verdict is an object holding exactly `defects`, a list of objects each holding
+    exactly `file`, a string, `line`, an integer from 1, and `summary`, a string. An
+    empty list means the review found no reachable defect.
+    """
+    defect = {
+        "type": "object",
+        "properties": {
+            "file": {"type": "string"},
+            "line": {"type": "integer", "minimum": 1},
+            "summary": {"type": "string"},
+        },
+        "required": list(DEFECT_FIELDS),
+        "additionalProperties": False,
+    }
+    return {
+        "type": "object",
+        "properties": {"defects": {"type": "array", "items": defect}},
+        "required": ["defects"],
+        "additionalProperties": False,
+    }
+
+
+def review_prompt(base: str, head: str) -> str:
+    """Return the prompt of a guard review of the change from the commit `base` to the commit `head`."""
+    return (
+        "Review the change checked out, read only, in the current directory: a git "
+        f"repository whose HEAD is the head commit {head}. The change runs from the "
+        f"base commit {base} to that head commit; read it locally with "
+        f"`git diff {base}...{head}` and `git log {base}..{head}`, and read the files "
+        "around it as you need.\n"
+        "\n"
+        "No pull request is named and no token is given: do not use `gh` or reach the "
+        "network. Change nothing: the checkout is read only.\n"
+        "\n"
+        "Judge only reachable defects: a bug, a security flaw or a broken behaviour that "
+        "a real input or a real use of the code can reach. Leave style, naming and "
+        "suggestions out.\n"
+        "\n"
+        "Answer by the schema: one entry per reachable defect, with the path of its file "
+        "relative to the repository root, its line in the head commit and a one-sentence "
+        "summary; an empty list when there is none.\n"
+    )
+
+
+def review_command(base: str, head: str, max_turns: int) -> tuple[str, ...]:
+    """Return the command that runs the guard review of the change from the commit `base` to the commit `head`.
+
+    Claude Code runs headless as the `REVIEWER_AGENT` of the plugin mounted at
+    `PLUGIN_DIR` (see `review_prompt`), `max_turns` capping its turns, in
+    `bypassPermissions` mode, and answers in JSON by `verdict_schema`.
+    """
+    return (
+        AGENT_PROGRAM,
+        "-p",
+        review_prompt(base, head),
+        "--agent",
+        REVIEWER_AGENT,
+        "--plugin-dir",
+        PLUGIN_DIR,
+        "--max-turns",
+        str(max_turns),
+        "--permission-mode",
+        "bypassPermissions",
+        "--json-schema",
+        json.dumps(verdict_schema()),
+        "--output-format",
+        "json",
+    )
+
+
 def mount_option(source: Path, target: str = WORKDIR, readonly: bool = False) -> str:
     """Return the `--mount` value binding the directory `source` at `target`, read only if `readonly`.
 
@@ -160,10 +236,12 @@ class Container:
         plugin: Path,
         command: Sequence[str],
         environment: Mapping[str, str],
+        readonly: bool = False,
     ) -> ContainerExit:
         """Run `command` in a new container with `worktree` mounted, wait for it to end and return how it ended.
 
-        The plugin checkout `plugin` is mounted read only at `PLUGIN_DIR`. The container
+        `worktree` is mounted at `WORKDIR`, read only when `readonly` is true. The plugin
+        checkout `plugin` is mounted read only at `PLUGIN_DIR`. The container
         receives the variables of `environment`, by name and value, and no other; the
         values are handed to docker through its environment, never on its command line.
 
@@ -194,7 +272,7 @@ class Container:
                 "--label",
                 f"{OWNER_LABEL}={self._owner}",
                 "--mount",
-                mount_option(worktree),
+                mount_option(worktree, readonly=readonly),
                 "--mount",
                 mount_option(plugin, PLUGIN_DIR, readonly=True),
                 "--workdir",

@@ -3,7 +3,7 @@ import json
 import pytest
 
 from dev_worker.container import ContainerExit
-from dev_worker.outcome import Outcome, read_outcome
+from dev_worker.outcome import Defect, Outcome, read_outcome, read_verdict
 
 OUTCOMES = ("done", "blocked", "needs_human", "abandoned")
 SCHEMA_MISMATCH = (
@@ -191,3 +191,122 @@ def test_a_reason_quoting_a_nul_or_a_lone_surrogate_is_made_transmissible(
 
     assert isinstance(found, str)
     assert_transmissible(found)
+
+
+VERDICT_MISMATCH = (
+    "the structured output of Claude Code does not match the verdict schema: "
+)
+
+
+def verdict(**fields: object) -> ContainerExit:
+    """Return a container that exited 0 with `fields` as its structured output."""
+    return ContainerExit(0, result(structured_output=fields), "")
+
+
+def test_a_verdict_without_defects_is_an_empty_list() -> None:
+    assert read_verdict(verdict(defects=[])) == ()
+
+
+def test_a_verdict_lists_its_defects_in_order() -> None:
+    found = read_verdict(
+        verdict(
+            defects=[
+                {"file": "src/a.py", "line": 3, "summary": "Divides by zero."},
+                {"file": "src/b.py", "line": 1, "summary": "x\x00y"},
+            ]
+        )
+    )
+
+    assert isinstance(found, tuple)
+    assert found[0] == Defect("src/a.py", 3, "Divides by zero.")
+    assert (found[1].file, found[1].line) == ("src/b.py", 1)
+    assert_transmissible(found[1].summary)
+
+
+GOOD = {"file": "a.py", "line": 1, "summary": "Bug."}
+
+
+@pytest.mark.parametrize(
+    ("exited", "reason"),
+    [
+        pytest.param(
+            ContainerExit(0, "Error: boom", ""),
+            "the output of Claude Code is not a JSON object",
+            id="not-json",
+        ),
+        pytest.param(
+            ContainerExit(
+                1,
+                result(subtype="error_max_turns", is_error=True, result="Max turns."),
+                "",
+            ),
+            "Claude Code exited with code 1 "
+            "(subtype error_max_turns, result: Max turns.)",
+            id="ceiling",
+        ),
+        pytest.param(
+            ContainerExit(0, result(subtype="error_during_execution"), ""),
+            "Claude Code gave no structured output (subtype error_during_execution)",
+            id="no-structured-output",
+        ),
+        pytest.param(
+            ContainerExit(0, result(structured_output=[]), ""),
+            f"{VERDICT_MISMATCH}it is not a JSON object",
+            id="not-object",
+        ),
+        pytest.param(
+            verdict(defects=[], verdict="ok"),
+            f"{VERDICT_MISMATCH}it holds the unexpected field verdict",
+            id="extra-field",
+        ),
+        pytest.param(
+            verdict(),
+            f"{VERDICT_MISMATCH}its defects are missing or not a list",
+            id="missing-defects",
+        ),
+        pytest.param(
+            verdict(defects={}),
+            f"{VERDICT_MISMATCH}its defects are missing or not a list",
+            id="defects-not-list",
+        ),
+        pytest.param(
+            verdict(defects=[GOOD, "bug"]),
+            f"{VERDICT_MISMATCH}its defect 2 is not a JSON object",
+            id="defect-not-object",
+        ),
+        pytest.param(
+            verdict(defects=[{**GOOD, "severity": "high"}]),
+            f"{VERDICT_MISMATCH}its defect 1 holds the unexpected field severity",
+            id="defect-extra-field",
+        ),
+        pytest.param(
+            verdict(defects=[{**GOOD, "file": 3}]),
+            f"{VERDICT_MISMATCH}its defect 1 has a file missing or not a string",
+            id="file-not-string",
+        ),
+        pytest.param(
+            verdict(defects=[{**GOOD, "line": "3"}]),
+            f"{VERDICT_MISMATCH}its defect 1 has the line '3', not an integer from 1",
+            id="line-not-integer",
+        ),
+        pytest.param(
+            verdict(defects=[{**GOOD, "line": True}]),
+            f"{VERDICT_MISMATCH}its defect 1 has the line True, not an integer from 1",
+            id="line-boolean",
+        ),
+        pytest.param(
+            verdict(defects=[{**GOOD, "line": 0}]),
+            f"{VERDICT_MISMATCH}its defect 1 has the line 0, not an integer from 1",
+            id="line-zero",
+        ),
+        pytest.param(
+            verdict(defects=[{"file": "a.py", "line": 1}]),
+            f"{VERDICT_MISMATCH}its defect 1 has a summary missing or not a string",
+            id="missing-summary",
+        ),
+    ],
+)
+def test_an_output_without_a_valid_verdict_gives_why(
+    exited: ContainerExit, reason: str
+) -> None:
+    assert read_verdict(exited) == reason

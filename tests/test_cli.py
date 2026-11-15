@@ -22,6 +22,7 @@ from dev_worker.container import (
     ContainerError,
     ContainerExit,
     agent_command,
+    review_command,
 )
 from dev_worker.contract import MandateInput, MandateOutput
 from dev_worker.github import GitHubRepository
@@ -51,10 +52,17 @@ MAKE_PLUGIN = cli.make_plugin
 CHECKOUT = Path("plugin")
 IDENTITY = "12345678+example-worker@users.noreply.github.com"
 RESCUED = ("rescue", "agent/DEMO-1", "Example Worker", IDENTITY)
+REVIEWED = [
+    ("refresh",),
+    ("open_review", "main", "0123456789abcdef0123456789abcdef01234567"),
+    ("close_review",),
+]
 SUMMARY = "The login page asks for an email."
 DONE = json.dumps(
     {"type": "result", "structured_output": {"outcome": "done", "message": SUMMARY}}
 )
+NO_DEFECT = json.dumps({"type": "result", "structured_output": {"defects": []}})
+BASE_COMMIT = "89abcdef0123456789abcdef0123456789abcdef"
 
 
 def valid_input(**overrides: object) -> dict[str, object]:
@@ -121,6 +129,7 @@ PULL = PullRequest(
     url="https://github.com/example-org/example-app/pull/7",
     head="0123456789abcdef0123456789abcdef01234567",
     title="feat: a login page",
+    base="main",
 )
 
 
@@ -182,6 +191,7 @@ class FakeWorkspace:
         self.left: str | None = None
         self.calls: list[tuple[str, ...]] = []
         self.worktree = Path("worktree")
+        self.review = Path("review")
 
     def _step(self, *call: str) -> None:
         self.calls.append(call)
@@ -213,6 +223,15 @@ class FakeWorkspace:
     def close(self, branch: str) -> None:
         """Record the closing of `branch`."""
         self._step("close", branch)
+
+    def open_review(self, base: str, head: str) -> str:
+        """Record the review checkout of `head` against `base`; return `BASE_COMMIT`."""
+        self._step("open_review", base, head)
+        return BASE_COMMIT
+
+    def close_review(self) -> None:
+        """Record the deletion of the review checkout."""
+        self._step("close_review")
 
 
 @pytest.fixture(autouse=True)
@@ -261,6 +280,8 @@ class FakeContainer:
     def __init__(self, error: ContainerError | None = None) -> None:
         self.error = error
         self.exited = ContainerExit(0, DONE, "")
+        self.verdict = ContainerExit(0, NO_DEFECT, "")
+        self.readonly: list[bool] = []
         self.failing: tuple[str, ...] | None = None
         self.images: list[str] = []
         self.directories: list[Path] = []
@@ -290,12 +311,14 @@ class FakeContainer:
         plugin: Path,
         command: Sequence[str],
         environment: Mapping[str, str],
+        readonly: bool = False,
     ) -> ContainerExit:
-        """Record the run on `worktree` with `time_left` seconds left and `plugin` mounted, then its command and environment; return `exited`."""
+        """Record the run on `worktree` with `time_left` seconds left and `plugin` mounted, then its command, environment and whether `worktree` is read only; return `verdict` when it is, `exited` otherwise."""
         self.commands.append(tuple(command))
         self.environments.append(dict(environment))
+        self.readonly.append(readonly)
         self._step("run", worktree, time_left, plugin)
-        return self.exited
+        return self.verdict if readonly else self.exited
 
     def check_none_running(self) -> None:
         """Record the check that no container of the instance is running."""
@@ -1315,8 +1338,9 @@ def test_claim_delay_starts_after_the_worktree_left_by_an_earlier_run_is_rescued
 
     def slow_rescue(branch: str, identity: GitIdentity) -> None:
         rescue(branch, identity)
-        tracker.clock[0] += 1000.0
-        tracker.wall[0] += 1000.0
+        if branch == "agent/OLD-7":
+            tracker.clock[0] += 1000.0
+            tracker.wall[0] += 1000.0
 
     monkeypatch.setattr(workspace, "rescue", slow_rescue)
     workspace.left = "agent/OLD-7"
@@ -1551,7 +1575,7 @@ def test_journal_records_the_duration_of_the_mandate_in_seconds(
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
 ) -> None:
-    clock = [90.0, 90.0, 90.0, 90.0, 100.0, 101.0, 102.5]
+    clock = [90.0, 90.0, 90.0, 90.0, 100.0, 101.0, 101.5, 102.5]
     monkeypatch.setattr(cli.time, "monotonic", lambda: clock.pop(0))
 
     run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
@@ -1661,6 +1685,7 @@ def test_mandate_runs_in_a_worktree_on_the_ticket_branch_closed_afterwards(
         ("open", "agent/DEMO-1"),
         RESCUED,
         ("close", "agent/DEMO-1"),
+        *REVIEWED,
     ]
 
 
@@ -1685,7 +1710,7 @@ def test_workspace_is_made_for_the_instance_repository_in_its_directory(
     assert answer["status"] == "completed"
     assert [(repository.name, directory) for repository, directory in made] == [
         ("example-org/example-app", instance.with_suffix(""))
-    ] * 2
+    ] * 3
 
 
 def test_worktree_branch_follows_the_instance_branch_template(
@@ -1713,6 +1738,7 @@ def test_worktree_branch_follows_the_instance_branch_template(
         ("open", "feature/DEMO-1-auto"),
         ("rescue", "feature/DEMO-1-auto", "Example Worker", IDENTITY),
         ("close", "feature/DEMO-1-auto"),
+        *REVIEWED,
     ]
 
 
@@ -1823,7 +1849,8 @@ def test_container_runs_claude_on_the_ticket_with_the_worker_rules_and_only_the_
             worker.body,
             40,
             ["done", "blocked", "needs_human", "abandoned"],
-        )
+        ),
+        review_command(BASE_COMMIT, PULL.head, 40),
     ]
     assert container.environments == [
         {
@@ -1833,8 +1860,16 @@ def test_container_runs_claude_on_the_ticket_with_the_worker_rules_and_only_the_
             "TWG_SITE": "example.atlassian.net",
             "TWG_USER": "worker@example.com",
             "IS_SANDBOX": "1",
-        }
+        },
+        {
+            "CLAUDE_CODE_OAUTH_TOKEN": "agent-token",
+            "IS_SANDBOX": "1",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "safe.directory",
+            "GIT_CONFIG_VALUE_0": "/workspace",
+        },
     ]
+    assert container.readonly == [False, True]
     assert "worker-github-token" not in container.environments[0].values()
 
 
@@ -1912,7 +1947,14 @@ def test_container_of_an_api_key_agent_gets_the_key_as_anthropic_api_key_and_no_
             "TWG_SITE": "example.atlassian.net",
             "TWG_USER": "worker@example.com",
             "IS_SANDBOX": "1",
-        }
+        },
+        {
+            "ANTHROPIC_API_KEY": "agent-key",
+            "IS_SANDBOX": "1",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "safe.directory",
+            "GIT_CONFIG_VALUE_0": "/workspace",
+        },
     ]
 
 
@@ -1958,15 +2000,19 @@ def test_run_prepares_the_plugin_the_header_names_in_the_instance_directory(
     )
 
     assert answer["status"] == "completed"
-    assert plugin.prepared == [
-        (
-            instance.with_suffix(""),
-            Plugin(
-                repository="https://github.com/AxiaCoder/claude-config.git",
-                tag="atelier--v1.0.0",
-            ),
-        )
-    ]
+    assert (
+        plugin.prepared
+        == [
+            (
+                instance.with_suffix(""),
+                Plugin(
+                    repository="https://github.com/AxiaCoder/claude-config.git",
+                    tag="atelier--v1.0.0",
+                ),
+            )
+        ]
+        * 2
+    )
 
 
 def test_plugin_that_cannot_be_fetched_fails_the_run_naming_why_before_the_worktree(
@@ -2026,8 +2072,9 @@ def test_container_runs_under_the_run_timeout_of_the_instance(
 
     run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
 
-    [(step, worktree, time_left, checkout), checked] = container.calls
+    [(step, worktree, time_left, checkout), checked, reviewed] = container.calls
     assert checked == ("check_none_running",)
+    assert reviewed[0] == "run"
     assert (step, worktree, checkout) == ("run", Path("worktree"), CHECKOUT)
     assert isinstance(time_left, float)
     assert 4 < time_left <= 5
@@ -2062,6 +2109,7 @@ def test_container_is_given_the_time_left_once_the_worktree_is_ready(
     assert container.calls == [
         ("run", workspace.worktree, 1200, CHECKOUT),
         ("check_none_running",),
+        ("run", workspace.review, 600, CHECKOUT),
     ]
 
 
@@ -2086,6 +2134,7 @@ def test_container_time_left_counts_the_time_spent_taking_the_ticket(
     assert container.calls == [
         ("run", workspace.worktree, 1500, CHECKOUT),
         ("check_none_running",),
+        ("run", workspace.review, 1500, CHECKOUT),
     ]
 
 
@@ -2182,7 +2231,7 @@ def test_worktree_is_closed_when_the_mandate_fails(
     )
 
     assert answer["errors"] == ["refused"]
-    assert workspace.calls[-2:] == [RESCUED, ("close", "agent/DEMO-1")]
+    assert workspace.calls[-5:-3] == [RESCUED, ("close", "agent/DEMO-1")]
 
 
 def test_worktree_is_closed_when_the_mandate_raises(
@@ -2390,11 +2439,13 @@ def fake_docker(
 
     Each keyword sets the environment variable `FAKE_DOCKER_<KEYWORD>`, such as
     `ps_stdout_1` for `FAKE_DOCKER_PS_STDOUT_1`. The container writes the `done`
-    outcome `DONE` unless `start_stdout` says otherwise.
+    outcome `DONE` unless `start_stdout` says otherwise, and the guard review container
+    after it the verdict `NO_DEFECT` unless `start_stdout_1` does.
     """
     record = tmp_path / "docker.jsonl"
     monkeypatch.setenv("FAKE_DOCKER_RECORD", str(record))
     monkeypatch.setenv("FAKE_DOCKER_START_STDOUT", DONE)
+    monkeypatch.setenv("FAKE_DOCKER_START_STDOUT_1", NO_DEFECT)
     for name, value in answers.items():
         monkeypatch.setenv(f"FAKE_DOCKER_{name.upper()}", value)
     monkeypatch.setattr(cli, "make_container", MAKE_CONTAINER)
@@ -2466,6 +2517,9 @@ def test_container_left_by_a_killed_worker_is_killed_before_its_worktree_is_resc
         "create",
         "start",
         "ps",
+        "image",
+        "create",
+        "start",
     ]
     assert ("rescue", "agent/OLD-7", "Example Worker", IDENTITY) in workspace.calls
     assert stub.moves != []
@@ -2558,8 +2612,9 @@ def test_containers_of_an_instance_carry_one_label_whatever_the_path_spelling(
 
     owner = f"dev-worker.instance={instance.with_suffix('').resolve()}"
     calls = [json.loads(line) for line in record.read_text("utf-8").splitlines()]
-    [create_call] = [call for call in calls if call[0] == "create"]
-    assert owner in create_call
+    create_calls = [call for call in calls if call[0] == "create"]
+    assert len(create_calls) == 2
+    assert all(owner in create_call for create_call in create_calls)
     assert all(f"label={owner}" in call for call in calls if call[0] == "ps")
 
 
@@ -6125,3 +6180,428 @@ def test_done_whose_summary_holds_a_nul_or_a_lone_surrogate_still_comments_moves
     assert "\x00" not in body
     body.encode("utf-8")
     assert stub.moves == [IN_PROGRESS, MERGED]
+
+
+def review_verdict(*defects: dict[str, object]) -> ContainerExit:
+    """Return a guard review container that ended on a verdict listing `defects`."""
+    return ContainerExit(
+        0,
+        json.dumps({"type": "result", "structured_output": {"defects": list(defects)}}),
+        "",
+    )
+
+
+def test_done_is_reviewed_read_only_without_repository_or_tracker_tokens_then_merged_at_the_reviewed_head(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    container: FakeContainer,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["errors"] == []
+    assert container.readonly == [False, True]
+    step, mounted, time_left, plugin_checkout = container.calls[-1]
+    assert (step, mounted, plugin_checkout) == ("run", workspace.review, CHECKOUT)
+    assert isinstance(time_left, float)
+    assert 0 < time_left <= 1800
+    assert container.commands[-1] == review_command(BASE_COMMIT, PULL.head, 40)
+    review_environment = container.environments[-1]
+    assert "GH_TOKEN" not in review_environment
+    assert "TWG_TOKEN" not in review_environment
+    assert review_environment["GIT_CONFIG_COUNT"] == "1"
+    assert review_environment["GIT_CONFIG_KEY_0"] == "safe.directory"
+    assert review_environment["GIT_CONFIG_VALUE_0"] == "/workspace"
+    assert "worker-github-token" not in review_environment.values()
+    assert workspace.calls[-3:] == REVIEWED
+    assert reachable_repository.calls[-1] == ("merge", PULL)
+    assert stub.moves == [IN_PROGRESS, MERGED]
+
+
+def test_review_max_turns_of_the_instance_caps_the_review(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+) -> None:
+    with instance.open("a", encoding="utf-8") as file:
+        file.write("  review_max_turns: 12\n")
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert container.commands[-1] == review_command(BASE_COMMIT, PULL.head, 12)
+
+
+def test_done_whose_review_finds_defects_is_not_merged_and_lists_them_in_the_comment(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    container: FakeContainer,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    container.verdict = review_verdict(
+        {"file": "src/app.py", "line": 12, "summary": "The token is logged."},
+        {"file": "src/db.py", "line": 3, "summary": "The query is concatenated."},
+    )
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    reason = (
+        f"the guard review of the pull request {PULL.url} found reachable defects; "
+        "it was not merged.\n"
+        "- src/app.py:12 The token is logged.\n"
+        "- src/db.py:3 The query is concatenated."
+    )
+    assert_blocked_run_fails(answer, instance, reason)
+    assert "merge" not in [name for name, _ in reachable_repository.calls]
+    assert stub.comments == [
+        ("DEMO-1", f"{SUMMARY}\n\nThe ticket is blocked: {reason}")
+    ]
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
+    assert workspace.calls[-1] == ("close_review",)
+
+
+@pytest.mark.parametrize(
+    ("verdict", "reason"),
+    [
+        pytest.param(
+            ContainerExit(0, json.dumps({"structured_output": {"defects": 3}}), ""),
+            "gave no verdict: the structured output of Claude Code does not match "
+            "the verdict schema: its defects are missing or not a list.",
+            id="off-schema",
+        ),
+        pytest.param(
+            ContainerExit(
+                1,
+                json.dumps({"subtype": "error_max_turns", "is_error": True}),
+                "",
+            ),
+            "gave no verdict: Claude Code exited with code 1 "
+            "(subtype error_max_turns).",
+            id="turn-ceiling",
+        ),
+    ],
+)
+def test_done_whose_review_gives_no_verdict_is_not_merged_naming_why(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    container: FakeContainer,
+    reachable_repository: ReachableRepository,
+    verdict: ContainerExit,
+    reason: str,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    container.verdict = verdict
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    full = f"the guard review of the pull request {PULL.url} {reason}"
+    assert_blocked_run_fails(answer, instance, full)
+    assert "merge" not in [name for name, _ in reachable_repository.calls]
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
+    assert workspace.calls[-1] == ("close_review",)
+
+
+def test_done_whose_review_container_fails_is_not_merged_naming_why(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    container: FakeContainer,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    run = container.run
+
+    def fail_review(*arguments: Any, readonly: bool = False) -> ContainerExit:
+        if readonly:
+            raise ContainerError("the image is gone")
+        return run(*arguments)
+
+    monkeypatch.setattr(container, "run", fail_review)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_blocked_run_fails(
+        answer,
+        instance,
+        f"the guard review of the pull request {PULL.url} failed: the image is gone.",
+    )
+    assert "merge" not in [name for name, _ in reachable_repository.calls]
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
+    assert workspace.calls[-1] == ("close_review",)
+
+
+@pytest.mark.parametrize("step", ["open_review", "refresh"])
+def test_done_whose_review_checkout_cannot_be_made_is_not_reviewed_nor_merged(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    container: FakeContainer,
+    reachable_repository: ReachableRepository,
+    step: str,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    open_worktree = workspace.open
+
+    def open_then_fail(branch: str) -> Path:
+        opened = open_worktree(branch)
+        workspace.fail = step
+        return opened
+
+    monkeypatch.setattr(workspace, "open", open_then_fail)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_blocked_run_fails(
+        answer,
+        instance,
+        f"the guard review of the pull request {PULL.url} did not run, its "
+        f"checkout cannot be made: {step} broke",
+    )
+    assert container.readonly == [False]
+    assert "merge" not in [name for name, _ in reachable_repository.calls]
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
+    assert workspace.calls[-1] == ("close_review",)
+
+
+def test_done_whose_review_plugin_cannot_be_fetched_is_not_reviewed_nor_merged(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    plugin: FakePlugin,
+    container: FakeContainer,
+    reachable_repository: ReachableRepository,
+) -> None:
+    serve(monkeypatch, demo_ticket())
+    find = reachable_repository.find_pull_request
+
+    def find_then_break_plugin(branch: str) -> PullRequest | None:
+        plugin.error = PluginError("the tag is gone")
+        return find(branch)
+
+    monkeypatch.setattr(
+        reachable_repository, "find_pull_request", find_then_break_plugin
+    )
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_blocked_run_fails(
+        answer,
+        instance,
+        f"the guard review of the pull request {PULL.url} did not run, its plugin "
+        "cannot be fetched: the tag is gone",
+    )
+    assert container.readonly == [False]
+    assert "merge" not in [name for name, _ in reachable_repository.calls]
+
+
+def test_done_whose_review_credential_is_gone_is_not_reviewed_nor_merged(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+    reachable_repository: ReachableRepository,
+) -> None:
+    serve(monkeypatch, demo_ticket())
+    find = reachable_repository.find_pull_request
+
+    def find_then_drop_credential(branch: str) -> PullRequest | None:
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN")
+        return find(branch)
+
+    monkeypatch.setattr(
+        reachable_repository, "find_pull_request", find_then_drop_credential
+    )
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_blocked_run_fails(
+        answer,
+        instance,
+        f"the guard review of the pull request {PULL.url} did not run. The "
+        "container was not started: the variable CLAUDE_CODE_OAUTH_TOKEN, which "
+        "should hold the Claude Code subscription token, is not set.",
+    )
+    assert container.readonly == [False]
+    assert "merge" not in [name for name, _ in reachable_repository.calls]
+
+
+def test_done_with_no_time_left_for_the_review_is_not_reviewed_nor_merged(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    container: FakeContainer,
+    reachable_repository: ReachableRepository,
+) -> None:
+    serve(monkeypatch, demo_ticket())
+    clock = [1000.0]
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock[0])
+    refresh = workspace.refresh
+
+    def refresh_late() -> None:
+        refresh()
+        if ("close", "agent/DEMO-1") in workspace.calls:
+            clock[0] += 1800
+
+    monkeypatch.setattr(workspace, "refresh", refresh_late)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_blocked_run_fails(
+        answer,
+        instance,
+        f"the guard review of the pull request {PULL.url} did not run: the run "
+        "ceiling of 1800 seconds was reached before it.",
+    )
+    assert container.readonly == [False]
+    assert "merge" not in [name for name, _ in reachable_repository.calls]
+    assert workspace.calls[-1] == ("close_review",)
+
+
+def test_done_whose_ci_has_not_passed_runs_no_review(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    container: FakeContainer,
+    reachable_repository: ReachableRepository,
+) -> None:
+    serve(monkeypatch, demo_ticket())
+    reachable_repository.ci = "failed"
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert container.readonly == [False]
+    assert ("close_review",) not in workspace.calls
+
+
+def test_done_on_a_ticket_carrying_the_hold_label_runs_no_review(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    container: FakeContainer,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    find = reachable_repository.find_pull_request
+
+    def label_then_find(branch: str) -> PullRequest | None:
+        stub.answer = replace(demo_ticket("In Progress"), labels=("hold-merge",))
+        return find(branch)
+
+    monkeypatch.setattr(reachable_repository, "find_pull_request", label_then_find)
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert container.readonly == [False]
+    assert ("close_review",) not in workspace.calls
+
+
+UNDELETED = "The review checkout cannot be deleted: close_review broke"
+
+
+def test_done_whose_clean_review_checkout_cannot_be_deleted_is_merged_reporting_it(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    workspace.fail = "close_review"
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed"
+    assert answer["errors"] == [UNDELETED]
+    assert reachable_repository.calls[-1] == ("merge", PULL)
+    assert stub.moves == [IN_PROGRESS, MERGED]
+
+
+def test_done_whose_review_gives_no_verdict_and_whose_checkout_cannot_be_deleted_is_blocked_reporting_both(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    container: FakeContainer,
+    reachable_repository: ReachableRepository,
+) -> None:
+    serve(monkeypatch, demo_ticket())
+    workspace.fail = "close_review"
+    container.verdict = ContainerExit(0, json.dumps({"structured_output": {}}), "")
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    reason = (
+        f"the guard review of the pull request {PULL.url} gave no verdict: the "
+        "structured output of Claude Code does not match the verdict schema: its "
+        "defects are missing or not a list."
+    )
+    assert answer["status"] == "failed"
+    assert answer["errors"] == [
+        f"The run ended on 'done' but its ticket is blocked: {reason}",
+        UNDELETED,
+    ]
+    assert "merge" not in [name for name, _ in reachable_repository.calls]
+
+
+@pytest.mark.parametrize("removable", [True, False], ids=["removed", "kept"])
+def test_review_interrupted_deletes_its_checkout_and_raises_again(
+    monkeypatch: pytest.MonkeyPatch,
+    workspace: FakeWorkspace,
+    container: FakeContainer,
+    removable: bool,
+) -> None:
+    instance = cli.load_instance(INSTANCE, cli.load_worker().header)
+
+    def interrupt(*arguments: Any, readonly: bool = False) -> ContainerExit:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(container, "run", interrupt)
+    if not removable:
+        workspace.fail = "close_review"
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        cli.review_pull_request(
+            PULL, instance, cli.load_worker(), Path("instance"), cli.time.monotonic()
+        )
+
+    assert workspace.calls[-1] == ("close_review",)
+    notes = getattr(raised.value, "__notes__", [])
+    assert notes == (
+        []
+        if removable
+        else ["The review checkout cannot be deleted: close_review broke"]
+    )
