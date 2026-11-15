@@ -35,6 +35,10 @@ On GitHub, in the repository's **Settings → Rules → Rulesets**, add a **New 
 
 On a repository owned by a user account, a collaborator cannot use a fine-grained token on it, so the agent's token is a classic token with the `repo` scope; it reaches every repository the agent's account can, so give that account access to this repository only — and it can still write to any public repository (issues, comments, pull requests), which a fine-grained token cannot. On a repository owned by an organization the agent's account is a member of, a fine-grained token limited to this repository, with **Contents** and **Pull requests** set to read and write, is enough. With this rule, a merge attempted with the agent's token is refused.
 
+## The guard review before a merge
+
+Once a run ends on `done`, its pull request is merged only if its CI passed, the ticket does not carry the `hold_merge_label`, and a guard review finds no reachable defect in it. The review is a second Claude Code run, in its own disposable container started from the instance image: it reads, mounted read only, a checkout of the pull request's head commit made from the mirror, and diffs it locally against the pull request's base branch. It receives the agent credential, plus the git setting that lets it read the mounted checkout; no repository or tracker token. It runs as the `reviewer` agent of the pinned plugin, within the `review_max_turns` limit and the time left in the run, and answers whether it reviewed the change, why not when it did not, and the list of the defects it found. The pull request is merged only on an answer that the change was reviewed with no defect; a defect found, a review that says it did not take place, or a review that gives no valid answer leaves the ticket blocked with the reason in its comment, and the pull request open.
+
 ## Development
 
 Requires [uv](https://docs.astral.sh/uv/). The tests create symbolic links: on Windows, turn on Developer Mode first. From the repository root:

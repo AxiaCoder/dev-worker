@@ -15,7 +15,10 @@ from dev_worker.container import (
     agent_command,
     mount_option,
     outcome_schema,
+    review_command,
+    review_prompt,
     ticket_prompt,
+    verdict_schema,
 )
 from dev_worker.tickets import Ticket
 
@@ -653,3 +656,86 @@ def test_an_interruption_before_the_daemon_made_the_container_leaves_no_containe
         container().run(tmp_path, 60, PLUGIN, COMMAND, {})
 
     assert left_over(daemon) == []
+
+
+def test_run_mounts_the_worktree_read_only_when_asked(
+    record: Path, tmp_path: Path
+) -> None:
+    worktree = tmp_path / "review"
+
+    container().run(worktree, 60, PLUGIN, COMMAND, {}, readonly=True)
+
+    _, create, _ = calls(record)
+    assert create[create.index("--mount") + 1] == (
+        f"type=bind,source={worktree},target=/workspace,readonly"
+    )
+
+
+def test_verdict_schema_requires_whether_reviewed_a_reason_and_a_list_of_defects() -> (
+    None
+):
+    assert verdict_schema() == {
+        "type": "object",
+        "properties": {
+            "reviewed": {"type": "boolean"},
+            "reason": {"type": "string"},
+            "defects": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "file": {"type": "string"},
+                        "line": {"type": "integer", "minimum": 1},
+                        "summary": {"type": "string"},
+                    },
+                    "required": ["file", "line", "summary"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["reviewed", "reason", "defects"],
+        "additionalProperties": False,
+    }
+
+
+def test_review_prompt_names_the_base_and_head_commits_and_no_pull_request() -> None:
+    prompt = review_prompt("b" * 40, "h" * 40)
+
+    assert f"git diff {'b' * 40}...{'h' * 40}" in prompt
+    assert f"HEAD is the head commit {'h' * 40}" in prompt
+    assert "pull request is named" in prompt
+    assert "reachable defects" in prompt
+
+
+def test_review_prompt_keeps_the_review_off_gh_and_asks_for_reviewed_false_when_it_could_not_be_done() -> (
+    None
+):
+    prompt = review_prompt("b" * 40, "h" * 40)
+
+    assert "CI of the change has already passed" in prompt
+    assert "do not run `gh`" in prompt
+    assert "`reviewed` is false, `reason` says why" in prompt
+
+
+def test_review_command_runs_the_reviewer_agent_headless_with_its_turns_and_schema() -> (
+    None
+):
+    command = review_command("b" * 40, "h" * 40, 25)
+
+    assert command == (
+        "claude",
+        "-p",
+        review_prompt("b" * 40, "h" * 40),
+        "--agent",
+        "atelier:reviewer",
+        "--plugin-dir",
+        "/plugin",
+        "--max-turns",
+        "25",
+        "--permission-mode",
+        "bypassPermissions",
+        "--json-schema",
+        json.dumps(verdict_schema()),
+        "--output-format",
+        "json",
+    )

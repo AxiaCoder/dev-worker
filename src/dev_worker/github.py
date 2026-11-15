@@ -37,12 +37,13 @@ STATUS_STATES: dict[str, CiState] = {
 
 
 class _ListedPullRequest(BaseModel):
-    """A pull request as `gh pr list --json number,url,headRefOid,title` writes it."""
+    """A pull request as `gh pr list --json number,url,headRefOid,title,baseRefName` writes it."""
 
     number: int
     url: str
     headRefOid: str
     title: str
+    baseRefName: str
 
 
 _LIST_ANSWER = TypeAdapter(list[_ListedPullRequest])
@@ -155,7 +156,7 @@ class GitHubRepository:
                 "--state",
                 "open",
                 "--json",
-                "number,url,headRefOid,title",
+                "number,url,headRefOid,title,baseRefName",
             ],
         )
         try:
@@ -175,6 +176,7 @@ class GitHubRepository:
             url=found.url,
             head=found.headRefOid,
             title=found.title,
+            base=found.baseRefName,
         )
 
     def read_ci(self, pull_request: PullRequest) -> CiState:

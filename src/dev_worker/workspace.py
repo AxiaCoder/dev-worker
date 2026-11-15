@@ -1,6 +1,6 @@
-"""The workspace of a run: a git mirror of the repository and a fresh worktree drawn from it.
+"""The workspace of a run: a git mirror of the repository, a fresh worktree drawn from it, and the checkout a guard review reads.
 
-Both live in the instance directory. The mirror is a bare repository whose
+All three live in the instance directory. The mirror is a bare repository whose
 `refs/remotes/origin/*` follow the remote; a run only adds, then deletes, the local
 branch of its worktree, and before deleting it rescues its work to the remote (see
 `Workspace.rescue`). Every git call signs in through `gh` with the instance token,
@@ -11,6 +11,7 @@ raises `WorkspaceError`.
 
 import os
 import shutil
+import stat
 import subprocess
 from collections.abc import Sequence
 from pathlib import Path
@@ -21,6 +22,7 @@ from dev_worker.instance import GitIdentity, Repository
 GIT_TIMEOUT_SECONDS = 600.0
 MIRROR_DIRECTORY = "mirror.git"
 WORKTREE_DIRECTORY = "worktree"
+REVIEW_DIRECTORY = "review"
 REMOTE = "origin"
 FETCH_REFSPEC = f"+refs/heads/*:refs/remotes/{REMOTE}/*"
 DEFAULT_BRANCH_REF = f"refs/remotes/{REMOTE}/HEAD"
@@ -57,6 +59,7 @@ class Workspace:
         self._timeout = timeout
         self.mirror = directory / MIRROR_DIRECTORY
         self.worktree = directory / WORKTREE_DIRECTORY
+        self.review = directory / REVIEW_DIRECTORY
 
     def refresh(self) -> None:
         """Create the mirror when it is missing, then fetch every branch of the remote into it.
@@ -251,6 +254,74 @@ class Workspace:
                 REMOTE,
                 f"HEAD:refs/heads/{branch}",
             )
+
+    def open_review(self, base: str, head: str) -> str:
+        """Create the review checkout at the commit `head` and return the commit the branch `base` points to.
+
+        The review checkout is a repository of its own, whose `.git` needs nothing
+        outside it: whatever an earlier review left there is deleted first (see
+        `close_review`), then it is created and fetches from the mirror, the mirror being
+        expected refreshed, only the ref `refs/remotes/origin/<base>` and the commit
+        `head`; its HEAD is then detached at `head`, its files checked out. Raises
+        `WorkspaceError` when a leftover cannot be deleted, a git call fails, or the
+        mirror holds no branch `base` or no commit `head`.
+        """
+        self.close_review()
+        self._git("creating the review checkout", "init", "--quiet", str(self.review))
+        self._git_review(
+            f"fetching the base branch {base}",
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            str(self.mirror),
+            f"+refs/remotes/{REMOTE}/{base}:refs/remotes/{REMOTE}/{base}",
+        )
+        self._git_review(
+            f"fetching the reviewed commit {head}",
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            str(self.mirror),
+            head,
+        )
+        base_commit = self._git_review(
+            f"reading the base branch {base}",
+            "rev-parse",
+            "--verify",
+            f"refs/remotes/{REMOTE}/{base}^{{commit}}",
+        ).strip()
+        self._git_review(
+            f"checking out the reviewed commit {head}",
+            "checkout",
+            "--quiet",
+            "--detach",
+            head,
+            "--",
+        )
+        return base_commit
+
+    def close_review(self) -> None:
+        """Delete the review checkout, if it exists, without following any symbolic link in it.
+
+        The read-only files git keeps its objects in are made writable first. Raises
+        `WorkspaceError` when it cannot be deleted.
+        """
+        if not self.review.exists():
+            return
+        try:
+            for folder, _, names in os.walk(self.review / ".git" / "objects"):
+                for name in names:
+                    os.chmod(Path(folder, name), stat.S_IREAD | stat.S_IWRITE)
+            shutil.rmtree(self.review)
+        except OSError as error:
+            reason = error.strerror or type(error).__name__
+            raise WorkspaceError(
+                f"the review checkout '{self.review}' cannot be deleted: {reason}"
+            ) from None
+
+    def _git_review(self, action: str, *arguments: str) -> str:
+        """Run git with `arguments` in the review checkout and return what it wrote to stdout; see `_git`."""
+        return self._git(action, "-C", str(self.review), *arguments)
 
     def _delete_ref_after(self, error: WorkspaceError, ref: str) -> None:
         """Delete `ref` from the mirror, if it exists, after `error` made an `open` fail.

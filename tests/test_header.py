@@ -51,7 +51,11 @@ def test_shipped_worker_file_loads() -> None:
         "needs_human": "blocked",
         "abandoned": "blocked",
     }
-    assert worker.header.ceilings == {"run_timeout_seconds": 1800, "max_turns": 60}
+    assert worker.header.ceilings == {
+        "run_timeout_seconds": 1800,
+        "max_turns": 60,
+        "review_max_turns": 40,
+    }
     assert worker.header.plugin.model_dump() == {
         "repository": "https://github.com/AxiaCoder/claude-config.git",
         "tag": "atelier--v1.0.0",
