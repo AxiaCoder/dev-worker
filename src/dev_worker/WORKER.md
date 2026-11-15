@@ -75,6 +75,10 @@ It may comment on the ticket and create follow-up tickets in the tracker.
   still failing after its bounded retries, a `dev` ⇄ `qa` loop past its two passes. It never goes
   past such a gate on its own, and never opens the pull request a gate refused. The merge request
   and review comments pending a decision are not such checks: § Merging without asking covers them.
+- **A subagent stopped at its turn ceiling** (the `maxTurns` of its definition) **may be launched
+  once more for the same task**, with a brief that resumes from what it left. If that relaunch stops
+  at its ceiling too, the run ends with `blocked`, the subagent and its ceiling as the reason. The
+  relaunch continues the same task: it is not a new pass of a bounded loop.
 - **An authorised task chains.** No pause between steps, and one report, at the end: the outcome.
 - **A trivial defect is fixed or left unsaid.** When fixing it costs less than deciding, fix it in
   this pull request if it concerns it; otherwise say nothing.
@@ -248,8 +252,9 @@ End with exactly one outcome:
 - **`done`** — the pull request is open and its review passes are handled. The summary says what
   the pull request does, what was verified, and the hypotheses it records.
 - **`blocked`** — something stops the work that the run cannot get past alone: a missing access, a
-  tool that fails, a ticket it depends on that is not done, a refusal, or a check of the plugin still
-  failing where it hands back to the user. The reason says what stops it and what would unblock it.
+  tool that fails, a ticket it depends on that is not done, a refusal, a check of the plugin still
+  failing where it hands back to the user, or a subagent whose relaunch stopped at its turn
+  ceiling too. The reason says what stops it and what would unblock it.
 - **`needs_human`** — a decision that is hard to undo or cannot be guessed. The reason asks the
   question in full, answerable by someone who has not followed the run.
 - **`abandoned`** — the ticket should not be done as written: already done, obsolete, or
