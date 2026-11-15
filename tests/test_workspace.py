@@ -878,12 +878,40 @@ def test_open_review_checks_out_the_head_commit_in_a_repository_of_its_own(
     )
 
 
+def test_open_review_fetches_only_the_base_branch_and_the_head_commit(
+    space: Workspace, work: Path
+) -> None:
+    git("-C", work, "checkout", "--quiet", "-b", BRANCH)
+    (work / "change.txt").write_text("changed", encoding="utf-8")
+    git("-C", work, "add", "change.txt")
+    head = commit(work, "change")
+    git("-C", work, "push", "--quiet", "origin", BRANCH)
+    git("-C", work, "checkout", "--quiet", "-b", "other", "main")
+    (work / "other.txt").write_text("other", encoding="utf-8")
+    git("-C", work, "add", "other.txt")
+    other = commit(work, "other")
+    git("-C", work, "push", "--quiet", "origin", "other")
+    space.refresh()
+
+    space.open_review("main", head)
+
+    review = space.review
+    refs = git("-C", review, "for-each-ref", "--format=%(refname)", "refs/remotes")
+    assert refs == "refs/remotes/origin/main"
+    missing = subprocess.run(
+        ["git", "-C", str(review), "cat-file", "-e", f"{other}^{{commit}}"],
+        capture_output=True,
+        check=False,
+    )
+    assert missing.returncode != 0
+
+
 def test_open_review_without_the_head_commit_fails_naming_it(
     space: Workspace,
 ) -> None:
     space.refresh()
 
-    with pytest.raises(WorkspaceError, match="checking out the reviewed commit"):
+    with pytest.raises(WorkspaceError, match="fetching the reviewed commit f+"):
         space.open_review("main", "f" * 40)
 
 
@@ -892,7 +920,7 @@ def test_open_review_without_the_base_branch_fails_naming_it(
 ) -> None:
     space.refresh()
 
-    with pytest.raises(WorkspaceError, match="reading the base branch gone"):
+    with pytest.raises(WorkspaceError, match="fetching the base branch gone"):
         space.open_review("gone", git("-C", work, "rev-parse", "HEAD"))
 
 

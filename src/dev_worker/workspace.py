@@ -260,21 +260,29 @@ class Workspace:
 
         The review checkout is a repository of its own, whose `.git` needs nothing
         outside it: whatever an earlier review left there is deleted first (see
-        `close_review`), then it is created and fetches every
-        `refs/remotes/origin/*` ref of the mirror, the mirror being expected refreshed;
-        its HEAD is then detached at `head`, its files checked out. Raises
+        `close_review`), then it is created and fetches from the mirror, the mirror being
+        expected refreshed, only the ref `refs/remotes/origin/<base>` and the commit
+        `head`; its HEAD is then detached at `head`, its files checked out. Raises
         `WorkspaceError` when a leftover cannot be deleted, a git call fails, or the
-        checkout holds no commit `head` or no branch `base`.
+        mirror holds no branch `base` or no commit `head`.
         """
         self.close_review()
         self._git("creating the review checkout", "init", "--quiet", str(self.review))
         self._git_review(
-            "fetching the reviewed change into the review checkout",
+            f"fetching the base branch {base}",
             "fetch",
             "--quiet",
             "--no-tags",
             str(self.mirror),
-            f"+refs/remotes/{REMOTE}/*:refs/remotes/{REMOTE}/*",
+            f"+refs/remotes/{REMOTE}/{base}:refs/remotes/{REMOTE}/{base}",
+        )
+        self._git_review(
+            f"fetching the reviewed commit {head}",
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            str(self.mirror),
+            head,
         )
         base_commit = self._git_review(
             f"reading the base branch {base}",
