@@ -91,7 +91,9 @@ class Benign(str):
     """Why a run did not take its ticket when no part of the worker failed.
 
     The lock is held by a run that is not gone, another run claimed the ticket first,
-    or the ticket is not ready to be taken.
+    or the ticket is not ready to be taken. A `done` run is also left blocked for a
+    `Benign` reason when its pull request is missing, its CI has not passed, its guard
+    review found a reachable defect, or its head moved before the merge.
     """
 
 
@@ -101,7 +103,8 @@ class RunReport:
 
     `worker_failed` is false when the run stopped short for a `Benign` reason, or took
     its ticket and settled it by the outcome its container ended on with no error of the
-    worker's own added; true otherwise.
+    worker's own added, a `done` run left blocked only for a `Benign` reason; true
+    otherwise.
     """
 
     output: MandateOutput
@@ -454,7 +457,10 @@ def land_done(
     the pull request left open and nothing retried. The body is `summary` followed by
     what happened, the defects found listed; after a merge that failed for a reason
     other than a moved head, it says the merge may have happened. The reason the ticket
-    is blocked is `None` unless it goes to the `blocked` status key. The errors hold why
+    is blocked is `None` unless it goes to the `blocked` status key, and `Benign` when no
+    pull request is open, its CI has not passed, the review found a reachable defect or
+    the head moved before the merge; any other reason is a failure of the worker's own
+    chain. The errors hold why
     the review checkout could not be deleted, which neither blocks the ticket nor holds
     the merge back.
     """
@@ -475,13 +481,17 @@ def land_done(
     try:
         pull_request = repository.find_pull_request(branch)
         if pull_request is None:
-            return blocked(f"no open pull request has the branch {branch} as its head.")
+            return blocked(
+                Benign(f"no open pull request has the branch {branch} as its head.")
+            )
         ci = repository.read_ci(pull_request)
         if ci != "passed":
             state = "failed" if ci == "failed" else "has not finished"
             return blocked(
-                f"the CI of the pull request {pull_request.url} {state}; it was not "
-                "merged."
+                Benign(
+                    f"the CI of the pull request {pull_request.url} {state}; it was "
+                    "not merged."
+                )
             )
         held = instance.hold_merge_label in tracker.read(key).labels
     except (RepositoryError, TrackerError) as error:
@@ -509,7 +519,7 @@ def land_done(
     try:
         repository.merge(pull_request)
     except HeadMovedError as error:
-        return blocked(str(error))
+        return blocked(Benign(error))
     except RepositoryError as error:
         return blocked(
             f"the pull request {pull_request.url} cannot be merged: {error} It may "
@@ -727,8 +737,9 @@ def run_under_lock(
 
     The worker did not fail when the run was refused for a `Benign` reason, or when it
     ended on an outcome of its container, its worktree removed, its ticket commented on
-    and moved and its final line written; a `done` run left blocked included. It failed
-    otherwise, a run that ended without a usable outcome included.
+    and moved and its final line written; a `done` run left blocked for a `Benign`
+    reason included (see `land_done`). It failed otherwise, a run that ended without a
+    usable outcome, and a `done` run left blocked for any other reason, included.
     """
     task_id = mandate.task_id
     try:
@@ -783,7 +794,12 @@ def run_under_lock(
             *output.errors,
         )
     output = with_errors(output, errors)
-    settled = isinstance(ending, Outcome) and closed and not errors
+    settled = (
+        isinstance(ending, Outcome)
+        and closed
+        and not errors
+        and (blocking is None or isinstance(blocking, Benign))
+    )
     entry |= {"status": output.status, "duration": time.monotonic() - mandate_began}
     try:
         append_entry(directory, entry)
@@ -963,7 +979,7 @@ def review_pull_request(
     to that commit (see `run_review`). The review checkout is deleted afterwards,
     whatever happened (see `Workspace.close_review`); a deletion that fails is returned
     apart, never as a reason, and added to an exception raised meanwhile as a note. The
-    reason lists the defects the review found, or says why it gave no verdict.
+    reason lists the defects the review found, `Benign`, or says why it gave no verdict.
     """
     try:
         plugin = make_plugin(directory).prepare(worker.header.plugin)
@@ -1040,8 +1056,8 @@ def run_review(
     `review_environment` gives. The time left is `run_timeout_seconds` minus the seconds
     elapsed since `began`, the `time.monotonic()` reading taken when the run started;
     none left, the container is not started. The verdict is read from what the container
-    wrote (see `read_verdict`): no defect gives None; defects give a reason listing each
-    as `file:line summary`; a container that cannot be run, reaches the ceiling or gives
+    wrote (see `read_verdict`): no defect gives None; defects give a `Benign` reason
+    listing each as `file:line summary`; a container that cannot be run, reaches the ceiling or gives
     no valid verdict gives the reason it gave none.
     """
     url = pull_request.url
@@ -1072,7 +1088,7 @@ def run_review(
     findings = "\n".join(
         f"- {defect.file}:{defect.line} {defect.summary}" for defect in verdict
     )
-    return (
+    return Benign(
         f"the guard review of the pull request {url} found reachable defects; it "
         f"was not merged.\n{findings}"
     )
@@ -1763,9 +1779,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     The `run` input is read from stdin as raw bytes and the answer is written as UTF-8
     bytes, whatever the encoding of the system. `state` reads the journal and lock of the
-    instance directory; `health` reads the instance and its directory (see `read_health`). Returns 0 whenever a
-    JSON document is written, even for a failed mandate; argparse exits with 2 on
-    incorrect usage.
+    instance directory; `health` reads the instance and its directory (see `read_health`). `run`, `state`
+    and `health` return 0 whenever a JSON document is written, even for a failed
+    mandate; argparse exits with 2 on incorrect usage.
 
     `wake` writes the output of the run it made, or of its own failure, and nothing when
     no ticket is ready; it returns 1 when the worker failed (see `RunReport`), 0
