@@ -1,8 +1,10 @@
-"""The ticket tracker as the rest of the worker sees it: read a ticket, list the tickets in a status, claim one, comment on it, change its status."""
+"""The ticket tracker as the rest of the worker sees it: read a ticket, list the tickets in a status, claim one, count its requeues, comment on it, change its status."""
 
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
+
+REQUEUE_MARKER = "dev-worker returns this ticket to the queue: "
 
 
 class TrackerError(Exception):
@@ -76,10 +78,25 @@ class TicketTracker(Protocol):
         """
         ...
 
-    def claims(self, key: str, status: str) -> tuple[Claim, ...]:
-        """Return the claims posted on the ticket `key` since it last entered the real status `status`, oldest first.
+    def entered(self, key: str, statuses: frozenset[str]) -> datetime | None:
+        """Return the server time the ticket `key` last entered any of the real statuses `statuses` by a change of status, timezone-aware; None when it never did.
 
-        Each claim carries the server time it was created at. A ticket that never entered `status` by a change of status gives all its claims.
+        Raises `TrackerError` when it cannot be read.
+        """
+        ...
+
+    def claims(self, key: str, statuses: frozenset[str]) -> tuple[Claim, ...]:
+        """Return the claims posted on the ticket `key` since it last entered any of the real statuses `statuses`, oldest first.
+
+        Each claim carries the server time it was created at. A ticket that never entered any of `statuses` by a change of status gives all its claims.
+        Raises `TrackerError` when they cannot be read.
+        """
+        ...
+
+    def requeues(self, key: str, statuses: frozenset[str]) -> int:
+        """Return how many requeue comments, whose text starts with `REQUEUE_MARKER`, were posted on the ticket `key` since it last entered any of the real statuses `statuses`.
+
+        A ticket that never entered any of `statuses` by a change of status counts all of them.
         Raises `TrackerError` when they cannot be read.
         """
         ...
