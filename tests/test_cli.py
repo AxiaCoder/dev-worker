@@ -115,7 +115,7 @@ class ReadyTracker:
         """Return the claim id 1."""
         return 1
 
-    def claims(self, key: str, status: str) -> tuple[Claim, ...]:
+    def claims(self, key: str, statuses: frozenset[str]) -> tuple[Claim, ...]:
         """Return the claim 1 alone."""
         return (Claim(1, "task-1", CLAIM_EPOCH),)
 
@@ -520,7 +520,7 @@ class StubTracker:
         self.posted.append(task_id)
         return len(self.posted)
 
-    def claims(self, key: str, status: str) -> tuple[Claim, ...]:
+    def claims(self, key: str, statuses: frozenset[str]) -> tuple[Claim, ...]:
         """Return every claim recorded, oldest first."""
         return tuple(
             Claim(rank, task, CLAIM_EPOCH) for rank, task in enumerate(self.posted, 1)
@@ -887,9 +887,9 @@ class InterleavedTracker(ReadyTracker):
         self.posted.append(task_id)
         return len(self.posted)
 
-    def claims(self, key: str, status: str) -> tuple[Claim, ...]:
-        """Record `status`; return every claim kept, oldest first."""
-        self.asked.append(status)
+    def claims(self, key: str, statuses: frozenset[str]) -> tuple[Claim, ...]:
+        """Record `statuses`, sorted; return every claim kept, oldest first."""
+        self.asked.extend(sorted(statuses))
         return tuple(
             Claim(rank, task, CLAIM_EPOCH) for rank, task in enumerate(self.posted, 1)
         )
@@ -943,7 +943,7 @@ class UnclaimableTracker(ReadyTracker):
             raise TrackerError("twg failed while claiming DEMO-1: timeout")
         return 7
 
-    def claims(self, key: str, status: str) -> tuple[Claim, ...]:
+    def claims(self, key: str, statuses: frozenset[str]) -> tuple[Claim, ...]:
         """Raise when the read step fails; otherwise return a claim other than 7."""
         if self.step == "claims":
             raise TrackerError(
@@ -1080,7 +1080,7 @@ class TimedTracker(ReadyTracker):
         self.claimed = True
         return own
 
-    def claims(self, key: str, status: str) -> tuple[Claim, ...]:
+    def claims(self, key: str, statuses: frozenset[str]) -> tuple[Claim, ...]:
         """Advance the clocks by the read delays; return every claim kept, oldest first."""
         self.clock[0] += self.read_seconds
         self.wall[0] += self.read_seconds + self.suspended_seconds
@@ -7154,7 +7154,7 @@ def unremovable_worktree(setup: Wake) -> None:
 
 
 def unfound_claim(setup: Wake) -> None:
-    def none_found(key: str, status: str) -> tuple[Claim, ...]:
+    def none_found(key: str, statuses: frozenset[str]) -> tuple[Claim, ...]:
         return ()
 
     setup.monkeypatch.setattr(setup.stub, "claims", none_found)
@@ -7165,9 +7165,9 @@ def overdue_claims(setup: Wake) -> None:
     setup.monkeypatch.setattr(cli.time, "time", lambda: wall[0])
     claims = setup.stub.claims
 
-    def late(key: str, status: str) -> tuple[Claim, ...]:
+    def late(key: str, statuses: frozenset[str]) -> tuple[Claim, ...]:
         wall[0] += cli.CLAIM_TAKE_LIMIT_SECONDS + 1
-        return claims(key, status)
+        return claims(key, statuses)
 
     setup.monkeypatch.setattr(setup.stub, "claims", late)
 
@@ -7444,8 +7444,8 @@ class TimelineTracker(StubTracker):
 
     An event is a status entered `("status", name)`, a claim `("claim", task_id)` or a
     comment `("comment", body)`; a claim's id is its rank among the events, from 1.
-    Claims and requeues count from the last entry in a status, every one when it was
-    never entered. `listings` records each status listed; `list_error` and
+    Claims and requeues count from the last entry in any of the statuses asked, every
+    one when none was ever entered. `listings` records each status listed; `list_error` and
     `claims_error` are raised by those reads when set.
     """
 
@@ -7456,28 +7456,32 @@ class TimelineTracker(StubTracker):
         self.list_error: TrackerError | None = None
         self.claims_error: TrackerError | None = None
 
-    def since(self, status: str) -> list[tuple[int, tuple[str, str]]]:
-        """Return the events since the ticket last entered `status`, with their rank from 1."""
+    def since(self, statuses: frozenset[str]) -> list[tuple[int, tuple[str, str]]]:
+        """Return the events since the ticket last entered any of `statuses`, with their rank from 1."""
         ranked = list(enumerate(self.events, 1))
-        entries = [rank for rank, event in ranked if event == ("status", status)]
+        entries = [
+            rank
+            for rank, (kind, name) in ranked
+            if kind == "status" and name in statuses
+        ]
         start = max(entries, default=0)
         return [(rank, event) for rank, event in ranked if rank > start]
 
-    def claims(self, key: str, status: str) -> tuple[Claim, ...]:
-        """Return the claims since the ticket last entered `status`; raise `claims_error` when set."""
+    def claims(self, key: str, statuses: frozenset[str]) -> tuple[Claim, ...]:
+        """Return the claims since the ticket last entered any of `statuses`; raise `claims_error` when set."""
         if self.claims_error is not None:
             raise self.claims_error
         return tuple(
             Claim(rank, task, CLAIM_EPOCH)
-            for rank, (kind, task) in self.since(status)
+            for rank, (kind, task) in self.since(statuses)
             if kind == "claim"
         )
 
-    def requeues(self, key: str, status: str) -> int:
-        """Return how many requeue comments were posted since the ticket last entered `status`."""
+    def requeues(self, key: str, statuses: frozenset[str]) -> int:
+        """Return how many requeue comments were posted since the ticket last entered any of `statuses`."""
         return sum(
             kind == "comment" and body.startswith(REQUEUE)
-            for _, (kind, body) in self.since(status)
+            for _, (kind, body) in self.since(statuses)
         )
 
     def claim(self, key: str, task_id: str) -> int:
@@ -7862,3 +7866,68 @@ def test_wake_whose_recovery_lock_cannot_be_released_fails_with_exit_1(
     assert errors[0].startswith("The tickets in 'In Progress' cannot be listed")
     assert errors[1].startswith("Lock file '")
     assert errors[1].endswith("cannot be removed: Permission denied")
+
+
+ENTERS_IN_REVIEW = ("status", "In Review")
+ENTERS_DONE = ("status", "Done")
+
+
+@pytest.mark.parametrize(
+    "settled", [ENTERS_IN_REVIEW, ENTERS_DONE], ids=["in-review", "done"]
+)
+def test_wake_leaves_a_settled_ticket_a_person_moved_back_in_progress(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    settled: tuple[str, str],
+) -> None:
+    stub = timeline(monkeypatch, *DEAD_RUN, settled, ENTERS_IN_PROGRESS)
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert (code, answer) == (0, None)
+    assert stub.comments == []
+    assert stub.moves == []
+
+
+@pytest.mark.parametrize(
+    "settled", [ENTERS_IN_REVIEW, ENTERS_DONE], ids=["in-review", "done"]
+)
+def test_attempts_count_again_once_a_settled_ticket_is_handed_back(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    settled: tuple[str, str],
+) -> None:
+    died = (
+        ("comment", f"{REQUEUE}earlier"),
+        ENTERS_READY,
+        ("claim", "t"),
+        ENTERS_IN_PROGRESS,
+    )
+    stub = timeline(monkeypatch, *DEAD_RUN, *died, *died, settled, *DEAD_RUN)
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert (code, answer) == (0, None)
+    assert [body for _, body in stub.comments] == [
+        f"{REQUEUE}the run that took it is gone without settling it (attempt 1 of 3)."
+    ]
+    assert stub.moves == [("DEMO-1", "To Do")]
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_wake_does_not_recover_while_the_process_of_the_lock_it_took_over_still_runs(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    hold_lock(instance, lock_of(1801, pid=os.getpid(), ticket_key="DEMO-1"))
+    monkeypatch.setattr(cli, "process_runs_since", lambda pid, moment: True)
+    stub = timeline(monkeypatch, *DEAD_RUN)
+
+    code, _ = wake(capsysbinary, instance)
+
+    assert code == 0
+    assert stub.comments == []
+    assert stub.moves == []

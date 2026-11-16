@@ -354,7 +354,7 @@ def claim_ticket(
             "The claim may have been posted."
         )
     try:
-        claims = tracker.claims(key, ready)
+        claims = tracker.claims(key, frozenset({ready}))
     except TrackerError as error:
         return (
             f"The claims on ticket {key!r} cannot be read: {error} "
@@ -691,19 +691,29 @@ def made_instance_directory(instance_path: Path) -> Path | str:
 
 
 def take_instance_lock(
-    directory: Path, record: Mapping[str, object], instance: Instance
+    directory: Path,
+    record: Mapping[str, object],
+    instance: Instance,
+    *,
+    spare_live_process: bool = False,
 ) -> Path | str:
     """Take the lock of `directory`, writing `record` in it, or take it over from a run that is gone.
 
     A run is gone once it has held the lock beyond the `run_timeout_seconds` limit of
-    `instance`, or once its process is gone (see `take_over_lock`). Returns the lock
-    file path, or why the lock cannot be taken; the reason is `Benign` when a run that
-    is not gone holds it. Never raises on a file error.
+    `instance`, or once its process is gone (see `take_over_lock`). With
+    `spare_live_process`, a run whose process still runs is never taken over. Returns
+    the lock file path, or why the lock cannot be taken; the reason is `Benign` when a
+    run that is not gone, or spared, holds it. Never raises on a file error.
     """
     try:
         return take_lock(directory, record)
     except FileExistsError:
-        return take_over_lock(directory, record, instance.limits["run_timeout_seconds"])
+        return take_over_lock(
+            directory,
+            record,
+            instance.limits["run_timeout_seconds"],
+            spare_live_process=spare_live_process,
+        )
     except OSError as error:
         return lock_unwritable(directory, error)
 
@@ -1368,9 +1378,10 @@ def recover_dead_runs(
     """Hand back the tickets the dead runs of the instance left in progress; return why it failed, empty when it did not.
 
     The lock of the instance directory is taken for `task_id`, or taken over from a run
-    that is gone (see `take_instance_lock`), so that no run of the instance is alive
-    while the tickets in the real status of the `in_progress` key are read; a lock held
-    by a run that is not gone skips the recovery without failing. Each ticket is handed
+    that is gone and whose process no longer runs (see `take_instance_lock`), so that no
+    run of the instance is alive while the tickets in the real status of the
+    `in_progress` key are read; a lock held by a run that is not gone, or whose process
+    still runs, skips the recovery without failing. Each ticket is handed
     back as `requeue_dead_ticket` says, until a tracker failure stops the recovery. The
     lock is released afterwards; a lock that cannot be released adds its reason. Never
     raises on a file or tracker error.
@@ -1383,7 +1394,7 @@ def recover_dead_runs(
         "start": datetime.now(UTC).isoformat(),
         "pid": os.getpid(),
     }
-    lock = take_instance_lock(directory, record, instance)
+    lock = take_instance_lock(directory, record, instance, spare_live_process=True)
     if isinstance(lock, Benign):
         return []
     if isinstance(lock, str):
@@ -1428,11 +1439,12 @@ def requeue_dead_ticket(
 ) -> str | None:
     """Hand back the ticket `key` when a dead run of the worker left it in progress; return why it failed, or None.
 
-    No run of the instance is to be alive. The ticket is the worker's when it has a
-    claim since it last entered the real status of the `ready` key, the latest of which
-    was posted since it last entered the real status of the `blocked` key; any other
-    ticket was moved by a person and is left as it is. The dead run made one attempt
-    more than the requeue comments since the ticket last entered the `blocked` status.
+    No run of the instance is to be alive. A ticket settles when it enters the real
+    status of any status key of the instance but `ready` and `in_progress`. The ticket
+    is the worker's when it has a claim since it last entered the real status of the
+    `ready` key, the latest of which was posted since it last settled; any other ticket
+    was moved by a person and is left as it is. The dead run made one attempt more
+    than the requeue comments since the ticket last settled.
     Below the `max_attempts` limit, a requeue comment naming the attempt is posted and
     the ticket moved to the `ready` status; at the limit, a comment asks a person to
     look at it and the ticket is moved to the `blocked` status. A ticket whose comment
@@ -1441,12 +1453,16 @@ def requeue_dead_ticket(
     """
     ready = instance.statuses["ready"]
     blocked = instance.statuses["blocked"]
+    settled = frozenset(instance.statuses.values()) - {
+        ready,
+        instance.statuses["in_progress"],
+    }
     try:
-        since_ready = tracker.claims(key, ready)
-        since_blocked = {claim.claim_id for claim in tracker.claims(key, blocked)}
-        if not since_ready or since_ready[-1].claim_id not in since_blocked:
+        since_ready = tracker.claims(key, frozenset({ready}))
+        since_settled = {claim.claim_id for claim in tracker.claims(key, settled)}
+        if not since_ready or since_ready[-1].claim_id not in since_settled:
             return None
-        attempt = tracker.requeues(key, blocked) + 1
+        attempt = tracker.requeues(key, settled) + 1
     except TrackerError as error:
         return (
             f"The comments of ticket {key!r} cannot be read from the tracker: {error}"
@@ -1711,17 +1727,35 @@ def gone_reason(
     return None
 
 
+def lock_process_runs(lock: Mapping[str, object]) -> bool:
+    """Tell whether the lock record `lock` names by a positive integer `pid` and a usable `start` a process that still runs, started no later than `start`."""
+    pid = lock.get("pid")
+    start = run_start(lock)
+    return (
+        isinstance(pid, int)
+        and not isinstance(pid, bool)
+        and pid > 0
+        and start is not None
+        and process_runs_since(pid, start.timestamp())
+    )
+
+
 def take_over_lock(
-    directory: Path, record: Mapping[str, object], timeout: int
+    directory: Path,
+    record: Mapping[str, object],
+    timeout: int,
+    *,
+    spare_live_process: bool = False,
 ) -> Path | str:
     """Take the lock of `directory` from a run that is gone, writing `record` in it.
 
     The gone run (see `gone_reason`) is journaled first, as a failed run with the
     `task_id`, `ticket_key` and `start` of its lock record and the reason it is gone
-    in `errors`; a torn last journal line is set aside before. Returns the lock file
-    path, or why the lock cannot be taken: its run is not gone, another run took it
-    first, both `Benign`, or a file cannot be read or written. Never raises on a file
-    error.
+    in `errors`; a torn last journal line is set aside before. With
+    `spare_live_process`, a run whose process still runs (see `lock_process_runs`) is
+    not gone. Returns the lock file path, or why the lock cannot be taken: its run is
+    not gone, another run took it first, both `Benign`, or a file cannot be read or
+    written. Never raises on a file error.
     """
     in_progress = Benign(
         f"A run is already in progress in instance directory '{directory}'."
@@ -1730,7 +1764,11 @@ def take_over_lock(
         seen = (directory / LOCK_FILE).read_bytes()
         held = parse_lock(seen)
         reason = gone_reason(directory, held, timeout)
-        if reason is None or not remove_lock_if_unchanged(directory, seen):
+        if (
+            reason is None
+            or (spare_live_process and lock_process_runs(held))
+            or not remove_lock_if_unchanged(directory, seen)
+        ):
             return in_progress
     except FileNotFoundError:
         return in_progress

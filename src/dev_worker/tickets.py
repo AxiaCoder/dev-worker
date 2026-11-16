@@ -78,18 +78,18 @@ class TicketTracker(Protocol):
         """
         ...
 
-    def claims(self, key: str, status: str) -> tuple[Claim, ...]:
-        """Return the claims posted on the ticket `key` since it last entered the real status `status`, oldest first.
+    def claims(self, key: str, statuses: frozenset[str]) -> tuple[Claim, ...]:
+        """Return the claims posted on the ticket `key` since it last entered any of the real statuses `statuses`, oldest first.
 
-        Each claim carries the server time it was created at. A ticket that never entered `status` by a change of status gives all its claims.
+        Each claim carries the server time it was created at. A ticket that never entered any of `statuses` by a change of status gives all its claims.
         Raises `TrackerError` when they cannot be read.
         """
         ...
 
-    def requeues(self, key: str, status: str) -> int:
-        """Return how many requeue comments, whose text starts with `REQUEUE_MARKER`, were posted on the ticket `key` since it last entered the real status `status`.
+    def requeues(self, key: str, statuses: frozenset[str]) -> int:
+        """Return how many requeue comments, whose text starts with `REQUEUE_MARKER`, were posted on the ticket `key` since it last entered any of the real statuses `statuses`.
 
-        A ticket that never entered `status` by a change of status counts all of them.
+        A ticket that never entered any of `statuses` by a change of status counts all of them.
         Raises `TrackerError` when they cannot be read.
         """
         ...

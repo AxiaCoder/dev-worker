@@ -1032,7 +1032,7 @@ def test_claims_count_only_those_since_the_last_entry_in_the_status_oldest_first
         ),
     )
 
-    claims = tracker().claims("ABC-218", "To Do")
+    claims = tracker().claims("ABC-218", frozenset({"To Do"}))
 
     assert claims == (
         Claim(100, "task-1", datetime(2026, 11, 11, 8, 0, tzinfo=UTC)),
@@ -1067,7 +1067,7 @@ def test_claims_of_a_ticket_that_never_entered_the_status_all_count(
         ),
     )
 
-    assert tracker().claims("ABC-218", "To Do") == (
+    assert tracker().claims("ABC-218", frozenset({"To Do"})) == (
         Claim(90, "task-1", datetime(2020, 1, 1, tzinfo=UTC)),
     )
 
@@ -1094,7 +1094,7 @@ def test_claims_carry_the_creation_time_of_their_own_comment(
         ),
     )
 
-    assert tracker().claims("ABC-218", "To Do") == (
+    assert tracker().claims("ABC-218", frozenset({"To Do"})) == (
         Claim(100, "task-1", datetime(2026, 11, 11, 8, 5, tzinfo=UTC)),
         Claim(110, "task-2", datetime(2026, 11, 11, 8, 10, 30, tzinfo=UTC)),
     )
@@ -1113,7 +1113,7 @@ def test_claims_with_a_next_page_and_no_new_cursor_raise(
     serve_pages(monkeypatch, looping, stuck)
 
     with pytest.raises(TrackerError, match="names a next page without a new cursor"):
-        tracker().claims("ABC-218", "To Do")
+        tracker().claims("ABC-218", frozenset({"To Do"}))
 
 
 def test_claims_page_that_cannot_be_read_raises(
@@ -1125,12 +1125,12 @@ def test_claims_page_that_cannot_be_read_raises(
         TrackerError,
         match="the answer of twg to reading the changelog of ABC-218 cannot be read",
     ):
-        tracker().claims("ABC-218", "To Do")
+        tracker().claims("ABC-218", frozenset({"To Do"}))
 
 
 def test_claims_on_a_key_that_is_not_a_ticket_key_are_refused(record: Path) -> None:
     with pytest.raises(TrackerError, match="is not a Jira ticket key"):
-        tracker().claims("abc-218", "To Do")
+        tracker().claims("abc-218", frozenset({"To Do"}))
     assert not record.exists()
 
 
@@ -1304,7 +1304,7 @@ def test_requeues_count_the_requeue_comments_since_the_last_entry_in_the_status(
         ),
     )
 
-    assert tracker().requeues("ABC-218", "Blocked") == 2
+    assert tracker().requeues("ABC-218", frozenset({"Blocked"})) == 2
     assert calls == [
         ["jira", "workitem", "changelog", "query", "--issue-id", "ABC-218",
          "--first", "100"],
@@ -1331,10 +1331,10 @@ def test_requeues_of_a_ticket_that_never_entered_the_status_all_count(
         ),
     )
 
-    assert tracker().requeues("ABC-218", "Blocked") == 1
+    assert tracker().requeues("ABC-218", frozenset({"Blocked"})) == 1
 
 
 def test_requeues_on_a_key_that_is_not_a_ticket_key_are_refused(record: Path) -> None:
     with pytest.raises(TrackerError, match="is not a Jira ticket key"):
-        tracker().requeues("abc-218", "Blocked")
+        tracker().requeues("abc-218", frozenset({"Blocked"}))
     assert not record.exists()

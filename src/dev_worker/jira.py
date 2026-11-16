@@ -471,10 +471,10 @@ class JiraTracker:
         )  # fmt: skip
         return _validate(_CreatedAnswer, answer, action).data.id
 
-    def claims(self, key: str, status: str) -> tuple[Claim, ...]:
-        """Return the claims on the ticket `key` since it last entered the status `status`, oldest first.
+    def claims(self, key: str, statuses: frozenset[str]) -> tuple[Claim, ...]:
+        """Return the claims on the ticket `key` since it last entered any of the statuses `statuses`, oldest first.
 
-        The last entry is the latest changelog entry that sets the status to `status`; a
+        The last entry is the latest changelog entry that sets the status to one of `statuses`; a
         claim counts when its comment was created at that instant or after, and every claim
         counts when there is no such entry. Each claim carries the creation time of its
         comment. Claims are ordered by comment id. Every page of the changelog and of the
@@ -483,13 +483,13 @@ class JiraTracker:
         """
         found = [
             Claim(comment.id, text.removeprefix(CLAIM_MARKER), comment.created)
-            for comment, text in self._comments_since(key, status)
+            for comment, text in self._comments_since(key, statuses)
             if text.startswith(CLAIM_MARKER)
         ]
         return tuple(sorted(found, key=lambda claim: claim.claim_id))
 
-    def requeues(self, key: str, status: str) -> int:
-        """Return how many requeue comments were posted on the ticket `key` since it last entered the status `status`.
+    def requeues(self, key: str, statuses: frozenset[str]) -> int:
+        """Return how many requeue comments were posted on the ticket `key` since it last entered any of the statuses `statuses`.
 
         A requeue comment is one whose plain text starts with `REQUEUE_MARKER`. The last
         entry is read as `claims` reads it; every requeue counts when there is none. Raises
@@ -497,13 +497,15 @@ class JiraTracker:
         """
         return sum(
             text.startswith(REQUEUE_MARKER)
-            for _, text in self._comments_since(key, status)
+            for _, text in self._comments_since(key, statuses)
         )
 
-    def _comments_since(self, key: str, status: str) -> list[tuple[_Comment, str]]:
-        """Return the comments on the ticket `key` created since it last entered the status `status`, each with its stripped plain text, in the tracker's order.
+    def _comments_since(
+        self, key: str, statuses: frozenset[str]
+    ) -> list[tuple[_Comment, str]]:
+        """Return the comments on the ticket `key` created since it last entered any of the statuses `statuses`, each with its stripped plain text, in the tracker's order.
 
-        The last entry is the latest changelog entry that sets the status to `status`; a
+        The last entry is the latest changelog entry that sets the status to one of `statuses`; a
         comment counts when it was created at that instant or after, and every comment
         counts when there is no such entry. Every page of the changelog and of the comments
         is read. Raises `TrackerError` when `key` is not a ticket key, the token variable
@@ -520,7 +522,7 @@ class JiraTracker:
             for page in changelog
             for history in page.data
             if any(
-                change.field == "status" and change.toString == status
+                change.field == "status" and change.toString in statuses
                 for change in history.items
             )
         ]
