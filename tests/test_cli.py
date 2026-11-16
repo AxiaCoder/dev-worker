@@ -7672,6 +7672,25 @@ def test_wake_leaves_a_ticket_a_person_moved_in_progress(
     assert stub.moves == []
 
 
+def test_wake_hands_back_a_ticket_whose_latest_claim_follows_its_last_block(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = timeline(
+        monkeypatch,
+        ENTERS_READY,
+        ("claim", "t1"),
+        ENTERS_BLOCKED,
+        ("claim", "t2"),
+        ENTERS_IN_PROGRESS,
+    )
+
+    wake(capsysbinary, instance)
+
+    assert stub.moves == [("DEMO-1", "To Do")]
+
+
 def test_wake_does_not_recover_while_a_live_run_holds_the_lock(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
