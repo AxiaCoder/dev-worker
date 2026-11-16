@@ -28,7 +28,7 @@ from dev_worker.contract import MandateInput, MandateOutput
 from dev_worker.github import GitHubRepository
 from dev_worker.header import HeaderError, Plugin
 from dev_worker.instance import GitIdentity, Instance, Repository, Tracker
-from dev_worker.jira import JiraTracker
+from dev_worker.jira import TWG_TIMEOUT_SECONDS, JiraTracker
 from dev_worker.outcome import Outcome
 from dev_worker.plugin import PluginCheckout, PluginError
 from dev_worker.repositories import (
@@ -7736,12 +7736,18 @@ def test_wake_leaves_a_ticket_moved_in_progress_before_its_latest_claim(
 @pytest.mark.parametrize(
     ("delay", "moves"),
     [
-        (cli.CLAIM_TAKE_LIMIT_SECONDS, [("DEMO-1", "To Do")]),
-        (cli.CLAIM_TAKE_LIMIT_SECONDS + 1, []),
+        (
+            cli.CLAIM_TAKE_LIMIT_SECONDS + int(TWG_TIMEOUT_SECONDS),
+            [("DEMO-1", "To Do")],
+        ),
+        (cli.CLAIM_TAKE_LIMIT_SECONDS + int(TWG_TIMEOUT_SECONDS) + 1, []),
     ],
-    ids=["at-the-take-limit", "past-the-take-limit"],
+    ids=[
+        "at-the-take-limit-plus-the-move-timeout",
+        "past-the-take-limit-plus-the-move-timeout",
+    ],
 )
-def test_wake_hands_back_a_ticket_only_when_it_entered_in_progress_within_the_take_limit(
+def test_wake_hands_back_a_ticket_only_when_it_entered_in_progress_within_the_take_limit_plus_the_move_timeout(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,

@@ -46,7 +46,7 @@ from dev_worker.instance import (
     Tracker,
     load_instance,
 )
-from dev_worker.jira import JiraTracker
+from dev_worker.jira import TWG_TIMEOUT_SECONDS, JiraTracker
 from dev_worker.outcome import Outcome, read_outcome, read_verdict
 from dev_worker.plugin import PluginCheckout, PluginError
 from dev_worker.repositories import (
@@ -91,6 +91,7 @@ TICKET_KEY = re.compile(r"(.+)-([1-9][0-9]*)")
 RECENT_RUNS = 10
 CLAIM_TAKE_LIMIT_SECONDS = 300
 CLAIM_EXPIRY_SECONDS = 600
+TAKE_DATING_LIMIT_SECONDS = CLAIM_TAKE_LIMIT_SECONDS + TWG_TIMEOUT_SECONDS
 
 
 class Benign(str):
@@ -1443,8 +1444,10 @@ def requeue_dead_ticket(
     status of any status key of the instance but `ready` and `in_progress`. The ticket
     is the worker's when it has a claim since it last entered the real status of the
     `ready` key, the latest of which was posted since it last settled, and when it last
-    entered the real status of the `in_progress` key at most `CLAIM_TAKE_LIMIT_SECONDS`
-    after that claim was created, both times read from the tracker; any other ticket
+    entered the real status of the `in_progress` key at most `TAKE_DATING_LIMIT_SECONDS`
+    after that claim was created, both times read from the tracker: the worker sends the
+    move within `CLAIM_TAKE_LIMIT_SECONDS` of its claim, and the tracker may date it up
+    to `TWG_TIMEOUT_SECONDS` later. Any other ticket
     was moved by a person and is left as it is. The dead run made one attempt more
     than the requeue comments since the ticket last settled.
     Below the `max_attempts` limit, a requeue comment naming the attempt is posted and
@@ -1464,7 +1467,7 @@ def requeue_dead_ticket(
             return None
         claimed = since_ready[-1].created
         taken = tracker.entered(key, frozenset({in_progress}))
-        take_limit = timedelta(seconds=CLAIM_TAKE_LIMIT_SECONDS)
+        take_limit = timedelta(seconds=TAKE_DATING_LIMIT_SECONDS)
         if taken is None or not claimed <= taken <= claimed + take_limit:
             return None
         attempt = tracker.requeues(key, settled) + 1
