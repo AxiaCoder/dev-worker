@@ -5,8 +5,8 @@ import runpy
 import shutil
 import subprocess
 import sys
-from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import replace
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from importlib.metadata import entry_points
@@ -6719,3 +6719,713 @@ def test_review_interrupted_deletes_its_checkout_and_raises_again(
         if removable
         else ["The review checkout cannot be deleted: close_review broke"]
     )
+
+
+class ListingTracker(StubTracker):
+    """A `StubTracker` that lists `listed` as the tickets in a status, raising it when it is an error.
+
+    `listings` records each status listed.
+    """
+
+    def __init__(
+        self, listed: tuple[Ticket, ...] | TrackerError, answer: Ticket | TrackerError
+    ) -> None:
+        super().__init__(answer)
+        self.listed = listed
+        self.listings: list[str] = []
+
+    def tickets_in(self, status: str) -> tuple[Ticket, ...]:
+        """Record `status`, then return or raise `listed`."""
+        self.listings.append(status)
+        if isinstance(self.listed, TrackerError):
+            raise self.listed
+        return self.listed
+
+
+def list_tickets(
+    monkeypatch: pytest.MonkeyPatch,
+    listed: tuple[Ticket, ...] | TrackerError | None = None,
+    answer: Ticket | TrackerError | None = None,
+) -> ListingTracker:
+    """Make `wake` list `listed` and read `answer` from a `ListingTracker`; return it.
+
+    Both default to the ready ticket DEMO-1 alone.
+    """
+    stub = ListingTracker(
+        (demo_ticket(),) if listed is None else listed,
+        demo_ticket() if answer is None else answer,
+    )
+    monkeypatch.setattr(cli, "make_tracker", stub.make)
+    return stub
+
+
+def wake(
+    capsysbinary: pytest.CaptureFixture[bytes], instance: Path
+) -> tuple[int, dict[str, Any] | None]:
+    """Call `main` with `wake`; return its exit code and parsed answer, None when it wrote nothing."""
+    code = cli.main(["wake", "--instance", str(instance)])
+    out = capsysbinary.readouterr().out
+    return code, json.loads(out.decode("utf-8")) if out else None
+
+
+def ticket_on(key: str, *blockers: Blocker) -> Ticket:
+    """Return the ready ticket `key`, blocked by `blockers`."""
+    return replace(demo_ticket("To Do", *blockers), key=key)
+
+
+def test_wake_without_a_ready_ticket_does_nothing_and_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = list_tickets(monkeypatch, listed=())
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert (code, answer) == (0, None)
+    assert stub.listings == ["To Do"]
+    assert stub.reads == []
+    assert not instance.with_suffix("").exists()
+
+
+def test_wake_whose_ready_tickets_are_all_blocked_does_nothing_and_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = list_tickets(
+        monkeypatch,
+        listed=(
+            ticket_on("DEMO-1", Blocker("DEMO-9", "In Progress")),
+            ticket_on("DEMO-2", Blocker("DEMO-8", "Done"), Blocker("DEMO-7", "To Do")),
+        ),
+    )
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert (code, answer) == (0, None)
+    assert stub.reads == []
+    assert stub.posted == []
+
+
+def test_wake_runs_the_first_ticket_by_rank_whose_blockers_are_all_done(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    picked = ticket_on("DEMO-2", Blocker("DEMO-8", "Done"))
+    stub = list_tickets(
+        monkeypatch,
+        listed=(
+            ticket_on("DEMO-3", Blocker("DEMO-9", "In Progress")),
+            picked,
+            ticket_on("DEMO-1"),
+        ),
+        answer=picked,
+    )
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert code == 0
+    assert answer is not None
+    assert answer["status"] == "completed"
+    assert answer["contract_version"] == "0.1"
+    task_id = answer["task_id"]
+    assert isinstance(task_id, str) and task_id.startswith("wake-")
+    assert set(stub.reads) == {"DEMO-2"}
+    assert stub.posted == [task_id]
+    assert ("DEMO-2", "In Progress") in stub.moves
+    assert [
+        (line["task_id"], line["ticket_key"]) for line in journal_lines(instance)
+    ] == [
+        (task_id, "DEMO-2"),
+        (task_id, "DEMO-2"),
+    ]
+
+
+def test_each_wake_runs_under_a_task_id_of_its_own(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    list_tickets(monkeypatch)
+    _, first = wake(capsysbinary, instance)
+    list_tickets(monkeypatch)
+    _, second = wake(capsysbinary, instance)
+
+    assert first is not None and second is not None
+    assert first["task_id"] != second["task_id"]
+
+
+def test_wake_on_an_instance_that_cannot_be_loaded_fails_with_exit_1(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    tmp_path: Path,
+) -> None:
+    stub = list_tickets(monkeypatch)
+
+    code, answer = wake(capsysbinary, tmp_path / "missing.yaml")
+
+    assert code == 1
+    assert answer is not None
+    assert_failed(answer, None, "cannot be read")
+    assert stub.listings == []
+
+
+def test_wake_whose_tickets_cannot_be_listed_fails_with_exit_1(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    list_tickets(monkeypatch, listed=TrackerError("twg failed: down"))
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert code == 1
+    assert answer is not None
+    assert_failed(
+        answer,
+        None,
+        "The tickets in 'To Do' cannot be listed from the tracker: twg failed: down",
+    )
+    assert not instance.with_suffix("").exists()
+
+
+def blocked_outcome(container: FakeContainer) -> None:
+    """Make the run container end on the `blocked` outcome."""
+    container.exited = ContainerExit(
+        0,
+        json.dumps(
+            {
+                "type": "result",
+                "structured_output": {"outcome": "blocked", "message": "Unclear."},
+            }
+        ),
+        "",
+    )
+
+
+@dataclass
+class Wake:
+    """What a wake test may arrange before the wake."""
+
+    monkeypatch: pytest.MonkeyPatch
+    instance: Path
+    stub: ListingTracker
+    workspace: FakeWorkspace
+    container: FakeContainer
+    plugin: FakePlugin
+    repository: ReachableRepository
+
+
+def hold_the_lock(setup: Wake) -> None:
+    hold_lock(setup.instance, b"held by another run")
+
+
+def lose_claim(setup: Wake) -> None:
+    setup.stub.posted.append("rival")
+
+
+def leave_ready_on_claim(setup: Wake) -> None:
+    claim = setup.stub.claim
+
+    def claim_then_move(key: str, task_id: str) -> int:
+        setup.stub.answer = demo_ticket("In Progress")
+        return claim(key, task_id)
+
+    setup.monkeypatch.setattr(setup.stub, "claim", claim_then_move)
+
+
+def taken_before_read(setup: Wake) -> None:
+    setup.stub.answer = demo_ticket("In Progress")
+
+
+def blocked_before_read(setup: Wake) -> None:
+    setup.stub.answer = demo_ticket("To Do", Blocker("DEMO-9", "In Progress"))
+
+
+def end_blocked(setup: Wake) -> None:
+    blocked_outcome(setup.container)
+
+
+def merge(setup: Wake) -> None:
+    pass
+
+
+def hold_merge(setup: Wake) -> None:
+    setup.stub.answer = replace(demo_ticket(), labels=("hold-merge",))
+
+
+def fail_ci(setup: Wake) -> None:
+    setup.repository.ci = "failed"
+
+
+def unfinished_ci(setup: Wake) -> None:
+    setup.repository.ci = "running"
+
+
+def no_pull_request(setup: Wake) -> None:
+    setup.repository.pull = None
+
+
+def find_defects(setup: Wake) -> None:
+    setup.container.verdict = review_verdict(
+        {"file": "src/app.py", "line": 12, "summary": "The token is logged."}
+    )
+
+
+def move_the_head(setup: Wake) -> None:
+    setup.repository.errors["merge"] = HeadMovedError(
+        "the head of pull request #7 moved since its review"
+    )
+
+
+def after_the_run(setup: Wake, act: Callable[[], None]) -> None:
+    """Make the run container call `act` once it has run, before the ticket is settled."""
+    run = setup.container.run
+
+    def run_then_act(*arguments: Any, readonly: bool = False) -> ContainerExit:
+        exited = run(*arguments, readonly=readonly)
+        if not readonly:
+            act()
+        return exited
+
+    setup.monkeypatch.setattr(setup.container, "run", run_then_act)
+
+
+def during_the_review(setup: Wake, act: Callable[[], None]) -> None:
+    """Make the guard review container call `act` once it has run."""
+    run = setup.container.run
+
+    def review_then_act(*arguments: Any, readonly: bool = False) -> ContainerExit:
+        exited = run(*arguments, readonly=readonly)
+        if readonly:
+            act()
+        return exited
+
+    setup.monkeypatch.setattr(setup.container, "run", review_then_act)
+
+
+def hold_merge_during_the_review(setup: Wake) -> None:
+    def label() -> None:
+        setup.stub.answer = replace(demo_ticket("In Progress"), labels=("hold-merge",))
+
+    during_the_review(setup, label)
+
+
+@pytest.mark.parametrize(
+    ("arrange", "fragment"),
+    [
+        (unfinished_ci, "The run ended on 'done' but its ticket is blocked"),
+        (no_pull_request, "no open pull request has the branch"),
+        (find_defects, "found reachable defects"),
+        (move_the_head, "the head of pull request #7 moved since its review"),
+        (hold_merge_during_the_review, None),
+        (hold_the_lock, "A run is already in progress"),
+        (lose_claim, "is claimed by task 'rival'"),
+        (leave_ready_on_claim, "is no longer in 'To Do'"),
+        (taken_before_read, "is in status 'In Progress', not 'To Do'"),
+        (blocked_before_read, "is blocked by DEMO-9 ('In Progress')"),
+        (end_blocked, "The run ended on the outcome 'blocked': Unclear."),
+        (merge, None),
+        (hold_merge, None),
+        (fail_ci, "The run ended on 'done' but its ticket is blocked"),
+    ],
+)
+def test_wake_that_yields_or_settles_its_ticket_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    container: FakeContainer,
+    plugin: FakePlugin,
+    reachable_repository: ReachableRepository,
+    arrange: Callable[[Wake], None],
+    fragment: str | None,
+) -> None:
+    stub = list_tickets(monkeypatch)
+    arrange(
+        Wake(
+            monkeypatch,
+            instance,
+            stub,
+            workspace,
+            container,
+            plugin,
+            reachable_repository,
+        )
+    )
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert code == 0
+    assert answer is not None
+    if fragment is None:
+        assert answer["status"] == "completed"
+        assert answer["errors"] == []
+    else:
+        assert_failed(answer, answer["task_id"], fragment)
+        assert len(answer["errors"]) == 1
+
+
+def unreadable_ticket(setup: Wake) -> None:
+    setup.stub.answer = TrackerError("twg failed: down")
+
+
+def unwritable_lock(setup: Wake) -> None:
+    def refuse(directory: Path, record: object) -> Path:
+        raise PermissionError(13, "Permission denied")
+
+    setup.monkeypatch.setattr(cli, "take_lock", refuse)
+
+
+def unreadable_journal(setup: Wake) -> None:
+    def refuse(directory: Path, task_id: str) -> bool:
+        raise PermissionError(13, "Permission denied")
+
+    setup.monkeypatch.setattr(cli, "journal_holds", refuse)
+
+
+def unrescuable_worktree(setup: Wake) -> None:
+    setup.workspace.left = "agent/DEMO-7"
+    setup.workspace.fail = "rescue"
+
+
+def unpostable_claim(setup: Wake) -> None:
+    def refuse(key: str, task_id: str) -> int:
+        raise TrackerError("twg failed: down")
+
+    setup.monkeypatch.setattr(setup.stub, "claim", refuse)
+
+
+def unreadable_claims(setup: Wake) -> None:
+    def refuse(key: str, status: str) -> tuple[Claim, ...]:
+        raise TrackerError("twg failed: down")
+
+    setup.monkeypatch.setattr(setup.stub, "claims", refuse)
+
+
+def unmovable_ticket(setup: Wake) -> None:
+    setup.stub.move_error = TrackerError("twg failed: down")
+
+
+def unmovable_ticket_at_the_end(setup: Wake) -> None:
+    set_status = setup.stub.set_status
+
+    def refuse_done(key: str, status: str) -> None:
+        if status == "Done":
+            raise TrackerError("twg failed: down")
+        set_status(key, status)
+
+    setup.monkeypatch.setattr(setup.stub, "set_status", refuse_done)
+
+
+def uncommentable_ticket(setup: Wake) -> None:
+    blocked_outcome(setup.container)
+    setup.stub.comment_error = TrackerError("twg failed: down")
+
+
+def unwritable_running_line(setup: Wake) -> None:
+    def full(directory: Path, entry: object) -> None:
+        raise OSError(28, "No space left on device")
+
+    setup.monkeypatch.setattr(cli, "append_entry", full)
+
+
+def unwritable_final_line(setup: Wake) -> None:
+    fail_on_final_line(setup.monkeypatch)
+
+
+def unremovable_lock(setup: Wake) -> None:
+    def stuck(path: Path, *record: object) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    setup.monkeypatch.setattr(cli, "release_lock", stuck)
+
+
+def unfetchable_plugin(setup: Wake) -> None:
+    setup.plugin.error = PluginError("git failed while cloning: no such tag")
+
+
+def unremovable_worktree(setup: Wake) -> None:
+    setup.workspace.fail = "close"
+
+
+def unfound_claim(setup: Wake) -> None:
+    def none_found(key: str, status: str) -> tuple[Claim, ...]:
+        return ()
+
+    setup.monkeypatch.setattr(setup.stub, "claims", none_found)
+
+
+def overdue_claims(setup: Wake) -> None:
+    wall = [CLAIM_EPOCH.timestamp()]
+    setup.monkeypatch.setattr(cli.time, "time", lambda: wall[0])
+    claims = setup.stub.claims
+
+    def late(key: str, status: str) -> tuple[Claim, ...]:
+        wall[0] += cli.CLAIM_TAKE_LIMIT_SECONDS + 1
+        return claims(key, status)
+
+    setup.monkeypatch.setattr(setup.stub, "claims", late)
+
+
+def unpreparable_worktree(setup: Wake) -> None:
+    setup.workspace.fail = "refresh"
+
+
+def failing_container(setup: Wake) -> None:
+    setup.container.error = ContainerError("docker failed while running: no")
+    setup.container.failing = ("run",)
+
+
+def ceiling_reached(setup: Wake) -> None:
+    slow_refresh(setup.monkeypatch, setup.workspace, 1801.0)
+
+
+def unreadable_outcome(setup: Wake) -> None:
+    setup.container.exited = ContainerExit(0, "not an outcome", "")
+
+
+def uncreatable_directory(setup: Wake) -> None:
+    setup.instance.with_suffix("").write_bytes(b"a file, not a directory")
+
+
+@pytest.mark.parametrize(
+    ("arrange", "fragment"),
+    [
+        (unreadable_ticket, "cannot be read from the tracker: twg failed: down"),
+        (unwritable_lock, "cannot be written: Permission denied"),
+        (unreadable_journal, "cannot be read or repaired: Permission denied"),
+        (unrescuable_worktree, "The worktree left by an earlier run"),
+        (unpostable_claim, "cannot be claimed for task"),
+        (unreadable_claims, "cannot be read: twg failed: down"),
+        (unmovable_ticket, "cannot be moved to 'In Progress'"),
+        (unmovable_ticket_at_the_end, "cannot be moved to 'Done'"),
+        (uncommentable_ticket, "cannot be commented on"),
+        (unwritable_running_line, "cannot be written: No space left on device"),
+        (unwritable_final_line, "cannot be written: No space left on device"),
+        (unremovable_lock, "cannot be removed: Permission denied"),
+        (unfetchable_plugin, "The plugin cannot be fetched"),
+        (unremovable_worktree, "The worktree cannot be removed"),
+        (unfound_claim, "is not found among the claims"),
+        (overdue_claims, "were read back more than 300 seconds"),
+        (unpreparable_worktree, "The worktree cannot be prepared: refresh broke"),
+        (failing_container, "The container failed: docker failed while running"),
+        (ceiling_reached, "the run ceiling of 1800 seconds was reached"),
+        (unreadable_outcome, "The run ended without a usable outcome"),
+        (uncreatable_directory, "cannot be created"),
+    ],
+)
+def test_wake_whose_worker_fails_exits_with_1(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    container: FakeContainer,
+    plugin: FakePlugin,
+    reachable_repository: ReachableRepository,
+    arrange: Callable[[Wake], None],
+    fragment: str,
+) -> None:
+    stub = list_tickets(monkeypatch)
+    arrange(
+        Wake(
+            monkeypatch,
+            instance,
+            stub,
+            workspace,
+            container,
+            plugin,
+            reachable_repository,
+        )
+    )
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert code == 1
+    assert answer is not None
+    errors = answer["errors"]
+    assert any(fragment in error for error in errors), errors
+
+
+def unfindable_pull_request(setup: Wake) -> None:
+    setup.repository.errors["find_pull_request"] = RepositoryError(
+        "gh failed while listing pull requests: down"
+    )
+
+
+def unreadable_ci(setup: Wake) -> None:
+    setup.repository.errors["read_ci"] = RepositoryError(
+        "gh failed while reading checks: down"
+    )
+
+
+def unreadable_ticket_before_the_review(setup: Wake) -> None:
+    def tracker_down() -> None:
+        setup.stub.answer = TrackerError("twg failed while reading DEMO-1: down")
+
+    after_the_run(setup, tracker_down)
+
+
+def unreadable_ticket_after_the_review(setup: Wake) -> None:
+    def tracker_down() -> None:
+        setup.stub.answer = TrackerError("twg failed while reading DEMO-1: down")
+
+    during_the_review(setup, tracker_down)
+
+
+def unmergeable_pull_request(setup: Wake) -> None:
+    setup.repository.errors["merge"] = RepositoryError(
+        "gh did not answer within 60 seconds while merging pull request #7"
+    )
+
+
+def unfetchable_review_plugin(setup: Wake) -> None:
+    def break_plugin() -> None:
+        setup.plugin.error = PluginError("the tag is gone")
+
+    after_the_run(setup, break_plugin)
+
+
+def unmakeable_review_checkout(setup: Wake) -> None:
+    def break_checkout() -> None:
+        setup.workspace.fail = "open_review"
+
+    after_the_run(setup, break_checkout)
+
+
+def missing_review_credential(setup: Wake) -> None:
+    after_the_run(setup, lambda: setup.monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN"))
+
+
+def failing_review_container(setup: Wake) -> None:
+    run = setup.container.run
+
+    def fail_review(*arguments: Any, readonly: bool = False) -> ContainerExit:
+        if readonly:
+            raise ContainerError("the image is gone")
+        return run(*arguments, readonly=readonly)
+
+    setup.monkeypatch.setattr(setup.container, "run", fail_review)
+
+
+def give_no_verdict(setup: Wake) -> None:
+    setup.container.verdict = ContainerExit(
+        0, json.dumps({"structured_output": {"defects": []}}), ""
+    )
+
+
+def review_not_taken_place(setup: Wake) -> None:
+    setup.container.verdict = ContainerExit(
+        0,
+        json.dumps(
+            {
+                "structured_output": {
+                    "reviewed": False,
+                    "reason": "gh pr checks needs a token.",
+                    "defects": [],
+                }
+            }
+        ),
+        "",
+    )
+
+
+def review_at_its_turn_ceiling(setup: Wake) -> None:
+    setup.container.verdict = ContainerExit(
+        1, json.dumps({"subtype": "error_max_turns", "is_error": True}), ""
+    )
+
+
+def no_time_left_for_the_review(setup: Wake) -> None:
+    clock = [1000.0]
+    setup.monkeypatch.setattr(cli.time, "monotonic", lambda: clock[0])
+
+    def spend_the_run_time() -> None:
+        clock[0] += 1800
+
+    after_the_run(setup, spend_the_run_time)
+
+
+@pytest.mark.parametrize(
+    ("arrange", "fragment"),
+    [
+        (give_no_verdict, "gave no verdict: the structured output"),
+        (review_not_taken_place, "the review did not take place"),
+        (review_at_its_turn_ceiling, "(subtype error_max_turns)"),
+        (no_time_left_for_the_review, "ceiling of 1800 seconds was reached before it"),
+        (unfindable_pull_request, "gh failed while listing pull requests: down"),
+        (unreadable_ci, "gh failed while reading checks: down"),
+        (unreadable_ticket_before_the_review, "twg failed while reading DEMO-1"),
+        (unreadable_ticket_after_the_review, "twg failed while reading DEMO-1"),
+        (unmergeable_pull_request, "It may have been merged"),
+        (unfetchable_review_plugin, "its plugin cannot be fetched: the tag is gone"),
+        (unmakeable_review_checkout, "its checkout cannot be made: open_review"),
+        (missing_review_credential, "the variable CLAUDE_CODE_OAUTH_TOKEN"),
+        (failing_review_container, "failed: the image is gone."),
+    ],
+)
+def test_wake_whose_done_run_the_worker_cannot_land_exits_with_1(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    container: FakeContainer,
+    plugin: FakePlugin,
+    reachable_repository: ReachableRepository,
+    arrange: Callable[[Wake], None],
+    fragment: str,
+) -> None:
+    stub = list_tickets(monkeypatch)
+    arrange(
+        Wake(
+            monkeypatch,
+            instance,
+            stub,
+            workspace,
+            container,
+            plugin,
+            reachable_repository,
+        )
+    )
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert answer is not None
+    errors = answer["errors"]
+    assert any(fragment in error for error in errors), errors
+    assert code == 1
+
+
+def test_wake_whose_listed_key_is_refused_exits_with_1(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    list_tickets(monkeypatch, listed=(ticket_on("OTHER-1"),))
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert code == 1
+    assert answer is not None
+    assert_failed(answer, answer["task_id"], "is not in the tracker project 'DEMO'.")
+
+
+def test_wake_whose_task_id_is_already_journaled_exits_with_1(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    fixed = cli.uuid.UUID(int=7)
+    monkeypatch.setattr(cli.uuid, "uuid4", lambda: fixed)
+    stub = list_tickets(monkeypatch)
+    first_code, _ = wake(capsysbinary, instance)
+    stub.answer = demo_ticket()
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert first_code == 0
+    assert code == 1
+    assert answer is not None
+    assert_failed(answer, f"wake-{fixed}", f"Task 'wake-{fixed}' has already been run.")

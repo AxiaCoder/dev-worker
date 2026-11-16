@@ -1,7 +1,8 @@
-"""Command line entry point: the `run`, `state` and `health` commands.
+"""Command line entry point: the `run`, `wake`, `state` and `health` commands.
 
 Each command names the instance file with `--instance`; `run` runs a mandate read as JSON
-on stdin against that instance and the `WORKER.md` shipped with the package.
+on stdin against that instance and the `WORKER.md` shipped with the package, and `wake`
+runs the `deliver_ticket` mandate on the first ticket ready to be taken.
 """
 
 import argparse
@@ -11,6 +12,7 @@ import os
 import re
 import sys
 import time
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -83,6 +85,30 @@ TICKET_KEY = re.compile(r"(.+)-([1-9][0-9]*)")
 RECENT_RUNS = 10
 CLAIM_TAKE_LIMIT_SECONDS = 300
 CLAIM_EXPIRY_SECONDS = 600
+
+
+class Benign(str):
+    """Why a run did not take its ticket when no part of the worker failed.
+
+    The lock is held by a run that is not gone, another run claimed the ticket first,
+    or the ticket is not ready to be taken. A `done` run is also left blocked for a
+    `Benign` reason when its pull request is missing, its CI has not passed, its guard
+    review found a reachable defect, or its head moved before the merge.
+    """
+
+
+@dataclass(frozen=True)
+class RunReport:
+    """The output of a run, and whether the worker failed during it.
+
+    `worker_failed` is false when the run stopped short for a `Benign` reason, or took
+    its ticket and settled it by the outcome its container ended on with no error of the
+    worker's own added, a `done` run left blocked only for a `Benign` reason; true
+    otherwise.
+    """
+
+    output: MandateOutput
+    worker_failed: bool
 
 
 def failed(task_id: str | None, *errors: str) -> MandateOutput:
@@ -242,7 +268,8 @@ def read_ready_ticket(
 
     It is refused when the tracker cannot read it,
     when its status is not the real status of the `ready` key of `instance`, or when a
-    ticket that blocks it is not in the real status of the `done` key.
+    ticket that blocks it is not in the real status of the `done` key; the last two
+    reasons are `Benign`.
     """
     try:
         ticket = tracker.read(key)
@@ -250,7 +277,7 @@ def read_ready_ticket(
         return f"Ticket {key!r} cannot be read from the tracker: {error}"
     ready = instance.statuses["ready"]
     if ticket.status != ready:
-        return f"Ticket {key!r} is in status {ticket.status!r}, not {ready!r}."
+        return Benign(f"Ticket {key!r} is in status {ticket.status!r}, not {ready!r}.")
     done = instance.statuses["done"]
     open_blockers = [
         f"{blocker.key} ({blocker.status!r})"
@@ -258,7 +285,7 @@ def read_ready_ticket(
         if blocker.status != done
     ]
     if open_blockers:
-        return (
+        return Benign(
             f"Ticket {key!r} is blocked by {', '.join(open_blockers)}, "
             f"not in status {done!r}."
         )
@@ -309,7 +336,8 @@ def claim_ticket(
     `claim_overdue`), or whose own claim is not found among them may not take it; the
     reason says whether the claim may have been posted. A run whose claim wins reads the
     ticket again and may not take it unless it is still in the `ready` status. `start` is
-    taken right before the claim is posted.
+    taken right before the claim is posted. A claim that loses, and a ticket read again
+    out of `ready`, give a `Benign` reason.
     """
     ready = instance.statuses["ready"]
     try:
@@ -351,7 +379,7 @@ def claim_ticket(
             for winner in winners
             if winner.claim_id < own and winner.created >= oldest_live
         )
-        return (
+        return Benign(
             f"Ticket {key!r} is claimed by task {rival.task_id!r}. "
             f"The claim of task {task_id!r} was posted."
         )
@@ -363,7 +391,7 @@ def claim_ticket(
             f"The claim of task {task_id!r} was posted."
         )
     if ticket.status != ready:
-        return (
+        return Benign(
             f"Ticket {key!r} is no longer in {ready!r}: it is in {ticket.status!r}. "
             f"The claim of task {task_id!r} was posted."
         )
@@ -429,7 +457,10 @@ def land_done(
     the pull request left open and nothing retried. The body is `summary` followed by
     what happened, the defects found listed; after a merge that failed for a reason
     other than a moved head, it says the merge may have happened. The reason the ticket
-    is blocked is `None` unless it goes to the `blocked` status key. The errors hold why
+    is blocked is `None` unless it goes to the `blocked` status key, and `Benign` when no
+    pull request is open, its CI has not passed, the review found a reachable defect or
+    the head moved before the merge; any other reason is a failure of the worker's own
+    chain. The errors hold why
     the review checkout could not be deleted, which neither blocks the ticket nor holds
     the merge back.
     """
@@ -450,13 +481,17 @@ def land_done(
     try:
         pull_request = repository.find_pull_request(branch)
         if pull_request is None:
-            return blocked(f"no open pull request has the branch {branch} as its head.")
+            return blocked(
+                Benign(f"no open pull request has the branch {branch} as its head.")
+            )
         ci = repository.read_ci(pull_request)
         if ci != "passed":
             state = "failed" if ci == "failed" else "has not finished"
             return blocked(
-                f"the CI of the pull request {pull_request.url} {state}; it was not "
-                "merged."
+                Benign(
+                    f"the CI of the pull request {pull_request.url} {state}; it was "
+                    "not merged."
+                )
             )
         held = instance.hold_merge_label in tracker.read(key).labels
     except (RepositoryError, TrackerError) as error:
@@ -484,7 +519,7 @@ def land_done(
     try:
         repository.merge(pull_request)
     except HeadMovedError as error:
-        return blocked(str(error))
+        return blocked(Benign(error))
     except RepositoryError as error:
         return blocked(
             f"the pull request {pull_request.url} cannot be merged: {error} It may "
@@ -567,8 +602,8 @@ def run_journaled(
     instance: Instance,
     worker: WorkerFile,
     instance_path: Path,
-) -> MandateOutput:
-    """Run `handler` under the lock of the instance directory and journal the run.
+) -> RunReport:
+    """Run `handler` under the lock of the instance directory and journal the run; return its output and whether the worker failed.
 
     `worker` is the `WORKER.md` the run follows (see `run_in_worktree`).
     The ticket key is checked first, then the ticket is read from the tracker and
@@ -583,25 +618,29 @@ def run_journaled(
     becomes a failed output naming the reason, except a lock that cannot be removed:
     the run keeps its status and the reason is added to `errors`. An exception raised
     by `handler` propagates once the lock is released, the ticket left as it is.
+
+    The worker failed unless the run was refused for a `Benign` reason, or took its
+    ticket and settled it with no error of the worker's own (see `run_under_lock`), and
+    its lock was released.
     """
     task_id = mandate.task_id
     refusal = check_ticket_key(mandate, instance)
     if refusal is not None:
-        return failed(task_id, refusal)
+        return worker_failure(task_id, refusal)
     ticket_key = mandate.params["ticket_key"]
     assert isinstance(ticket_key, str)
     tracker = make_tracker(instance.tracker)
     ticket = read_ready_ticket(ticket_key, instance, tracker)
     if isinstance(ticket, str):
-        return failed(task_id, ticket)
+        return refused(task_id, ticket)
     try:
         directory = instance_directory(instance_path)
     except ValueError as error:
-        return failed(task_id, str(error))
+        return worker_failure(task_id, str(error))
     try:
         directory.mkdir(parents=True, exist_ok=True)
     except OSError as error:
-        return failed(
+        return worker_failure(
             task_id,
             f"Instance directory '{directory}' cannot be created: {os_reason(error)}",
         )
@@ -622,10 +661,10 @@ def run_journaled(
     except OSError as error:
         taken = lock_unwritable(directory, error)
     if isinstance(taken, str):
-        return failed(task_id, taken)
+        return refused(task_id, taken)
     lock = taken
     try:
-        output = run_under_lock(
+        report = run_under_lock(
             handler, mandate, instance, worker, ticket, tracker, directory, start, began
         )
     finally:
@@ -636,8 +675,24 @@ def run_journaled(
         else:
             release_error = None
     if release_error is not None:
-        return output.model_copy(update={"errors": [*output.errors, release_error]})
-    return output
+        output = report.output
+        return RunReport(
+            output.model_copy(update={"errors": [*output.errors, release_error]}),
+            worker_failed=True,
+        )
+    return report
+
+
+def worker_failure(task_id: str | None, *errors: str) -> RunReport:
+    """Return the failed output carrying `errors`, as a failure of the worker."""
+    return RunReport(failed(task_id, *errors), worker_failed=True)
+
+
+def refused(task_id: str, reason: str) -> RunReport:
+    """Return the failed output carrying `reason`; the worker failed unless `reason` is `Benign`."""
+    return RunReport(
+        failed(task_id, reason), worker_failed=not isinstance(reason, Benign)
+    )
 
 
 def run_under_lock(
@@ -650,8 +705,8 @@ def run_under_lock(
     directory: Path,
     start: str,
     began: float,
-) -> MandateOutput:
-    """Run `handler` unless its task_id is already journaled, journaling the run twice.
+) -> RunReport:
+    """Run `handler` unless its task_id is already journaled, journaling the run twice; return its output and whether the worker failed.
 
     `worker` is the `WORKER.md` the run follows and `ticket` the ticket as read before
     the lock was taken (see `run_in_worktree`).
@@ -679,20 +734,26 @@ def run_under_lock(
     is journaled `failed`. A tracker failure while
     settling adds its reason to `errors`. An exception raised by `handler` leaves the
     ticket as it is.
+
+    The worker did not fail when the run was refused for a `Benign` reason, or when it
+    ended on an outcome of its container, its worktree removed, its ticket commented on
+    and moved and its final line written; a `done` run left blocked for a `Benign`
+    reason included (see `land_done`). It failed otherwise, a run that ended without a
+    usable outcome, and a `done` run left blocked for any other reason, included.
     """
     task_id = mandate.task_id
     try:
         set_aside_torn_tail(directory)
         repeated = journal_holds(directory, task_id)
     except OSError as error:
-        return failed(
+        return worker_failure(
             task_id,
             f"Journal in '{directory}' cannot be read or repaired: {os_reason(error)}",
         )
     except JournalError as error:
-        return failed(task_id, f"Journal in '{directory}': {error}")
+        return worker_failure(task_id, f"Journal in '{directory}': {error}")
     if repeated:
-        return failed(task_id, f"Task {task_id!r} has already been run.")
+        return worker_failure(task_id, f"Task {task_id!r} has already been run.")
     ticket_key = mandate.params["ticket_key"]
     assert isinstance(ticket_key, str)
     refusal = rescue_left_worktree(instance, directory)
@@ -702,7 +763,7 @@ def run_under_lock(
             ticket_key, task_id, instance, tracker, claim_start
         ) or take_ticket(ticket_key, task_id, instance, tracker, claim_start)
     if refusal is not None:
-        return failed(task_id, refusal)
+        return refused(task_id, refusal)
     entry: dict[str, object] = {
         "task_id": task_id,
         "ticket_key": mandate.params["ticket_key"],
@@ -718,9 +779,9 @@ def run_under_lock(
         _, errors = settle_ticket(
             ticket_key, reason, instance, worker, tracker, directory, began
         )
-        return with_errors(failed(task_id, reason), errors)
+        return RunReport(with_errors(failed(task_id, reason), errors), True)
     mandate_began = time.monotonic()
-    output, ending = run_in_worktree(
+    output, ending, closed = run_in_worktree(
         handler, mandate, instance, worker, ticket, directory, began
     )
     blocking, errors = settle_ticket(
@@ -733,6 +794,12 @@ def run_under_lock(
             *output.errors,
         )
     output = with_errors(output, errors)
+    settled = (
+        isinstance(ending, Outcome)
+        and closed
+        and not errors
+        and (blocking is None or isinstance(blocking, Benign))
+    )
     entry |= {"status": output.status, "duration": time.monotonic() - mandate_began}
     try:
         append_entry(directory, entry)
@@ -740,10 +807,13 @@ def run_under_lock(
         journal_error = (
             f"Journal in '{directory}' cannot be written: {os_reason(error)}"
         )
-        return output.model_copy(
-            update={"errors": [*output.errors, writable_text(journal_error)]}
+        return RunReport(
+            output.model_copy(
+                update={"errors": [*output.errors, writable_text(journal_error)]}
+            ),
+            worker_failed=True,
         )
-    return output
+    return RunReport(output, worker_failed=not settled)
 
 
 def end_worktree(
@@ -909,7 +979,7 @@ def review_pull_request(
     to that commit (see `run_review`). The review checkout is deleted afterwards,
     whatever happened (see `Workspace.close_review`); a deletion that fails is returned
     apart, never as a reason, and added to an exception raised meanwhile as a note. The
-    reason lists the defects the review found, or says why it gave no verdict.
+    reason lists the defects the review found, `Benign`, or says why it gave no verdict.
     """
     try:
         plugin = make_plugin(directory).prepare(worker.header.plugin)
@@ -986,8 +1056,8 @@ def run_review(
     `review_environment` gives. The time left is `run_timeout_seconds` minus the seconds
     elapsed since `began`, the `time.monotonic()` reading taken when the run started;
     none left, the container is not started. The verdict is read from what the container
-    wrote (see `read_verdict`): no defect gives None; defects give a reason listing each
-    as `file:line summary`; a container that cannot be run, reaches the ceiling or gives
+    wrote (see `read_verdict`): no defect gives None; defects give a `Benign` reason
+    listing each as `file:line summary`; a container that cannot be run, reaches the ceiling or gives
     no valid verdict gives the reason it gave none.
     """
     url = pull_request.url
@@ -1018,7 +1088,7 @@ def run_review(
     findings = "\n".join(
         f"- {defect.file}:{defect.line} {defect.summary}" for defect in verdict
     )
-    return (
+    return Benign(
         f"the guard review of the pull request {url} found reachable defects; it "
         f"was not merged.\n{findings}"
     )
@@ -1078,11 +1148,13 @@ def run_in_worktree(
     ticket: Ticket,
     directory: Path,
     began: float,
-) -> tuple[MandateOutput, Outcome | str]:
+) -> tuple[MandateOutput, Outcome | str, bool]:
     """Run `handler` once the plugin is prepared, the mirror in `directory` refreshed and a fresh worktree opened.
 
     Returns the output with how the run ended: the outcome the container ended on when
-    it is usable and the work rescued, else the reasons it is not, joined by a space.
+    it is usable and the work rescued, else the reasons it is not, joined by a space;
+    then whether no worktree was left behind: none was opened, or it was rescued and
+    removed.
 
     The checkout in `directory` of the plugin the header of `worker` names is prepared first (see
     `PluginCheckout.prepare`); one that cannot be fetched gives a failed output naming
@@ -1113,14 +1185,14 @@ def run_in_worktree(
         checkout = make_plugin(directory).prepare(worker.header.plugin)
     except PluginError as error:
         reason = f"The plugin cannot be fetched: {error}"
-        return failed(mandate.task_id, reason), reason
+        return failed(mandate.task_id, reason), reason, True
     workspace = make_workspace(instance.repository, directory)
     try:
         workspace.refresh()
         workspace.open(branch)
     except WorkspaceError as error:
         reason = f"The worktree cannot be prepared: {error}"
-        return failed(mandate.task_id, reason), reason
+        return failed(mandate.task_id, reason), reason, True
     try:
         ending = run_container(
             instance, directory, workspace.worktree, checkout, began, worker, ticket
@@ -1140,7 +1212,7 @@ def run_in_worktree(
         reasons = [ending, rescue_error] if isinstance(ending, str) else [rescue_error]
         ending = " ".join(reasons)
         output = output.model_copy(update={"status": "failed"})
-    return with_errors(output, [end_error] if end_error else []), ending
+    return with_errors(output, [end_error] if end_error else []), ending, not end_error
 
 
 def load_worker() -> WorkerFile:
@@ -1213,7 +1285,49 @@ def run_mandate(
     if isinstance(loaded, str):
         return failed(task_id, loaded)
     instance, worker = loaded
-    return run_journaled(handler, mandate, instance, worker, instance_path)
+    return run_journaled(handler, mandate, instance, worker, instance_path).output
+
+
+def wake(instance_path: Path) -> RunReport | None:
+    """Run the `deliver_ticket` mandate on the first ticket ready to be taken; return its report, `None` when no ticket is.
+
+    The instance is read from `instance_path` as `run` reads it. The tickets in the real
+    status of its `ready` key are listed in the tracker's rank order, and the first whose
+    blockers are all in the real status of the `done` key is run under a fresh task_id,
+    `wake-` followed by a UUID, as `run` runs a mandate (see `run_journaled`). An
+    instance that cannot be loaded, or a tracker that cannot list the tickets, gives a
+    failed output with no task_id, as a failure of the worker.
+    """
+    loaded = load_checked_instance(instance_path)
+    if isinstance(loaded, str):
+        return worker_failure(None, loaded)
+    instance, worker = loaded
+    ready = instance.statuses["ready"]
+    try:
+        tickets = make_tracker(instance.tracker).tickets_in(ready)
+    except TrackerError as error:
+        return worker_failure(
+            None, f"The tickets in {ready!r} cannot be listed from the tracker: {error}"
+        )
+    done = instance.statuses["done"]
+    ticket = next(
+        (
+            ticket
+            for ticket in tickets
+            if all(blocker.status == done for blocker in ticket.blockers)
+        ),
+        None,
+    )
+    if ticket is None:
+        return None
+    mandate = MandateInput(
+        contract_version=CONTRACT_VERSION,
+        task_id=f"wake-{uuid.uuid4()}",
+        mandate="deliver_ticket",
+        caller="wake",
+        params={"ticket_key": ticket.key},
+    )
+    return run_journaled(deliver_ticket, mandate, instance, worker, instance_path)
 
 
 def load_checked_instance(instance_path: Path) -> tuple[Instance, WorkerFile] | str:
@@ -1455,9 +1569,12 @@ def take_over_lock(
     `task_id`, `ticket_key` and `start` of its lock record and the reason it is gone
     in `errors`; a torn last journal line is set aside before. Returns the lock file
     path, or why the lock cannot be taken: its run is not gone, another run took it
-    first, or a file cannot be read or written. Never raises on a file error.
+    first, both `Benign`, or a file cannot be read or written. Never raises on a file
+    error.
     """
-    in_progress = f"A run is already in progress in instance directory '{directory}'."
+    in_progress = Benign(
+        f"A run is already in progress in instance directory '{directory}'."
+    )
     try:
         seen = (directory / LOCK_FILE).read_bytes()
         held = parse_lock(seen)
@@ -1637,15 +1754,19 @@ def add_instance_argument(command: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build the argument parser with the `run`, `state` and `health` subcommands.
+    """Build the argument parser with the `run`, `wake`, `state` and `health` subcommands.
 
-    All three require `--instance`; `run` also takes the mandate name.
+    All four require `--instance`; `run` also takes the mandate name.
     """
     parser = argparse.ArgumentParser(prog="dev-worker")
     commands = parser.add_subparsers(dest="command", required=True)
     run = commands.add_parser("run", help="run a mandate read as JSON on stdin")
     run.add_argument("mandate", help="name of the mandate to run")
     add_instance_argument(run)
+    wake_command = commands.add_parser(
+        "wake", help="run the first ticket ready to be taken, if any"
+    )
+    add_instance_argument(wake_command)
     state = commands.add_parser("state", help="print the worker state")
     add_instance_argument(state)
     health = commands.add_parser("health", help="print the worker health")
@@ -1658,18 +1779,33 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     The `run` input is read from stdin as raw bytes and the answer is written as UTF-8
     bytes, whatever the encoding of the system. `state` reads the journal and lock of the
-    instance directory; `health` reads the instance and its directory (see `read_health`). Returns 0 whenever a
-    JSON document is written, even for a failed mandate; argparse exits with 2 on
-    incorrect usage.
+    instance directory; `health` reads the instance and its directory (see `read_health`). `run`, `state`
+    and `health` return 0 whenever a JSON document is written, even for a failed
+    mandate; argparse exits with 2 on incorrect usage.
+
+    `wake` writes the output of the run it made, or of its own failure, and nothing when
+    no ticket is ready; it returns 1 when the worker failed (see `RunReport`), 0
+    otherwise.
     """
     args = build_parser().parse_args(argv)
+    if args.command == "wake":
+        report = wake(args.instance)
+        if report is None:
+            return 0
+        write_answer(report.output)
+        return 1 if report.worker_failed else 0
     if args.command == "run":
         answer = run_mandate(args.mandate, sys.stdin.buffer.read(), args.instance)
     elif args.command == "state":
         answer = read_state(args.instance)
     else:
         answer = read_health(args.instance)
+    write_answer(answer)
+    return 0
+
+
+def write_answer(answer: MandateOutput | State | Health) -> None:
+    """Write `answer` on stdout as one line of UTF-8 JSON, whatever the encoding of the system."""
     sys.stdout.flush()
     sys.stdout.buffer.write(answer.model_dump_json().encode("utf-8") + b"\n")
     sys.stdout.buffer.flush()
-    return 0
