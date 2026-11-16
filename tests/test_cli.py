@@ -6722,7 +6722,7 @@ def test_review_interrupted_deletes_its_checkout_and_raises_again(
 
 
 class ListingTracker(StubTracker):
-    """A `StubTracker` that lists `listed` as the tickets in a status, raising it when it is an error.
+    """A `StubTracker` that lists `listed` as the tickets in the example `ready` status, raising it when it is an error, and no ticket in any other status.
 
     `listings` records each status listed.
     """
@@ -6735,8 +6735,10 @@ class ListingTracker(StubTracker):
         self.listings: list[str] = []
 
     def tickets_in(self, status: str) -> tuple[Ticket, ...]:
-        """Record `status`, then return or raise `listed`."""
+        """Record `status`, then return or raise `listed` for `To Do`, nothing for another status."""
         self.listings.append(status)
+        if status != "To Do":
+            return ()
         if isinstance(self.listed, TrackerError):
             raise self.listed
         return self.listed
@@ -6783,9 +6785,9 @@ def test_wake_without_a_ready_ticket_does_nothing_and_succeeds(
     code, answer = wake(capsysbinary, instance)
 
     assert (code, answer) == (0, None)
-    assert stub.listings == ["To Do"]
+    assert stub.listings == ["In Progress", "To Do"]
     assert stub.reads == []
-    assert not instance.with_suffix("").exists()
+    assert not (instance.with_suffix("") / cli.LOCK_FILE).exists()
 
 
 def test_wake_whose_ready_tickets_are_all_blocked_does_nothing_and_succeeds(
@@ -6888,7 +6890,7 @@ def test_wake_whose_tickets_cannot_be_listed_fails_with_exit_1(
         None,
         "The tickets in 'To Do' cannot be listed from the tracker: twg failed: down",
     )
-    assert not instance.with_suffix("").exists()
+    assert not (instance.with_suffix("") / cli.LOCK_FILE).exists()
 
 
 def blocked_outcome(container: FakeContainer) -> None:
@@ -7429,3 +7431,415 @@ def test_wake_whose_task_id_is_already_journaled_exits_with_1(
     assert code == 1
     assert answer is not None
     assert_failed(answer, f"wake-{fixed}", f"Task 'wake-{fixed}' has already been run.")
+
+
+REQUEUE = "dev-worker returns this ticket to the queue: "
+ENTERS_IN_PROGRESS = ("status", "In Progress")
+ENTERS_READY = ("status", "To Do")
+ENTERS_BLOCKED = ("status", "Blocked")
+
+
+class TimelineTracker(StubTracker):
+    """A `StubTracker` for one ticket that keeps its history as events, oldest first.
+
+    An event is a status entered `("status", name)`, a claim `("claim", task_id)` or a
+    comment `("comment", body)`; a claim's id is its rank among the events, from 1.
+    Claims and requeues count from the last entry in a status, every one when it was
+    never entered. `listings` records each status listed; `list_error` and
+    `claims_error` are raised by those reads when set.
+    """
+
+    def __init__(self, ticket: Ticket, *events: tuple[str, str]) -> None:
+        super().__init__(ticket)
+        self.events = list(events)
+        self.listings: list[str] = []
+        self.list_error: TrackerError | None = None
+        self.claims_error: TrackerError | None = None
+
+    def since(self, status: str) -> list[tuple[int, tuple[str, str]]]:
+        """Return the events since the ticket last entered `status`, with their rank from 1."""
+        ranked = list(enumerate(self.events, 1))
+        entries = [rank for rank, event in ranked if event == ("status", status)]
+        start = max(entries, default=0)
+        return [(rank, event) for rank, event in ranked if rank > start]
+
+    def claims(self, key: str, status: str) -> tuple[Claim, ...]:
+        """Return the claims since the ticket last entered `status`; raise `claims_error` when set."""
+        if self.claims_error is not None:
+            raise self.claims_error
+        return tuple(
+            Claim(rank, task, CLAIM_EPOCH)
+            for rank, (kind, task) in self.since(status)
+            if kind == "claim"
+        )
+
+    def requeues(self, key: str, status: str) -> int:
+        """Return how many requeue comments were posted since the ticket last entered `status`."""
+        return sum(
+            kind == "comment" and body.startswith(REQUEUE)
+            for _, (kind, body) in self.since(status)
+        )
+
+    def claim(self, key: str, task_id: str) -> int:
+        """Record the claim of `task_id`; return its rank among the events."""
+        super().claim(key, task_id)
+        self.events.append(("claim", task_id))
+        return len(self.events)
+
+    def comment(self, key: str, body: str) -> None:
+        """Record the comment as `StubTracker` does, then as an event."""
+        super().comment(key, body)
+        self.events.append(("comment", body))
+
+    def set_status(self, key: str, status: str) -> None:
+        """Record the change as `StubTracker` does, then as an event."""
+        super().set_status(key, status)
+        self.events.append(("status", status))
+
+    def tickets_in(self, status: str) -> tuple[Ticket, ...]:
+        """Record `status`; return the ticket when it is in `status`, raising `list_error` when set."""
+        self.listings.append(status)
+        if self.list_error is not None:
+            raise self.list_error
+        assert isinstance(self.answer, Ticket)
+        return (self.answer,) if self.answer.status == status else ()
+
+
+def timeline(
+    monkeypatch: pytest.MonkeyPatch, *events: tuple[str, str], blocked: bool = True
+) -> TimelineTracker:
+    """Make `wake` use a `TimelineTracker` on DEMO-1, in progress after `events`; return it.
+
+    A `blocked` ticket waits on DEMO-9, so that the wake does not run it once ready.
+    """
+    blockers = (Blocker("DEMO-9", "To Do"),) if blocked else ()
+    stub = TimelineTracker(demo_ticket("In Progress", *blockers), *events)
+    monkeypatch.setattr(cli, "make_tracker", stub.make)
+    return stub
+
+
+DEAD_RUN = (ENTERS_READY, ("claim", "t1"), ENTERS_IN_PROGRESS)
+
+
+def test_wake_hands_back_a_ticket_its_dead_run_left_in_progress(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = timeline(monkeypatch, *DEAD_RUN)
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert (code, answer) == (0, None)
+    assert stub.comments == [
+        (
+            "DEMO-1",
+            (
+                f"{REQUEUE}the run that took it is gone without settling it "
+                "(attempt 1 of 3)."
+            ),
+        )
+    ]
+    assert stub.moves == [("DEMO-1", "To Do")]
+    assert stub.listings == ["In Progress", "To Do"]
+    assert not (instance.with_suffix("") / cli.LOCK_FILE).exists()
+
+
+def test_wake_takes_the_lock_over_from_the_dead_run_before_handing_its_ticket_back(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    lock = hold_lock(instance, lock_started(1801))
+    write_journal(
+        instance,
+        {"task_id": "t", "ticket_key": "DEMO-1", "status": "running", "start": "x"},
+    )
+    stub = timeline(monkeypatch, *DEAD_RUN)
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert (code, answer) == (0, None)
+    assert stub.moves == [("DEMO-1", "To Do")]
+    assert not lock.exists()
+    assert journal_lines(instance)[-1]["status"] == "failed"
+
+
+def test_wake_hands_back_a_ticket_whose_runs_died_before_as_the_next_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = timeline(
+        monkeypatch,
+        *DEAD_RUN,
+        ("comment", f"{REQUEUE}first"),
+        ENTERS_READY,
+        ("claim", "t2"),
+        ENTERS_IN_PROGRESS,
+    )
+
+    wake(capsysbinary, instance)
+
+    assert stub.comments[0][1].endswith("(attempt 2 of 3).")
+    assert stub.moves == [("DEMO-1", "To Do")]
+
+
+def test_wake_blocks_a_ticket_whose_runs_died_as_many_times_as_the_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    died = (
+        ("comment", f"{REQUEUE}earlier"),
+        ENTERS_READY,
+        ("claim", "t"),
+        ENTERS_IN_PROGRESS,
+    )
+    stub = timeline(monkeypatch, *DEAD_RUN, *died, *died)
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert (code, answer) == (0, None)
+    assert stub.comments == [
+        (
+            "DEMO-1",
+            (
+                "The runs that took this ticket died 3 times without settling it. "
+                "A person needs to look at it, then move it back to 'To Do'."
+            ),
+        )
+    ]
+    assert stub.moves == [("DEMO-1", "Blocked")]
+
+
+def test_wake_blocks_at_the_attempt_limit_of_the_instance(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    with instance.open("a", encoding="utf-8") as file:
+        file.write("  max_attempts: 1\n")
+    stub = timeline(monkeypatch, *DEAD_RUN)
+
+    wake(capsysbinary, instance)
+
+    assert stub.comments[0][1].startswith("The runs that took this ticket died 1 ")
+    assert stub.moves == [("DEMO-1", "Blocked")]
+
+
+def test_attempts_count_again_once_a_blocked_ticket_is_handed_back(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = timeline(
+        monkeypatch,
+        *DEAD_RUN,
+        ("comment", f"{REQUEUE}first"),
+        ("comment", f"{REQUEUE}second"),
+        ENTERS_BLOCKED,
+        *DEAD_RUN,
+    )
+
+    wake(capsysbinary, instance)
+
+    assert stub.comments[0][1].endswith("(attempt 1 of 3).")
+    assert stub.moves == [("DEMO-1", "To Do")]
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        (ENTERS_READY, ENTERS_IN_PROGRESS),
+        (ENTERS_READY, ("claim", "t1"), ENTERS_BLOCKED, ENTERS_IN_PROGRESS),
+        (("claim", "t1"), ENTERS_READY, ENTERS_IN_PROGRESS),
+    ],
+    ids=["never-claimed", "claimed-before-blocked", "claimed-before-ready"],
+)
+def test_wake_leaves_a_ticket_a_person_moved_in_progress(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    events: tuple[tuple[str, str], ...],
+) -> None:
+    stub = timeline(monkeypatch, *events)
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert (code, answer) == (0, None)
+    assert stub.comments == []
+    assert stub.moves == []
+
+
+def test_wake_does_not_recover_while_a_live_run_holds_the_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    live = {"task_id": "t", "start": datetime.now(UTC).isoformat(), "pid": os.getpid()}
+    lock = hold_lock(instance, json.dumps(live).encode())
+    stub = timeline(monkeypatch, *DEAD_RUN)
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert (code, answer) == (0, None)
+    assert stub.listings == ["To Do"]
+    assert stub.comments == []
+    assert lock.exists()
+
+
+def test_wake_runs_the_ticket_it_handed_back_in_the_same_wake(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = timeline(monkeypatch, *DEAD_RUN, blocked=False)
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert code == 0
+    assert answer is not None
+    assert answer["status"] == "completed"
+    assert stub.moves[:2] == [("DEMO-1", "To Do"), ("DEMO-1", "In Progress")]
+
+
+def test_wake_whose_in_progress_tickets_cannot_be_listed_fails_with_exit_1(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = timeline(monkeypatch, *DEAD_RUN)
+    stub.list_error = TrackerError("twg failed: down")
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert code == 1
+    assert answer is not None
+    assert_failed(
+        answer,
+        None,
+        "The tickets in 'In Progress' cannot be listed from the tracker: "
+        "twg failed: down",
+    )
+    assert stub.listings == ["In Progress"]
+    assert not (instance.with_suffix("") / cli.LOCK_FILE).exists()
+
+
+def test_wake_whose_claims_cannot_be_read_fails_without_moving_the_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = timeline(monkeypatch, *DEAD_RUN)
+    stub.claims_error = TrackerError("twg failed: down")
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert code == 1
+    assert answer is not None
+    assert_failed(
+        answer,
+        None,
+        "The comments of ticket 'DEMO-1' cannot be read from the tracker: "
+        "twg failed: down",
+    )
+    assert stub.moves == []
+
+
+def test_wake_whose_requeue_comment_fails_does_not_move_the_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = timeline(monkeypatch, *DEAD_RUN)
+    stub.comment_error = TrackerError("twg failed: down")
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert code == 1
+    assert answer is not None
+    assert_failed(
+        answer,
+        None,
+        "Ticket 'DEMO-1' cannot be commented on: twg failed: down The comment may "
+        "have been posted; the ticket was not moved.",
+    )
+    assert stub.moves == []
+
+
+def test_wake_whose_requeued_ticket_cannot_be_moved_fails_with_exit_1(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = timeline(monkeypatch, *DEAD_RUN)
+    stub.move_error = TrackerError("twg failed: down")
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert code == 1
+    assert answer is not None
+    assert_failed(
+        answer,
+        None,
+        "Ticket 'DEMO-1' cannot be moved to 'To Do': twg failed: down Its status is "
+        "unknown and is to be read again in the tracker.",
+    )
+
+
+def test_wake_whose_instance_directory_cannot_be_made_fails_before_recovering(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    instance.with_suffix("").write_text("", encoding="utf-8")
+    stub = timeline(monkeypatch, *DEAD_RUN)
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert code == 1
+    assert answer is not None
+    assert_failed(answer, None, "cannot be created")
+    assert stub.listings == []
+
+
+def test_wake_whose_lock_cannot_be_written_fails_before_recovering(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    def refuse(directory: Path, record: Mapping[str, object]) -> Path:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(cli, "take_lock", refuse)
+    stub = timeline(monkeypatch, *DEAD_RUN)
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert code == 1
+    assert answer is not None
+    assert_failed(answer, None, "cannot be written: Permission denied")
+    assert stub.listings == []
+
+
+def test_wake_whose_recovery_lock_cannot_be_released_fails_with_exit_1(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    def refuse(path: Path, record: Mapping[str, object]) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(cli, "release_lock", refuse)
+    stub = timeline(monkeypatch, *DEAD_RUN)
+    stub.list_error = TrackerError("twg failed: down")
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert code == 1
+    assert answer is not None
+    errors = answer["errors"]
+    assert errors[0].startswith("The tickets in 'In Progress' cannot be listed")
+    assert errors[1].startswith("Lock file '")
+    assert errors[1].endswith("cannot be removed: Permission denied")

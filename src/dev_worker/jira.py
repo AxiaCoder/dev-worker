@@ -4,7 +4,8 @@ Each `twg` call is bounded: one that has not answered within `TWG_TIMEOUT_SECOND
 (60 seconds) is stopped and raises `TrackerError`.
 
 A claim is a plain-text comment `CLAIM_MARKER` followed by the task_id, such as
-`dev-worker claims this ticket for task task-1`; its id is the comment id.
+`dev-worker claims this ticket for task task-1`; its id is the comment id. A requeue
+is a plain-text comment starting with `REQUEUE_MARKER`.
 """
 
 import json
@@ -21,7 +22,7 @@ from pydantic import AwareDatetime, BaseModel, Field, ValidationError
 
 from dev_worker.header import _describe
 from dev_worker.instance import Tracker
-from dev_worker.tickets import Blocker, Claim, Ticket, TrackerError
+from dev_worker.tickets import REQUEUE_MARKER, Blocker, Claim, Ticket, TrackerError
 
 TICKET_KEY = re.compile(r"[A-Z][A-Z0-9_]*-[0-9]+")
 BLOCKS = "Blocks"
@@ -480,6 +481,34 @@ class JiraTracker:
         comments is read. Raises `TrackerError` when `key` is not a
         ticket key, the token variable is not set, `twg` fails, or an answer cannot be read.
         """
+        found = [
+            Claim(comment.id, text.removeprefix(CLAIM_MARKER), comment.created)
+            for comment, text in self._comments_since(key, status)
+            if text.startswith(CLAIM_MARKER)
+        ]
+        return tuple(sorted(found, key=lambda claim: claim.claim_id))
+
+    def requeues(self, key: str, status: str) -> int:
+        """Return how many requeue comments were posted on the ticket `key` since it last entered the status `status`.
+
+        A requeue comment is one whose plain text starts with `REQUEUE_MARKER`. The last
+        entry is read as `claims` reads it; every requeue counts when there is none. Raises
+        as `claims` does.
+        """
+        return sum(
+            text.startswith(REQUEUE_MARKER)
+            for _, text in self._comments_since(key, status)
+        )
+
+    def _comments_since(self, key: str, status: str) -> list[tuple[_Comment, str]]:
+        """Return the comments on the ticket `key` created since it last entered the status `status`, each with its stripped plain text, in the tracker's order.
+
+        The last entry is the latest changelog entry that sets the status to `status`; a
+        comment counts when it was created at that instant or after, and every comment
+        counts when there is no such entry. Every page of the changelog and of the comments
+        is read. Raises `TrackerError` when `key` is not a ticket key, the token variable
+        is not set, `twg` fails, or an answer cannot be read.
+        """
         _check_key(key)
         changelog = self._pages(
             f"reading the changelog of {key}",
@@ -504,21 +533,12 @@ class JiraTracker:
             ],
             _CommentPage,
         )  # fmt: skip
-        found: list[Claim] = []
-        for page in comments:
-            for comment in page.data:
-                text = _plain_text(comment.body).strip()
-                if text.startswith(CLAIM_MARKER) and (
-                    since is None or comment.created >= since
-                ):
-                    found.append(
-                        Claim(
-                            comment.id,
-                            text.removeprefix(CLAIM_MARKER),
-                            comment.created,
-                        )
-                    )
-        return tuple(sorted(found, key=lambda claim: claim.claim_id))
+        return [
+            (comment, _plain_text(comment.body).strip())
+            for page in comments
+            for comment in page.data
+            if since is None or comment.created >= since
+        ]
 
     def _pages[P: _Page](
         self, action: str, arguments: list[str], model: type[P]

@@ -1265,3 +1265,76 @@ def test_tickets_in_escapes_quotes_and_backslashes_in_the_project(
     called = json.loads(record.read_text(encoding="utf-8"))
     jql = called["argv"][called["argv"].index("--jql") + 1]
     assert jql == 'project = "A\\"B\\\\" AND status = "To Do" ORDER BY Rank ASC'
+
+
+def test_requeues_count_the_requeue_comments_since_the_last_entry_in_the_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = serve_pages(
+        monkeypatch,
+        page(
+            [
+                history("2026-11-10T09:00:00.000Z", ("status", "Blocked")),
+                history("2026-11-11T09:00:00.000Z", ("status", "Blocked")),
+            ]
+        ),
+        page(
+            [
+                comment(
+                    "90",
+                    "2026-11-10T10:00:00.000Z",
+                    "dev-worker returns this ticket to the queue: before",
+                ),
+                comment(
+                    "100",
+                    "2026-11-11T09:00:00.000Z",
+                    adf("dev-worker returns this ticket to the queue: first"),
+                ),
+                comment(
+                    "110",
+                    "2026-11-11T10:00:00.000Z",
+                    "dev-worker claims this ticket for task task-1",
+                ),
+                comment(
+                    "120",
+                    "2026-11-11T11:00:00.000Z",
+                    "  dev-worker returns this ticket to the queue: second",
+                ),
+            ]
+        ),
+    )
+
+    assert tracker().requeues("ABC-218", "Blocked") == 2
+    assert calls == [
+        ["jira", "workitem", "changelog", "query", "--issue-id", "ABC-218",
+         "--first", "100"],
+        ["jira", "workitem", "comment", "query", "--issue-id", "ABC-218",
+         "--order-by", "created", "--first", "100"],
+    ]  # fmt: skip
+
+
+def test_requeues_of_a_ticket_that_never_entered_the_status_all_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    serve_pages(
+        monkeypatch,
+        page([]),
+        page(
+            [
+                comment(
+                    "90",
+                    "2020-01-01T00:00:00.000Z",
+                    "dev-worker returns this ticket to the queue: first",
+                ),
+                comment("100", "2020-01-02T00:00:00.000Z", "Looks good"),
+            ]
+        ),
+    )
+
+    assert tracker().requeues("ABC-218", "Blocked") == 1
+
+
+def test_requeues_on_a_key_that_is_not_a_ticket_key_are_refused(record: Path) -> None:
+    with pytest.raises(TrackerError, match="is not a Jira ticket key"):
+        tracker().requeues("abc-218", "Blocked")
+    assert not record.exists()
