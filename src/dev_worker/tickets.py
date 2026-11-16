@@ -1,4 +1,4 @@
-"""The ticket tracker as the rest of the worker sees it: read a ticket, claim it, comment on it, change its status."""
+"""The ticket tracker as the rest of the worker sees it: read a ticket, list the tickets in a status, claim one, comment on it, change its status."""
 
 from dataclasses import dataclass
 from datetime import datetime
@@ -51,7 +51,7 @@ class Claim:
 
 
 class TicketTracker(Protocol):
-    """A ticket tracker: reads a ticket by key, claims it for a run, comments on it and changes its status."""
+    """A ticket tracker: reads a ticket by key, lists the tickets in a status, claims one for a run, comments on it and changes its status."""
 
     def check_access(self) -> None:
         """Raise `TrackerError` when the tracker cannot be reached with the instance credentials; change nothing."""
@@ -59,6 +59,13 @@ class TicketTracker(Protocol):
 
     def read(self, key: str) -> Ticket:
         """Return the ticket `key`; raise `TrackerError` when it cannot be read."""
+        ...
+
+    def tickets_in(self, status: str) -> tuple[Ticket, ...]:
+        """Return the tickets of the instance project in the real status `status`, in the tracker's rank order.
+
+        Raises `TrackerError` when they cannot be listed.
+        """
         ...
 
     def claim(self, key: str, task_id: str) -> int:

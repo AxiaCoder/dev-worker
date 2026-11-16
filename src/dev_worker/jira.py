@@ -33,6 +33,7 @@ TEXT_BLOCKS = frozenset({"paragraph", "heading", "codeBlock"})
 NESTED_INDENT = "  "
 LISTS = frozenset({"bulletList", "orderedList", "taskList", "decisionList"})
 DONE = "DONE"
+TICKET_FIELDS = "status,labels,issuelinks,summary,description"
 
 
 class _Status(BaseModel):
@@ -82,6 +83,12 @@ class _GetAnswer(BaseModel):
     """The answer of `twg jira workitem get` for one key."""
 
     data: Annotated[list[_Item], Field(min_length=1, max_length=1)]
+
+
+class _Issues(BaseModel):
+    """The tickets of a page of `twg jira workitem query`."""
+
+    issues: list[_Item]
 
 
 class _CommentId(BaseModel):
@@ -141,6 +148,12 @@ class _CommentPage(_Page):
     """A page of `twg jira workitem comment query`."""
 
     data: list[_Comment]
+
+
+class _QueryPage(_Page):
+    """A page of `twg jira workitem query`."""
+
+    data: _Issues
 
 
 _UNREADABLE = object()
@@ -322,6 +335,30 @@ _RENDERERS: dict[object, Callable[[dict[Any, Any]], str]] = {
 }
 
 
+def _ticket(item: _Item) -> Ticket:
+    """Return the ticket `item` describes; its blockers are the tickets on the inward side of its "Blocks" links."""
+    return Ticket(
+        key=item.key,
+        status=item.status.name,
+        labels=tuple(item.labels),
+        blockers=tuple(
+            Blocker(
+                key=link.inwardIssue.key, status=link.inwardIssue.fields.status.name
+            )
+            for link in item.issuelinks
+            if link.type.name == BLOCKS and link.inwardIssue is not None
+        ),
+        title=item.summary,
+        description=_document_text(item.description),
+    )
+
+
+def _jql_string(value: str) -> str:
+    """Return `value` as a double-quoted JQL string, its backslashes and double quotes escaped."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
 def _check_key(key: str) -> None:
     """Raise `TrackerError` when `key` is not a Jira ticket key such as `ABC-12`."""
     if not TICKET_KEY.fullmatch(key):
@@ -358,11 +395,8 @@ class JiraTracker:
         _check_key(key)
         answer = self._run(
             f"reading {key}",
-            [
-                "jira", "workitem", "get", key,
-                "--fields", "status,labels,issuelinks,summary,description",
-            ],
-        )  # fmt: skip
+            ["jira", "workitem", "get", key, "--fields", TICKET_FIELDS],
+        )
         try:
             item = _GetAnswer.model_validate(answer).data[0]
         except ValidationError as error:
@@ -370,20 +404,25 @@ class JiraTracker:
             raise TrackerError(
                 f"the answer of twg to reading {key} cannot be read: {description}"
             ) from None
-        return Ticket(
-            key=item.key,
-            status=item.status.name,
-            labels=tuple(item.labels),
-            blockers=tuple(
-                Blocker(
-                    key=link.inwardIssue.key, status=link.inwardIssue.fields.status.name
-                )
-                for link in item.issuelinks
-                if link.type.name == BLOCKS and link.inwardIssue is not None
-            ),
-            title=item.summary,
-            description=_document_text(item.description),
+        return _ticket(item)
+
+    def tickets_in(self, status: str) -> tuple[Ticket, ...]:
+        """Return the tickets of the instance project in the real status `status`, in Jira's rank order.
+
+        Each ticket is read as `read` reads one. Every page of the query is read. Raises
+        `TrackerError` when the token variable is not set, `twg` fails, or an answer
+        cannot be read.
+        """
+        jql = (
+            f"project = {_jql_string(self._tracker.project)} "
+            f"AND status = {_jql_string(status)} ORDER BY Rank ASC"
         )
+        pages = self._pages(
+            f"listing the tickets in {status!r}",
+            ["jira", "workitem", "query", "--jql", jql, "--fields", TICKET_FIELDS],
+            _QueryPage,
+        )
+        return tuple(_ticket(item) for page in pages for item in page.data.issues)
 
     def set_status(self, key: str, status: str) -> None:
         """Move the ticket `key` to the real status name `status`.

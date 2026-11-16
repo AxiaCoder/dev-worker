@@ -1141,3 +1141,127 @@ def test_comment_whose_body_holds_a_nul_raises_a_tracker_error(
 
     with pytest.raises(TrackerError):
         tracker().comment("ABC-218", "x\x00y")
+
+
+def issues(*items: dict[str, Any], cursor: str | None = None) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "data": {"issues": list(items)},
+        "pageInfo": {"hasNextPage": cursor is not None, "nextCursor": cursor},
+    }
+
+
+def item(key: str, *links: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "key": key,
+        "issuelinks": list(links),
+        "status": {"name": "À faire"},
+        "labels": [],
+        "summary": f"Title of {key}",
+    }
+
+
+def test_tickets_in_queries_the_project_status_by_rank_with_the_read_fields(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, issues(ITEM))
+
+    tickets = tracker().tickets_in("À faire")
+
+    assert tickets == (tracker_read_ticket(),)
+    called = json.loads(record.read_text(encoding="utf-8"))
+    assert called["argv"] == [
+        "jira", "workitem", "query",
+        "--jql", 'project = "ABC" AND status = "À faire" ORDER BY Rank ASC',
+        "--fields", "status,labels,issuelinks,summary,description",
+        "--first", "100",
+        "--output", "json", "--output-summary", "none",
+    ]  # fmt: skip
+    assert called["env"]["TWG_TOKEN"] == TOKEN
+
+
+def tracker_read_ticket() -> Ticket:
+    return Ticket(
+        key="ABC-218",
+        status="À faire",
+        labels=("hold-merge", "backend"),
+        blockers=(Blocker("ABC-217", "Terminé"), Blocker("ABC-219", "En cours")),
+        title="Add a login page",
+        description="The page asks for an email.",
+    )
+
+
+def test_tickets_in_reads_every_page_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = serve_pages(
+        monkeypatch,
+        issues(item("ABC-3"), item("ABC-1"), cursor="c1"),
+        issues(item("ABC-2", link("inwardIssue", "ABC-9", "En cours"))),
+    )
+
+    tickets = tracker().tickets_in("À faire")
+
+    assert [ticket.key for ticket in tickets] == ["ABC-3", "ABC-1", "ABC-2"]
+    assert tickets[2].blockers == (Blocker("ABC-9", "En cours"),)
+    assert calls[0][-2:] == ["--first", "100"]
+    assert calls[1][-4:] == ["--first", "100", "--after", "c1"]
+
+
+def test_tickets_in_with_no_ticket_is_empty(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, issues())
+
+    assert tracker().tickets_in("À faire") == ()
+
+
+def test_tickets_in_escapes_quotes_and_backslashes_in_the_jql_strings(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, issues())
+
+    tracker().tickets_in('To "Do" \\ OR project = X')
+
+    called = json.loads(record.read_text(encoding="utf-8"))
+    jql = called["argv"][called["argv"].index("--jql") + 1]
+    assert jql == (
+        'project = "ABC" AND status = "To \\"Do\\" \\\\ OR project = X" '
+        "ORDER BY Rank ASC"
+    )
+
+
+def test_tickets_in_whose_page_cannot_be_read_raises(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, {"ok": True, "data": [], "pageInfo": {"hasNextPage": False}})
+
+    with pytest.raises(
+        TrackerError,
+        match="the answer of twg to listing the tickets in 'À faire' cannot be read",
+    ):
+        tracker().tickets_in("À faire")
+
+
+def test_tickets_in_with_a_twg_failure_raises(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, "", stderr="boom", code=1)
+
+    with pytest.raises(
+        TrackerError, match="twg failed while listing the tickets in 'À faire': boom"
+    ):
+        tracker().tickets_in("À faire")
+
+
+def test_tickets_in_escapes_quotes_and_backslashes_in_the_project(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, issues())
+    odd = TRACKER.model_copy(update={"project": 'A"B\\'})
+
+    JiraTracker(odd, command=[sys.executable, str(FAKE_TWG)]).tickets_in("To Do")
+
+    called = json.loads(record.read_text(encoding="utf-8"))
+    jql = called["argv"][called["argv"].index("--jql") + 1]
+    assert jql == 'project = "A\\"B\\\\" AND status = "To Do" ORDER BY Rank ASC'

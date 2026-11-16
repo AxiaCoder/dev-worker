@@ -27,6 +27,19 @@ An instance is one YAML file that points the worker at a tracker project and a r
 
 Real instances and secrets stay outside the repository: the file under `examples/` is fictional and is the only instance committed here.
 
+## Waking the worker
+
+```
+dev-worker wake --instance <instance file>
+```
+
+`wake` lists the tickets of the instance project in its `ready` status, in the tracker's rank order, and takes the first whose blockers are all in its `done` status. It runs the `deliver_ticket` mandate on it under a task_id of its own, `wake-` followed by a UUID, exactly as `run` would, and carries it to the end: one ticket per wake. It is meant to be started by a timer.
+
+It writes on stdout the JSON output of the run it made, and nothing when no ticket is ready. Its exit code says whether the wake failed, not whether the ticket was delivered:
+
+- **0** when no ticket is ready; when the lock is held by a run that is not gone; when another run claimed the ticket first, or the ticket is no longer ready to be taken; and when the run ended on an outcome of the agent — `done`, merged or held, or `blocked`, a `done` run left blocked before its merge included — with the ticket commented on and moved and nothing else failing;
+- **1** otherwise: the instance or `WORKER.md` cannot be loaded, the tracker cannot list or read the tickets, the claim cannot be posted or read back, the lock or the journal cannot be read or written, a worktree cannot be rescued or removed, the run ended without an outcome of the agent (its plugin, worktree or container could not be prepared or run), or the ticket cannot be moved or commented on. When the wake fails before it picks a ticket, its output is a failed one with no task_id.
+
 ## Protecting the base branch
 
 Only the worker merges, and the guarantee holds only if the worker and the agent are two different GitHub accounts: a token acts with its account's role, so an agent token created on the worker's account would be let through too.
