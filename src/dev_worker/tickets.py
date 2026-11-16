@@ -78,6 +78,13 @@ class TicketTracker(Protocol):
         """
         ...
 
+    def entered(self, key: str, statuses: frozenset[str]) -> datetime | None:
+        """Return the server time the ticket `key` last entered any of the real statuses `statuses` by a change of status, timezone-aware; None when it never did.
+
+        Raises `TrackerError` when it cannot be read.
+        """
+        ...
+
     def claims(self, key: str, statuses: frozenset[str]) -> tuple[Claim, ...]:
         """Return the claims posted on the ticket `key` since it last entered any of the real statuses `statuses`, oldest first.
 

@@ -7442,11 +7442,12 @@ ENTERS_BLOCKED = ("status", "Blocked")
 class TimelineTracker(StubTracker):
     """A `StubTracker` for one ticket that keeps its history as events, oldest first.
 
-    An event is a status entered `("status", name)`, a claim `("claim", task_id)` or a
-    comment `("comment", body)`; a claim's id is its rank among the events, from 1.
-    Claims and requeues count from the last entry in any of the statuses asked, every
-    one when none was ever entered. `listings` records each status listed; `list_error` and
-    `claims_error` are raised by those reads when set.
+    An event is a status entered `("status", name)`, a claim `("claim", task_id)`, a
+    comment `("comment", body)` or a pause `("wait", seconds)`; a claim's id is its rank
+    among the events, from 1. Every event happens at `CLAIM_EPOCH` plus the seconds of
+    the pauses before it. Claims and requeues count from the last entry in any of the
+    statuses asked, every one when none was ever entered. `listings` records each status
+    listed; `list_error` and `claims_error` are raised by those reads when set.
     """
 
     def __init__(self, ticket: Ticket, *events: tuple[str, str]) -> None:
@@ -7467,12 +7468,28 @@ class TimelineTracker(StubTracker):
         start = max(entries, default=0)
         return [(rank, event) for rank, event in ranked if rank > start]
 
+    def moment(self, rank: int) -> datetime:
+        """Return when the event of rank `rank`, from 1, happened."""
+        pauses = sum(
+            int(seconds) for kind, seconds in self.events[:rank] if kind == "wait"
+        )
+        return CLAIM_EPOCH + timedelta(seconds=pauses)
+
+    def entered(self, key: str, statuses: frozenset[str]) -> datetime | None:
+        """Return when the ticket last entered any of `statuses`, None when it never did."""
+        entries = [
+            rank
+            for rank, (kind, name) in enumerate(self.events, 1)
+            if kind == "status" and name in statuses
+        ]
+        return self.moment(max(entries)) if entries else None
+
     def claims(self, key: str, statuses: frozenset[str]) -> tuple[Claim, ...]:
         """Return the claims since the ticket last entered any of `statuses`; raise `claims_error` when set."""
         if self.claims_error is not None:
             raise self.claims_error
         return tuple(
-            Claim(rank, task, CLAIM_EPOCH)
+            Claim(rank, task, self.moment(rank))
             for rank, (kind, task) in self.since(statuses)
             if kind == "claim"
         )
@@ -7674,6 +7691,74 @@ def test_wake_leaves_a_ticket_a_person_moved_in_progress(
     assert (code, answer) == (0, None)
     assert stub.comments == []
     assert stub.moves == []
+
+
+def test_wake_leaves_a_ticket_a_person_moved_in_progress_hours_after_an_orphan_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = timeline(
+        monkeypatch,
+        ENTERS_READY,
+        ("claim", "t1"),
+        ("wait", str(3 * 3600)),
+        ENTERS_IN_PROGRESS,
+    )
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert (code, answer) == (0, None)
+    assert stub.comments == []
+    assert stub.moves == []
+
+
+def test_wake_leaves_a_ticket_moved_in_progress_before_its_latest_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = timeline(
+        monkeypatch,
+        ENTERS_READY,
+        ENTERS_IN_PROGRESS,
+        ("wait", "60"),
+        ("claim", "t1"),
+    )
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert (code, answer) == (0, None)
+    assert stub.comments == []
+    assert stub.moves == []
+
+
+@pytest.mark.parametrize(
+    ("delay", "moves"),
+    [
+        (cli.CLAIM_TAKE_LIMIT_SECONDS, [("DEMO-1", "To Do")]),
+        (cli.CLAIM_TAKE_LIMIT_SECONDS + 1, []),
+    ],
+    ids=["at-the-take-limit", "past-the-take-limit"],
+)
+def test_wake_hands_back_a_ticket_only_when_it_entered_in_progress_within_the_take_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    delay: int,
+    moves: list[tuple[str, str]],
+) -> None:
+    stub = timeline(
+        monkeypatch,
+        ENTERS_READY,
+        ("claim", "t1"),
+        ("wait", str(delay)),
+        ENTERS_IN_PROGRESS,
+    )
+
+    wake(capsysbinary, instance)
+
+    assert stub.moves == moves
 
 
 def test_wake_hands_back_a_ticket_whose_latest_claim_follows_its_last_block(

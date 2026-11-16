@@ -14,6 +14,7 @@ import re
 import subprocess
 import textwrap
 from collections.abc import Callable, Iterable, Iterator, Sequence
+from datetime import datetime
 from functools import partial
 from itertools import count, repeat
 from typing import Annotated, Any
@@ -500,6 +501,33 @@ class JiraTracker:
             for _, text in self._comments_since(key, statuses)
         )
 
+    def entered(self, key: str, statuses: frozenset[str]) -> datetime | None:
+        """Return when the ticket `key` last entered any of the statuses `statuses`, timezone-aware; None when it never did.
+
+        The last entry is the creation time of the latest changelog entry that sets the
+        status to one of `statuses`. Every page of the changelog is read. Raises
+        `TrackerError` when `key` is not a ticket key, the token variable is not set, `twg`
+        fails, or an answer cannot be read.
+        """
+        _check_key(key)
+        changelog = self._pages(
+            f"reading the changelog of {key}",
+            ["jira", "workitem", "changelog", "query", "--issue-id", key],
+            _ChangelogPage,
+        )
+        return max(
+            (
+                history.created
+                for page in changelog
+                for history in page.data
+                if any(
+                    change.field == "status" and change.toString in statuses
+                    for change in history.items
+                )
+            ),
+            default=None,
+        )
+
     def _comments_since(
         self, key: str, statuses: frozenset[str]
     ) -> list[tuple[_Comment, str]]:
@@ -511,22 +539,7 @@ class JiraTracker:
         is read. Raises `TrackerError` when `key` is not a ticket key, the token variable
         is not set, `twg` fails, or an answer cannot be read.
         """
-        _check_key(key)
-        changelog = self._pages(
-            f"reading the changelog of {key}",
-            ["jira", "workitem", "changelog", "query", "--issue-id", key],
-            _ChangelogPage,
-        )
-        entries = [
-            history.created
-            for page in changelog
-            for history in page.data
-            if any(
-                change.field == "status" and change.toString in statuses
-                for change in history.items
-            )
-        ]
-        since = max(entries, default=None)
+        since = self.entered(key, statuses)
         comments = self._pages(
             f"reading the comments of {key}",
             [
