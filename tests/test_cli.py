@@ -5615,6 +5615,34 @@ def test_done_whose_ci_has_not_passed_is_not_merged_moves_the_ticket_to_blocked_
     assert stub.moves == [IN_PROGRESS, BLOCKED]
 
 
+def test_done_whose_ci_has_reported_no_check_yet_is_not_merged_and_moves_the_ticket_to_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    reachable_repository.ci = "unreported"
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    reason = (
+        f"no CI check is reported yet on the head commit {PULL.head} of the pull "
+        f"request {PULL.url}; it was not merged."
+    )
+    assert_blocked_run_fails(answer, instance, reason)
+    assert [name for name, _ in reachable_repository.calls] == [
+        "find_pull_request",
+        "read_ci",
+    ]
+    assert stub.comments == [
+        ("DEMO-1", f"{SUMMARY}\n\nThe ticket is blocked: {reason}")
+    ]
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
+
+
 @pytest.mark.parametrize(
     ("step", "error", "calls"),
     [
@@ -5630,7 +5658,10 @@ def test_done_whose_ci_has_not_passed_is_not_merged_moves_the_ticket_to_blocked_
         ),
         (
             "read_ci",
-            RepositoryError("no CI check is reported on pull request #7"),
+            RepositoryError(
+                "the repository octo/widgets has no active GitHub Actions workflow file "
+                "and reports no CI check on pull request #7"
+            ),
             ["find_pull_request", "read_ci"],
         ),
         (
@@ -7021,6 +7052,10 @@ def unfinished_ci(setup: Wake) -> None:
     setup.repository.ci = "running"
 
 
+def unreported_ci(setup: Wake) -> None:
+    setup.repository.ci = "unreported"
+
+
 def no_pull_request(setup: Wake) -> None:
     setup.repository.pull = None
 
@@ -7074,6 +7109,7 @@ def hold_merge_during_the_review(setup: Wake) -> None:
     ("arrange", "fragment"),
     [
         (unfinished_ci, "The run ended on 'done' but its ticket is blocked"),
+        (unreported_ci, "no CI check is reported yet on the head commit"),
         (no_pull_request, "no open pull request has the branch"),
         (find_defects, "found reachable defects"),
         (move_the_head, "the head of pull request #7 moved since its review"),
@@ -7318,6 +7354,13 @@ def unreadable_ci(setup: Wake) -> None:
     )
 
 
+def ci_without_workflow(setup: Wake) -> None:
+    setup.repository.errors["read_ci"] = RepositoryError(
+        "the repository octo/widgets has no active GitHub Actions workflow file and "
+        "reports no CI check on pull request #7"
+    )
+
+
 def unreadable_ticket_before_the_review(setup: Wake) -> None:
     def tracker_down() -> None:
         setup.stub.answer = TrackerError("twg failed while reading DEMO-1: down")
@@ -7414,6 +7457,7 @@ def no_time_left_for_the_review(setup: Wake) -> None:
         (no_time_left_for_the_review, "ceiling of 1800 seconds was reached before it"),
         (unfindable_pull_request, "gh failed while listing pull requests: down"),
         (unreadable_ci, "gh failed while reading checks: down"),
+        (ci_without_workflow, "has no active GitHub Actions workflow"),
         (unreadable_ticket_before_the_review, "twg failed while reading DEMO-1"),
         (unreadable_ticket_after_the_review, "twg failed while reading DEMO-1"),
         (unmergeable_pull_request, "It may have been merged"),

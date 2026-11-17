@@ -73,6 +73,19 @@ class _ViewAnswer(BaseModel):
     ]
 
 
+class _Workflow(BaseModel):
+    """A GitHub Actions workflow, as `gh api repos/{name}/actions/workflows` writes it."""
+
+    path: str
+    state: str
+
+
+class _WorkflowsAnswer(BaseModel):
+    """The answer of `gh api repos/{name}/actions/workflows`."""
+
+    workflows: list[_Workflow]
+
+
 class _StateAnswer(BaseModel):
     """The answer of `gh pr view --json state`."""
 
@@ -80,6 +93,9 @@ class _StateAnswer(BaseModel):
 
 
 MERGED = "MERGED"
+ACTIVE = "active"
+WORKFLOW_FILES_DIRECTORY = ".github/workflows/"
+WORKFLOWS_PAGE_SIZE = 100
 
 _UNREADABLE = object()
 
@@ -182,10 +198,14 @@ class GitHubRepository:
     def read_ci(self, pull_request: PullRequest) -> CiState:
         """Return `"failed"` when a check failed, else `"running"` when one still runs, else `"passed"`.
 
-        The checks are those of the head commit, read in the same answer as its SHA. Raises
-        `HeadMovedError` when the head is no longer `pull_request.head`, and
-        `RepositoryError` when the token variable is not set, `gh` fails, its answer cannot
-        be read, or no check is reported.
+        The checks are those of the head commit, read in the same answer as its SHA. When
+        none is reported, the GitHub Actions workflows of the repository are read: this
+        returns `"unreported"` when at least one is active and defined by a workflow file
+        under `.github/workflows/`; GitHub's dynamic workflows, such as Dependabot's, do
+        not count. Raises `HeadMovedError` when the
+        head is no longer `pull_request.head`, and `RepositoryError` when the token
+        variable is not set, `gh` fails, its answer cannot be read, or no check is reported
+        and no workflow file is active.
         """
         number = pull_request.number
         action = f"reading the CI of pull request #{number}"
@@ -204,7 +224,12 @@ class GitHubRepository:
             )
         checks = view.statusCheckRollup
         if not checks:
-            raise RepositoryError(f"no CI check is reported on pull request #{number}")
+            if self._has_active_workflow():
+                return "unreported"
+            raise RepositoryError(
+                f"the repository {self._repository.name} has no active GitHub Actions "
+                f"workflow file and reports no CI check on pull request #{number}"
+            )
         states = {_check_state(check) for check in checks}
         if "failed" in states:
             return "failed"
@@ -263,6 +288,30 @@ class GitHubRepository:
                 f"is {state}; a merge queue may hold it."
             )
 
+    def _has_active_workflow(self) -> bool:
+        """Return whether one of the first 100 GitHub Actions workflows of the repository is active and defined by a workflow file.
+
+        A workflow file is one under `.github/workflows/`; GitHub's dynamic workflows,
+        always active, do not count.
+
+        Raises `RepositoryError` as `_run_json` does, and when the answer cannot be read.
+        """
+        action = "reading the GitHub Actions workflows of the repository"
+        path = (
+            f"repos/{self._repository.name}/actions/workflows"
+            f"?per_page={WORKFLOWS_PAGE_SIZE}"
+        )
+        answer = self._run_json(action, ["api", path], on_repository=False)
+        try:
+            workflows = _WorkflowsAnswer.model_validate(answer).workflows
+        except ValidationError as error:
+            raise self._unreadable(action, error) from None
+        return any(
+            workflow.state == ACTIVE
+            and workflow.path.startswith(WORKFLOW_FILES_DIRECTORY)
+            for workflow in workflows
+        )
+
     def _token(self) -> str:
         """Return the token held by the variable `token_env` names; raise `RepositoryError` if unset."""
         name = self._token_env
@@ -280,12 +329,15 @@ class GitHubRepository:
             f"the answer of gh to {action} cannot be read: {description}"
         )
 
-    def _run_json(self, action: str, arguments: list[str]) -> object:
+    def _run_json(
+        self, action: str, arguments: list[str], *, on_repository: bool = True
+    ) -> object:
         """Run `gh` with `arguments` and return its decoded JSON answer.
 
-        Raises `RepositoryError` as `_run` does, and when the answer is not JSON.
+        `on_repository` is passed to `_run`. Raises `RepositoryError` as `_run` does, and
+        when the answer is not JSON.
         """
-        answer = _parse_json(self._run(action, arguments))
+        answer = _parse_json(self._run(action, arguments, on_repository=on_repository))
         if answer is _UNREADABLE:
             raise RepositoryError(f"the answer of gh to {action} is not JSON")
         return answer

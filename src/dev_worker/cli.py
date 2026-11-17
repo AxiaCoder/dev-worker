@@ -100,8 +100,9 @@ class Benign(str):
 
     The lock is held by a run that is not gone, another run claimed the ticket first,
     or the ticket is not ready to be taken. A `done` run is also left blocked for a
-    `Benign` reason when its pull request is missing, its CI has not passed, its guard
-    review found a reachable defect, or its head moved before the merge.
+    `Benign` reason when its pull request is missing, its CI has not passed or has
+    reported no check yet on its head commit, its guard review found a reachable defect,
+    or its head moved before the merge.
     """
 
 
@@ -466,9 +467,10 @@ def land_done(
     what happened, the defects found listed; after a merge that failed for a reason
     other than a moved head, it says the merge may have happened. The reason the ticket
     is blocked is `None` unless it goes to the `blocked` status key, and `Benign` when no
-    pull request is open, its CI has not passed, the review found a reachable defect or
-    the head moved before the merge; any other reason is a failure of the worker's own
-    chain. The errors hold why
+    pull request is open, its CI has not passed or has reported no check yet on the head
+    commit, the review found a reachable defect or the head moved before the merge; any
+    other reason, such as a repository that reports no check and has no CI to report
+    one, is a failure of the worker's own chain. The errors hold why
     the review checkout could not be deleted, which neither blocks the ticket nor holds
     the merge back.
     """
@@ -493,6 +495,14 @@ def land_done(
                 Benign(f"no open pull request has the branch {branch} as its head.")
             )
         ci = repository.read_ci(pull_request)
+        if ci == "unreported":
+            return blocked(
+                Benign(
+                    "no CI check is reported yet on the head commit "
+                    f"{pull_request.head} of the pull request {pull_request.url}; it "
+                    "was not merged."
+                )
+            )
         if ci != "passed":
             state = "failed" if ci == "failed" else "has not finished"
             return blocked(
