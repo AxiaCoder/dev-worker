@@ -3,8 +3,8 @@
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-CiState = Literal["passed", "failed", "running"]
-"""The state of the CI of a pull request: every check passed, one failed, or some still run."""
+CiState = Literal["passed", "failed", "running", "unreported"]
+"""The state of the CI of a pull request: every check passed, one failed, some still run, or no check is reported yet while the repository has a CI to report one."""
 
 
 class RepositoryError(Exception):
@@ -55,7 +55,9 @@ class CodeRepository(Protocol):
         """Return the state of the CI of the commit `pull_request.head`.
 
         Raises `HeadMovedError` when the head of the pull request has moved since it was
-        found, and `RepositoryError` when the CI cannot be read or no check is reported.
+        found, and `RepositoryError` when the CI cannot be read, or when no check is
+        reported and the repository has no CI that could report one. No check reported
+        while the repository has such a CI is `"unreported"`.
         """
         ...
 

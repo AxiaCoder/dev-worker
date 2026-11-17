@@ -258,13 +258,93 @@ def test_read_ci_aggregates_the_checks(
     assert repository().read_ci(PULL) == state
 
 
-def test_a_pull_request_without_checks_raises(
-    record: Path, monkeypatch: pytest.MonkeyPatch
+def workflows(*states: str) -> dict[str, Any]:
+    return {
+        "total_count": len(states),
+        "workflows": [{"name": f"ci-{i}", "state": s} for i, s in enumerate(states)],
+    }
+
+
+@pytest.mark.parametrize(
+    "states",
+    [("active",), ("disabled_manually", "active")],
+)
+def test_a_pull_request_without_checks_in_a_repository_with_an_active_workflow_is_unreported(
+    record: Path, monkeypatch: pytest.MonkeyPatch, states: tuple[str, ...]
 ) -> None:
-    answer(monkeypatch, rollup())
+    calls = answer_in_turn(monkeypatch, record, rollup(), workflows(*states))
+
+    assert repository().read_ci(PULL) == "unreported"
+    assert every_call(calls)[1] == [
+        "api", "repos/octo/widgets/actions/workflows?per_page=100",
+    ]  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "states",
+    [(), ("disabled_manually",), ("disabled_inactivity", "deleted")],
+)
+def test_a_pull_request_without_checks_in_a_repository_without_an_active_workflow_raises(
+    record: Path, monkeypatch: pytest.MonkeyPatch, states: tuple[str, ...]
+) -> None:
+    answer_in_turn(monkeypatch, record, rollup(), workflows(*states))
 
     with pytest.raises(
-        RepositoryError, match="^no CI check is reported on pull request #42$"
+        RepositoryError,
+        match=(
+            "^the repository octo/widgets has no active GitHub Actions workflow and "
+            "reports no CI check on pull request #42$"
+        ),
+    ):
+        repository().read_ci(PULL)
+
+
+def test_a_pull_request_with_checks_does_not_read_the_workflows(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = answer_in_turn(monkeypatch, record, rollup(run("COMPLETED", "SUCCESS")))
+
+    repository().read_ci(PULL)
+
+    assert len(every_call(calls)) == 1
+
+
+@pytest.mark.parametrize(
+    ("workflows_answer", "ending"),
+    [
+        ("not json", "is not JSON"),
+        ({"total_count": 0}, "cannot be read: "),
+        ({"workflows": [{"name": "ci"}]}, "cannot be read: "),
+    ],
+)
+def test_an_unreadable_workflows_answer_raises(
+    record: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    workflows_answer: object,
+    ending: str,
+) -> None:
+    answer_in_turn(monkeypatch, record, rollup(), workflows_answer)
+
+    with pytest.raises(RepositoryError) as raised:
+        repository().read_ci(PULL)
+
+    assert str(raised.value).startswith(
+        "the answer of gh to reading the GitHub Actions workflows of the repository "
+    )
+    assert ending in str(raised.value)
+
+
+def test_a_failed_workflows_read_raises(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer_in_turn(monkeypatch, record, rollup(), GhFailure("HTTP 404: Not Found"))
+
+    with pytest.raises(
+        RepositoryError,
+        match=(
+            "^gh failed while reading the GitHub Actions workflows of the repository: "
+            "HTTP 404: Not Found$"
+        ),
     ):
         repository().read_ci(PULL)
 
