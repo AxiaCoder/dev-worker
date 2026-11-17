@@ -226,20 +226,20 @@ def parse_lock(content: bytes) -> dict[str, object]:
     return record if isinstance(record, dict) else {}
 
 
-def process_runs_since(pid: int, moment: float) -> bool:
+def process_runs_since(pid: int, moment: float) -> bool | None:
     """Tell whether process `pid` runs and was started no later than `moment`.
 
     `pid` must be positive; `moment` is a POSIX timestamp in seconds, allowed
     `CREATE_TIME_SLACK` seconds of imprecision. A process started after `moment` holds
-    a reused PID and does not count; a process this one cannot inspect, for lack of
-    rights or otherwise, does.
+    a reused PID and does not count. `None` when the process exists but cannot be
+    inspected, for lack of rights or otherwise.
     """
     try:
         created = psutil.Process(pid).create_time()
     except psutil.NoSuchProcess:
         return False
     except (psutil.Error, OSError):
-        return True
+        return None
     return created <= moment + CREATE_TIME_SLACK
 
 

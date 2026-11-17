@@ -329,13 +329,14 @@ def test_process_runs_since_is_false_for_a_pid_reused_after_the_moment() -> None
 @pytest.mark.parametrize(
     ("error", "runs"),
     [
-        (psutil.AccessDenied(1), True),
-        (OSError("refused"), True),
+        (psutil.AccessDenied(1), None),
+        (psutil.Error("unexpected"), None),
+        (OSError("refused"), None),
         (psutil.ZombieProcess(1), False),
     ],
 )
 def test_process_runs_since_on_a_process_it_cannot_inspect(
-    monkeypatch: pytest.MonkeyPatch, error: Exception, runs: bool
+    monkeypatch: pytest.MonkeyPatch, error: Exception, runs: bool | None
 ) -> None:
     def refuse(pid: int) -> psutil.Process:
         raise error

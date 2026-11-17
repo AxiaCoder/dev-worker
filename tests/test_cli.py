@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import psutil
 import pytest
 
 from dev_worker import cli, run_journal
@@ -4995,6 +4996,52 @@ def test_run_takes_over_a_lock_whose_process_is_gone_and_journals_the_gone_run(
     assert_taken_over(answer, instance, gone_line(60, process_gone(instance, pid)))
 
 
+def deny_inspection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every process refuse to be inspected, as one of another user does."""
+
+    def refuse(pid: int) -> psutil.Process:
+        raise psutil.AccessDenied(pid)
+
+    monkeypatch.setattr(psutil, "Process", refuse)
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_run_takes_over_a_lock_beyond_the_timeout_whose_process_cannot_be_inspected(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    hold_lock(instance, lock_of(1801, pid=os.getpid()))
+    deny_inspection(monkeypatch)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_taken_over(answer, instance, gone_line(1801, timed_out(instance, 1801)))
+
+
+@pytest.mark.usefixtures("frozen_now")
+@pytest.mark.parametrize("seconds_ago", [1800, 60])
+def test_run_refuses_a_lock_within_the_timeout_whose_process_cannot_be_inspected(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    seconds_ago: int,
+) -> None:
+    content = lock_of(seconds_ago, pid=os.getpid())
+    lock = hold_lock(instance, content)
+    deny_inspection(monkeypatch)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", "A run is already in progress")
+    assert lock.read_bytes() == content
+    assert journal_lines(instance) == []
+
+
 @pytest.mark.usefixtures("frozen_now")
 def test_run_takes_over_a_lock_of_unknown_details_held_beyond_the_timeout(
     monkeypatch: pytest.MonkeyPatch,
@@ -5322,6 +5369,40 @@ def test_health_is_ok_while_the_live_process_of_the_lock_is_within_the_timeout(
 ) -> None:
     hold_lock(instance, lock_of(seconds_ago, pid=os.getpid()))
     monkeypatch.setattr(cli, "process_runs_since", lambda pid, moment: True)
+
+    assert health(monkeypatch, capsysbinary, instance) == {
+        "status": "ok",
+        "reason": None,
+        "active": True,
+    }
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_health_ages_a_lock_whose_process_cannot_be_inspected_by_the_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    hold_lock(instance, lock_of(1801, pid=os.getpid()))
+    deny_inspection(monkeypatch)
+
+    assert health(monkeypatch, capsysbinary, instance) == {
+        "status": "degraded",
+        "reason": timed_out(instance, 1801),
+        "active": True,
+    }
+
+
+@pytest.mark.usefixtures("frozen_now")
+@pytest.mark.parametrize("seconds_ago", [1800, 0])
+def test_health_is_ok_while_a_lock_whose_process_cannot_be_inspected_is_within_the_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    seconds_ago: int,
+) -> None:
+    hold_lock(instance, lock_of(seconds_ago, pid=os.getpid()))
+    deny_inspection(monkeypatch)
 
     assert health(monkeypatch, capsysbinary, instance) == {
         "status": "ok",
@@ -8282,6 +8363,23 @@ def test_attempts_count_again_once_a_settled_ticket_is_handed_back(
         f"{REQUEUE}the run that took it is gone without settling it (attempt 1 of 3)."
     ]
     assert stub.moves == [("DEMO-1", "To Do")]
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_wake_recovers_from_a_lock_beyond_the_timeout_whose_process_cannot_be_inspected(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    lock = hold_lock(instance, lock_of(1801, pid=os.getpid(), ticket_key="DEMO-1"))
+    deny_inspection(monkeypatch)
+    stub = timeline(monkeypatch, *DEAD_RUN)
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert (code, answer) == (0, None)
+    assert stub.moves == [("DEMO-1", "To Do")]
+    assert not lock.exists()
 
 
 @pytest.mark.usefixtures("frozen_now")

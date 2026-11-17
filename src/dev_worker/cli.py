@@ -1727,15 +1727,16 @@ def gone_reason(
 ) -> str | None:
     """Return why the run holding the lock of `directory` is gone, `None` if it is not.
 
-    `lock` is the lock record. When the record names its process (see `lock_pid`), the
-    run is gone once that process no longer runs or was started after the record's
-    `start`, whatever the lock's age. Otherwise the run is gone once it has held the
-    lock longer than `timeout` seconds (see `lock_age`).
+    `lock` is the lock record. When the record names a process that can be inspected
+    (see `lock_process_runs`), the run is gone once that process no longer runs or was
+    started after the record's `start`, whatever the lock's age. Otherwise the run is
+    gone once it has held the lock longer than `timeout` seconds (see `lock_age`).
     """
     pid = lock_pid(lock)
-    if pid is not None:
-        if lock_process_runs(lock):
-            return None
+    runs = lock_process_runs(lock)
+    if runs is True:
+        return None
+    if runs is False:
         return (
             f"The run holding the lock of instance directory '{directory}' "
             f"is gone: its process {pid} no longer runs."
@@ -1761,7 +1762,7 @@ def overdue_reason(
     """
     pid = lock_pid(lock)
     age = lock_age(directory, lock)
-    if pid is None or age is None or age <= timeout or not lock_process_runs(lock):
+    if age is None or age <= timeout or lock_process_runs(lock) is not True:
         return None
     return (
         f"The run holding the lock of instance directory '{directory}' "
@@ -1787,15 +1788,16 @@ def lock_pid(lock: Mapping[str, object]) -> int | None:
     return None
 
 
-def lock_process_runs(lock: Mapping[str, object]) -> bool:
-    """Tell whether the lock record `lock` names a process (see `lock_pid`) that still runs, started no later than the record's `start`."""
+def lock_process_runs(lock: Mapping[str, object]) -> bool | None:
+    """Tell whether the process the lock record `lock` names (see `lock_pid`) still runs, started no later than the record's `start`.
+
+    `None` when the record names no process, or names one that cannot be inspected.
+    """
     pid = lock_pid(lock)
     start = run_start(lock)
-    return (
-        pid is not None
-        and start is not None
-        and process_runs_since(pid, start.timestamp())
-    )
+    if pid is None or start is None:
+        return None
+    return process_runs_since(pid, start.timestamp())
 
 
 def take_over_lock(
