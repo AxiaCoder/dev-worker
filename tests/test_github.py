@@ -259,10 +259,62 @@ def test_read_ci_aggregates_the_checks(
 
 
 def workflows(*states: str) -> dict[str, Any]:
+    return workflows_at(
+        *((f".github/workflows/ci-{i}.yml", s) for i, s in enumerate(states))
+    )
+
+
+def workflows_at(*entries: tuple[str, str]) -> dict[str, Any]:
     return {
-        "total_count": len(states),
-        "workflows": [{"name": f"ci-{i}", "state": s} for i, s in enumerate(states)],
+        "total_count": len(entries),
+        "workflows": [
+            {"name": f"ci-{i}", "path": path, "state": state}
+            for i, (path, state) in enumerate(entries)
+        ],
     }
+
+
+DEPENDABOT = "dynamic/dependabot/update-graph"
+COPILOT = "dynamic/copilot-pull-request-reviewer/copilot-pull-request-reviewer"
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        ((DEPENDABOT, "active"),),
+        ((COPILOT, "active"),),
+        ((DEPENDABOT, "active"), (COPILOT, "active")),
+        ((".github/workflows/ci.yml", "disabled_manually"), (DEPENDABOT, "active")),
+    ],
+)
+def test_a_pull_request_without_checks_in_a_repository_with_only_dynamic_active_workflows_raises(
+    record: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entries: tuple[tuple[str, str], ...],
+) -> None:
+    answer_in_turn(monkeypatch, record, rollup(), workflows_at(*entries))
+
+    with pytest.raises(
+        RepositoryError,
+        match=(
+            "^the repository octo/widgets has no active GitHub Actions workflow and "
+            "reports no CI check on pull request #42$"
+        ),
+    ):
+        repository().read_ci(PULL)
+
+
+def test_a_pull_request_without_checks_in_a_repository_with_a_dynamic_and_a_file_workflow_is_unreported(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer_in_turn(
+        monkeypatch,
+        record,
+        rollup(),
+        workflows_at((".github/workflows/check.yml", "active"), (DEPENDABOT, "active")),
+    )
+
+    assert repository().read_ci(PULL) == "unreported"
 
 
 @pytest.mark.parametrize(

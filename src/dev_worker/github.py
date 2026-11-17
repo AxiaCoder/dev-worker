@@ -76,6 +76,7 @@ class _ViewAnswer(BaseModel):
 class _Workflow(BaseModel):
     """A GitHub Actions workflow, as `gh api repos/{name}/actions/workflows` writes it."""
 
+    path: str
     state: str
 
 
@@ -93,6 +94,7 @@ class _StateAnswer(BaseModel):
 
 MERGED = "MERGED"
 ACTIVE = "active"
+WORKFLOW_FILES_DIRECTORY = ".github/workflows/"
 WORKFLOWS_PAGE_SIZE = 100
 
 _UNREADABLE = object()
@@ -198,10 +200,12 @@ class GitHubRepository:
 
         The checks are those of the head commit, read in the same answer as its SHA. When
         none is reported, the GitHub Actions workflows of the repository are read: this
-        returns `"unreported"` when at least one is active. Raises `HeadMovedError` when the
+        returns `"unreported"` when at least one is active and defined by a workflow file
+        under `.github/workflows/`; GitHub's dynamic workflows, such as Dependabot's, do
+        not count. Raises `HeadMovedError` when the
         head is no longer `pull_request.head`, and `RepositoryError` when the token
         variable is not set, `gh` fails, its answer cannot be read, or no check is reported
-        and no workflow is active.
+        and no workflow file is active.
         """
         number = pull_request.number
         action = f"reading the CI of pull request #{number}"
@@ -285,7 +289,10 @@ class GitHubRepository:
             )
 
     def _has_active_workflow(self) -> bool:
-        """Return whether one of the first 100 GitHub Actions workflows of the repository is active.
+        """Return whether one of the first 100 GitHub Actions workflows of the repository is active and defined by a workflow file.
+
+        A workflow file is one under `.github/workflows/`; GitHub's dynamic workflows,
+        always active, do not count.
 
         Raises `RepositoryError` as `_run_json` does, and when the answer cannot be read.
         """
@@ -299,7 +306,11 @@ class GitHubRepository:
             workflows = _WorkflowsAnswer.model_validate(answer).workflows
         except ValidationError as error:
             raise self._unreadable(action, error) from None
-        return any(workflow.state == ACTIVE for workflow in workflows)
+        return any(
+            workflow.state == ACTIVE
+            and workflow.path.startswith(WORKFLOW_FILES_DIRECTORY)
+            for workflow in workflows
+        )
 
     def _token(self) -> str:
         """Return the token held by the variable `token_env` names; raise `RepositoryError` if unset."""
