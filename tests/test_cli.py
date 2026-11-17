@@ -5659,7 +5659,7 @@ def test_done_whose_ci_has_reported_no_check_yet_is_not_merged_and_moves_the_tic
         (
             "read_ci",
             RepositoryError(
-                "the repository octo/widgets has no active GitHub Actions workflow "
+                "the repository octo/widgets has no active GitHub Actions workflow file "
                 "and reports no CI check on pull request #7"
             ),
             ["find_pull_request", "read_ci"],
@@ -7356,7 +7356,7 @@ def unreadable_ci(setup: Wake) -> None:
 
 def ci_without_workflow(setup: Wake) -> None:
     setup.repository.errors["read_ci"] = RepositoryError(
-        "the repository octo/widgets has no active GitHub Actions workflow and "
+        "the repository octo/widgets has no active GitHub Actions workflow file and "
         "reports no CI check on pull request #7"
     )
 

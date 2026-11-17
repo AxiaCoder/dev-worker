@@ -228,7 +228,7 @@ class GitHubRepository:
                 return "unreported"
             raise RepositoryError(
                 f"the repository {self._repository.name} has no active GitHub Actions "
-                f"workflow and reports no CI check on pull request #{number}"
+                f"workflow file and reports no CI check on pull request #{number}"
             )
         states = {_check_state(check) for check in checks}
         if "failed" in states:

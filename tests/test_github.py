@@ -297,7 +297,7 @@ def test_a_pull_request_without_checks_in_a_repository_with_only_dynamic_active_
     with pytest.raises(
         RepositoryError,
         match=(
-            "^the repository octo/widgets has no active GitHub Actions workflow and "
+            "^the repository octo/widgets has no active GitHub Actions workflow file and "
             "reports no CI check on pull request #42$"
         ),
     ):
@@ -344,7 +344,7 @@ def test_a_pull_request_without_checks_in_a_repository_without_an_active_workflo
     with pytest.raises(
         RepositoryError,
         match=(
-            "^the repository octo/widgets has no active GitHub Actions workflow and "
+            "^the repository octo/widgets has no active GitHub Actions workflow file and "
             "reports no CI check on pull request #42$"
         ),
     ):
