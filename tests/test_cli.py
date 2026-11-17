@@ -8366,6 +8366,23 @@ def test_attempts_count_again_once_a_settled_ticket_is_handed_back(
 
 
 @pytest.mark.usefixtures("frozen_now")
+def test_wake_recovers_from_a_lock_beyond_the_timeout_whose_process_cannot_be_inspected(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    lock = hold_lock(instance, lock_of(1801, pid=os.getpid(), ticket_key="DEMO-1"))
+    deny_inspection(monkeypatch)
+    stub = timeline(monkeypatch, *DEAD_RUN)
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert (code, answer) == (0, None)
+    assert stub.moves == [("DEMO-1", "To Do")]
+    assert not lock.exists()
+
+
+@pytest.mark.usefixtures("frozen_now")
 def test_wake_does_not_recover_while_the_process_of_the_lock_it_took_over_still_runs(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
