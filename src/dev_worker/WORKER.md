@@ -14,6 +14,7 @@ ceilings:
   run_timeout_seconds: 1800
   max_turns: 60
   review_max_turns: 40
+  review_timeout_seconds: 600
   max_attempts: 3
 plugin:
   repository: https://github.com/AxiaCoder/claude-config.git
@@ -34,7 +35,8 @@ What follows is the rules of conduct of a run, addressed to the AI that carries 
 
 You carry one ticket to a pull request, headless. Nobody watches the run and nobody answers a
 question while it lasts: the prompt holds the ticket's key, title and description, and that is all
-the human input you get.
+the human input you get. It also holds the CI deadline, in UTC: the moment you stop waiting for the
+CI (§ The CI of the pull request).
 
 You work in a worktree of the repository, on the branch the run was given. That branch may carry
 the work of an earlier run on the same ticket: read its history and resume from there. Whatever you
@@ -76,6 +78,8 @@ It may comment on the ticket and create follow-up tickets in the tracker.
   still failing after its bounded retries, a `dev` ⇄ `qa` loop past its two passes. It never goes
   past such a gate on its own, and never opens the pull request a gate refused. The merge request
   and review comments pending a decision are not such checks: § Merging without asking covers them.
+- **A CI of the head commit without a verdict at the CI deadline** ends the run with `blocked`
+  (§ The CI of the pull request).
 - **A subagent stopped at its turn ceiling** (the `maxTurns` of its definition) **may be launched
   once more for the same task**, with a brief that resumes from what it left. If that relaunch stops
   at its ceiling too, the run ends with `blocked`, the subagent and its ceiling as the reason. The
@@ -120,6 +124,21 @@ would give with its merge request goes into the summary of the `done` outcome.
 Nothing is left for the merge to settle: before ending with `done`, every review comment left
 pending a decision is settled — fixed, sent to a follow-up ticket, or set aside with its reason —
 or the run ends with `needs_human`.
+
+## The CI of the pull request
+
+**After your last push and before ending with `done`, wait for the checks of the pull request's head
+commit**: `gh pr checks <number> --watch`, which reads the checks of the head commit. Never the
+latest workflow run of the branch (`gh run watch`, `gh run list`): it may not be the head's.
+
+- **Stop waiting at the CI deadline** the prompt gives. Compare it with `date -u`, and bound the
+  watch to the time left, with `timeout`.
+- **Checks not reported yet right after a push are no verdict yet**: wait for them, they are not a
+  failure.
+- **A red check is fixed like a review defect** (a bug through its failing test first, §
+  Delegation), pushed, and waited for again.
+- **No verdict at the deadline**: end the run with `blocked`, the reason saying that the CI of the
+  head commit had no verdict at the CI deadline, with the pull request URL.
 
 ## Tooling (Outillage)
 
@@ -250,12 +269,14 @@ else English. Comments on the ticket and follow-up tickets are in the language o
 
 End with exactly one outcome:
 
-- **`done`** — the pull request is open and its review passes are handled. The summary says what
-  the pull request does, what was verified, and the hypotheses it records.
+- **`done`** — the pull request is open, its review passes are handled, and the CI of its head
+  commit passed. The summary says what the pull request does, what was verified, and the
+  hypotheses it records.
 - **`blocked`** — something stops the work that the run cannot get past alone: a missing access, a
   tool that fails, a ticket it depends on that is not done, a refusal, a check of the plugin still
-  failing where it hands back to the user, or a subagent whose relaunch stopped at its turn
-  ceiling too. The reason says what stops it and what would unblock it.
+  failing where it hands back to the user, a subagent whose relaunch stopped at its turn ceiling
+  too, or a CI of the head commit without a verdict at the CI deadline. The reason says what stops
+  it and what would unblock it.
 - **`needs_human`** — a decision that is hard to undo or cannot be guessed. The reason asks the
   question in full, answerable by someone who has not followed the run.
 - **`abandoned`** — the ticket should not be done as written: already done, obsolete, or

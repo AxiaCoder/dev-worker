@@ -26,6 +26,7 @@ import time
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import NoReturn
 
@@ -59,11 +60,17 @@ class ContainerExit:
     stderr: str
 
 
-def ticket_prompt(ticket: Ticket) -> str:
-    """Return the prompt of a run on `ticket`: its key, title and description."""
+def ticket_prompt(ticket: Ticket, ci_deadline: datetime) -> str:
+    """Return the prompt of a run on `ticket`: its key, title, CI deadline and description.
+
+    `ci_deadline` is an aware datetime, written in UTC to the second as
+    `YYYY-MM-DDTHH:MM:SSZ`.
+    """
+    deadline = ci_deadline.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     return (
         f"Ticket: {ticket.key}\n"
         f"Title: {ticket.title}\n"
+        f"CI deadline: {deadline}\n"
         "\n"
         f"Description:\n{ticket.description}\n"
     )
@@ -87,11 +94,16 @@ def outcome_schema(outcomes: Sequence[str]) -> dict[str, object]:
 
 
 def agent_command(
-    ticket: Ticket, rules: str, max_turns: int, outcomes: Sequence[str]
+    ticket: Ticket,
+    rules: str,
+    max_turns: int,
+    outcomes: Sequence[str],
+    ci_deadline: datetime,
 ) -> tuple[str, ...]:
     """Return the command that runs Claude Code headless on `ticket` in the container.
 
-    `rules` is appended to its system prompt, `max_turns` caps its turns and `outcomes`
+    The prompt carries `ci_deadline` (see `ticket_prompt`). `rules` is appended to its
+    system prompt, `max_turns` caps its turns and `outcomes`
     are the outcomes it may end on (see `outcome_schema`); it loads the plugin mounted at
     `PLUGIN_DIR`, runs in `bypassPermissions` mode, never prompting for a permission, and
     answers in JSON.
@@ -99,7 +111,7 @@ def agent_command(
     return (
         AGENT_PROGRAM,
         "-p",
-        ticket_prompt(ticket),
+        ticket_prompt(ticket, ci_deadline),
         "--append-system-prompt",
         rules,
         "--plugin-dir",
