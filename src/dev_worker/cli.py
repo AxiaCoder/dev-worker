@@ -706,26 +706,19 @@ def take_instance_lock(
     directory: Path,
     record: Mapping[str, object],
     instance: Instance,
-    *,
-    spare_live_process: bool = False,
 ) -> Path | str:
     """Take the lock of `directory`, writing `record` in it, or take it over from a run that is gone.
 
-    A run is gone once it has held the lock beyond the `run_timeout_seconds` limit of
-    `instance`, or once its process is gone (see `take_over_lock`). With
-    `spare_live_process`, a run whose process still runs is never taken over. Returns
-    the lock file path, or why the lock cannot be taken; the reason is `Benign` when a
-    run that is not gone, or spared, holds it. Never raises on a file error.
+    A run whose lock names its process is gone once that process is gone; one whose
+    lock names none, once it has held the lock beyond the `run_timeout_seconds` limit
+    of `instance` (see `gone_reason`). Returns the lock file path, or why the lock
+    cannot be taken; the reason is `Benign` when a run that is not gone holds it.
+    Never raises on a file error.
     """
     try:
         return take_lock(directory, record)
     except FileExistsError:
-        return take_over_lock(
-            directory,
-            record,
-            instance.limits["run_timeout_seconds"],
-            spare_live_process=spare_live_process,
-        )
+        return take_over_lock(directory, record, instance.limits["run_timeout_seconds"])
     except OSError as error:
         return lock_unwritable(directory, error)
 
@@ -1422,7 +1415,7 @@ def recover_dead_runs(
         "start": datetime.now(UTC).isoformat(),
         "pid": os.getpid(),
     }
-    lock = take_instance_lock(directory, record, instance, spare_live_process=True)
+    lock = take_instance_lock(directory, record, instance)
     if isinstance(lock, Benign):
         return []
     if isinstance(lock, str):
@@ -1734,11 +1727,19 @@ def gone_reason(
 ) -> str | None:
     """Return why the run holding the lock of `directory` is gone, `None` if it is not.
 
-    `lock` is the lock record. The run is gone when it has held the lock longer than
-    `timeout` seconds (see `lock_age`), or when the record names its process by a
-    positive integer `pid` and a usable `start`, and that process no longer runs or
-    was started after `start`.
+    `lock` is the lock record. When the record names its process (see `lock_pid`), the
+    run is gone once that process no longer runs or was started after the record's
+    `start`, whatever the lock's age. Otherwise the run is gone once it has held the
+    lock longer than `timeout` seconds (see `lock_age`).
     """
+    pid = lock_pid(lock)
+    if pid is not None:
+        if lock_process_runs(lock):
+            return None
+        return (
+            f"The run holding the lock of instance directory '{directory}' "
+            f"is gone: its process {pid} no longer runs."
+        )
     age = lock_age(directory, lock)
     if age is not None and age > timeout:
         return (
@@ -1746,30 +1747,52 @@ def gone_reason(
             f"started {age:.0f} seconds ago, beyond the run timeout of "
             f"{timeout} seconds."
         )
+    return None
+
+
+def overdue_reason(
+    directory: Path, lock: Mapping[str, object], timeout: int
+) -> str | None:
+    """Return why the run holding the lock of `directory` is overdue, `None` if it is not.
+
+    `lock` is the lock record. The run is overdue when its process still runs (see
+    `lock_process_runs`) and it has held the lock longer than `timeout` seconds (see
+    `lock_age`); such a lock is not taken over.
+    """
+    pid = lock_pid(lock)
+    age = lock_age(directory, lock)
+    if pid is None or age is None or age <= timeout or not lock_process_runs(lock):
+        return None
+    return (
+        f"The run holding the lock of instance directory '{directory}' "
+        f"started {age:.0f} seconds ago, beyond the run timeout of "
+        f"{timeout} seconds; its process {pid} still runs, so the lock is not "
+        f"taken over."
+    )
+
+
+def lock_pid(lock: Mapping[str, object]) -> int | None:
+    """Return the process the lock record `lock` names, or `None` when it names none.
+
+    A record names its process by a positive integer `pid` and a usable `start`.
+    """
     pid = lock.get("pid")
-    start = run_start(lock)
     if (
         isinstance(pid, int)
         and not isinstance(pid, bool)
         and pid > 0
-        and start is not None
-        and not process_runs_since(pid, start.timestamp())
+        and run_start(lock) is not None
     ):
-        return (
-            f"The run holding the lock of instance directory '{directory}' "
-            f"is gone: its process {pid} no longer runs."
-        )
+        return pid
     return None
 
 
 def lock_process_runs(lock: Mapping[str, object]) -> bool:
-    """Tell whether the lock record `lock` names by a positive integer `pid` and a usable `start` a process that still runs, started no later than `start`."""
-    pid = lock.get("pid")
+    """Tell whether the lock record `lock` names a process (see `lock_pid`) that still runs, started no later than the record's `start`."""
+    pid = lock_pid(lock)
     start = run_start(lock)
     return (
-        isinstance(pid, int)
-        and not isinstance(pid, bool)
-        and pid > 0
+        pid is not None
         and start is not None
         and process_runs_since(pid, start.timestamp())
     )
@@ -1779,16 +1802,13 @@ def take_over_lock(
     directory: Path,
     record: Mapping[str, object],
     timeout: int,
-    *,
-    spare_live_process: bool = False,
 ) -> Path | str:
     """Take the lock of `directory` from a run that is gone, writing `record` in it.
 
     The gone run (see `gone_reason`) is journaled first, as a failed run with the
     `task_id`, `ticket_key` and `start` of its lock record and the reason it is gone
-    in `errors`; a torn last journal line is set aside before. With
-    `spare_live_process`, a run whose process still runs (see `lock_process_runs`) is
-    not gone. Returns the lock file path, or why the lock cannot be taken: its run is
+    in `errors`; a torn last journal line is set aside before. Returns the lock file
+    path, or why the lock cannot be taken: its run is
     not gone, another run took it first, both `Benign`, or a file cannot be read or
     written. Never raises on a file error.
     """
@@ -1799,11 +1819,7 @@ def take_over_lock(
         seen = (directory / LOCK_FILE).read_bytes()
         held = parse_lock(seen)
         reason = gone_reason(directory, held, timeout)
-        if (
-            reason is None
-            or (spare_live_process and lock_process_runs(held))
-            or not remove_lock_if_unchanged(directory, seen)
-        ):
+        if reason is None or not remove_lock_if_unchanged(directory, seen):
             return in_progress
     except FileNotFoundError:
         return in_progress
@@ -1848,7 +1864,8 @@ def read_health(instance_path: Path) -> Health:
     `unreachable_connector`), or the Docker daemon cannot be reached (see
     `unreachable_docker`); `degraded`
     when the run holding the lock is gone (see `gone_reason`), which the next run mends
-    by taking the lock over, or the journal holds a torn line (see
+    by taking the lock over, or overdue (see `overdue_reason`), or the journal holds a
+    torn line (see
     `torn_journal_line`); `ok` otherwise. Writes nothing and never raises.
     """
     loaded = load_checked_instance(instance_path)
@@ -1876,9 +1893,14 @@ def read_health(instance_path: Path) -> Health:
         return Health(status="down", reason=writable_text(no_docker), active=True)
     lock = read_lock(directory)
     timeout = instance.limits["run_timeout_seconds"]
-    gone = None if lock is None else gone_reason(directory, lock, timeout)
-    if gone is not None:
-        return Health(status="degraded", reason=writable_text(gone), active=True)
+    stale = (
+        None
+        if lock is None
+        else gone_reason(directory, lock, timeout)
+        or overdue_reason(directory, lock, timeout)
+    )
+    if stale is not None:
+        return Health(status="degraded", reason=writable_text(stale), active=True)
     torn = torn_journal_line(directory)
     if torn is not None:
         return Health(status="degraded", reason=writable_text(torn), active=True)

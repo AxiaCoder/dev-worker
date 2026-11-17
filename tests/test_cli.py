@@ -4620,6 +4620,30 @@ def test_health_is_degraded_when_the_run_holding_the_lock_outlives_the_timeout(
 
 
 @pytest.mark.usefixtures("frozen_now")
+def test_health_is_degraded_naming_the_live_process_of_a_lock_beyond_the_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    pid = os.getpid()
+    hold_lock(instance, lock_of(1801, pid=pid))
+    monkeypatch.setattr(cli, "process_runs_since", lambda pid, moment: True)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert answer == {
+        "status": "degraded",
+        "reason": (
+            f"The run holding the lock of instance directory "
+            f"'{instance.with_suffix('')}' started 1801 seconds ago, beyond the "
+            f"run timeout of 1800 seconds; its process {pid} still runs, so the "
+            f"lock is not taken over."
+        ),
+        "active": True,
+    }
+
+
+@pytest.mark.usefixtures("frozen_now")
 @pytest.mark.parametrize("seconds_ago", [1800, 0])
 def test_health_is_ok_while_the_run_holding_the_lock_is_within_the_timeout(
     monkeypatch: pytest.MonkeyPatch,
@@ -4899,18 +4923,60 @@ def assert_taken_over(
 
 
 @pytest.mark.usefixtures("frozen_now")
-def test_run_takes_over_a_lock_held_beyond_the_timeout_and_journals_the_gone_run(
+def test_run_takes_over_a_lock_without_a_process_held_beyond_the_timeout(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
 ) -> None:
-    hold_lock(instance, lock_of(1801, pid=os.getpid()))
+    hold_lock(instance, lock_of(1801))
 
     answer = run_mandate(
         monkeypatch, capsysbinary, encode(valid_input()), instance=instance
     )
 
     assert_taken_over(answer, instance, gone_line(1801, timed_out(instance, 1801)))
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_run_refuses_a_lock_held_beyond_the_timeout_while_its_process_still_runs(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    content = lock_of(1801, pid=os.getpid())
+    lock = hold_lock(instance, content)
+    monkeypatch.setattr(cli, "process_runs_since", lambda pid, moment: True)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", "A run is already in progress")
+    assert lock.read_bytes() == content
+    assert journal_lines(instance) == []
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_run_takes_over_a_lock_held_beyond_the_timeout_whose_process_is_gone(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    hold_lock(instance, lock_of(1801, pid=dead_pid()))
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed"
+    old, running, own = journal_lines(instance)
+    assert {key: old[key] for key in ("task_id", "ticket_key", "status")} == {
+        "task_id": "old",
+        "ticket_key": "DEMO-7",
+        "status": "failed",
+    }
+    assert running["status"] == "running"
+    assert own["status"] == "completed"
 
 
 @pytest.mark.usefixtures("frozen_now")
@@ -5226,6 +5292,118 @@ def test_health_ignores_a_gone_process_when_the_lock_has_no_usable_start(
     hold_lock(instance, json.dumps({"pid": dead_pid()}).encode())
 
     assert health(monkeypatch, capsysbinary, instance)["status"] == "ok"
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_health_names_the_gone_process_rather_than_the_timeout_of_a_lock_beyond_it(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    pid = dead_pid()
+    hold_lock(instance, lock_of(1801, pid=pid))
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert answer == {
+        "status": "degraded",
+        "reason": process_gone(instance, pid),
+        "active": True,
+    }
+
+
+@pytest.mark.usefixtures("frozen_now")
+@pytest.mark.parametrize("seconds_ago", [1800, 0])
+def test_health_is_ok_while_the_live_process_of_the_lock_is_within_the_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    seconds_ago: int,
+) -> None:
+    hold_lock(instance, lock_of(seconds_ago, pid=os.getpid()))
+    monkeypatch.setattr(cli, "process_runs_since", lambda pid, moment: True)
+
+    assert health(monkeypatch, capsysbinary, instance) == {
+        "status": "ok",
+        "reason": None,
+        "active": True,
+    }
+
+
+@pytest.mark.usefixtures("frozen_now")
+@pytest.mark.parametrize("pid", [True, 0, -1, "1", 1.0, None])
+def test_health_ages_a_lock_whose_pid_is_not_a_positive_integer_by_the_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    pid: object,
+) -> None:
+    hold_lock(instance, lock_of(1801, pid=pid))
+    monkeypatch.setattr(cli, "process_runs_since", lambda pid, moment: True)
+
+    assert health(monkeypatch, capsysbinary, instance) == {
+        "status": "degraded",
+        "reason": timed_out(instance, 1801),
+        "active": True,
+    }
+
+
+@pytest.mark.usefixtures("frozen_now")
+@pytest.mark.parametrize("start", [None, "yesterday", "2026-11-05T10:00:00"])
+def test_health_ages_a_lock_with_a_live_pid_but_no_usable_start_by_the_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    start: object,
+) -> None:
+    record: dict[str, object] = {"pid": os.getpid()}
+    if start is not None:
+        record["start"] = start
+    lock = hold_lock(instance, json.dumps(record).encode())
+    modified = NOW.timestamp() - 1801
+    os.utime(lock, (modified, modified))
+    monkeypatch.setattr(cli, "process_runs_since", lambda pid, moment: True)
+
+    answer = health(monkeypatch, capsysbinary, instance)
+
+    assert answer["status"] == "degraded"
+    assert str(answer["reason"]).endswith("beyond the run timeout of 1800 seconds.")
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_run_journals_a_run_gone_beyond_the_timeout_by_its_gone_process(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    pid = dead_pid()
+    hold_lock(instance, lock_of(1801, pid=pid))
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed"
+    assert journal_lines(instance)[0]["errors"] == [process_gone(instance, pid)]
+
+
+@pytest.mark.usefixtures("frozen_now")
+def test_wake_does_not_take_over_a_lock_within_the_timeout_while_its_process_runs(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    content = lock_of(60, pid=os.getpid(), ticket_key="DEMO-1")
+    lock = hold_lock(instance, content)
+    monkeypatch.setattr(cli, "process_runs_since", lambda pid, moment: True)
+    stub = timeline(monkeypatch, *DEAD_RUN)
+
+    code, _ = wake(capsysbinary, instance)
+
+    assert code == 0
+    assert stub.comments == []
+    assert stub.moves == []
+    assert lock.read_bytes() == content
 
 
 class Unreachable:
