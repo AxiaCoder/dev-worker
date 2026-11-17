@@ -12,7 +12,7 @@ Out of V1: a framing mandate, narrow mandates, connectors beyond Jira and GitHub
 
 ## Adding an instance
 
-An instance is one YAML file that points the worker at a tracker project and a repository. It is read against the header of [`WORKER.md`](src/dev_worker/WORKER.md) and refused if it loosens it.
+An instance is one YAML file that points the worker at a tracker project and a repository. It is read against the header of [`WORKER.md`](src/dev_worker/WORKER.md) and refused if it loosens it, or tightens `run_timeout_seconds` so far that a run has no time left for its agent.
 
 1. Copy [`examples/instance.yaml`](examples/instance.yaml) to a place **outside this repository**.
 2. Set the tracker site address (`site`), the email of its account (`user`), the tracker project and the repository name.
@@ -23,7 +23,7 @@ An instance is one YAML file that points the worker at a tracker project and a r
 7. Under `hold_merge_label`, name the ticket label that holds a merge back: a ticket carrying it keeps its pull request open.
 8. Under `agent.provider`, choose how the agent signs in: `subscription` for a Claude Code OAuth token, `api_key` for an Anthropic API key.
 9. Write the name of the environment variable that holds each token — the tracker's under `tracker.token_env`, the credential of the agent's provider under `agent.token_env`, and two for the repository: the agent's under `repository.agent_token_env`, the worker's under `repository.worker_token_env`, each in its own variable — and set those variables in the worker's environment. The file never holds a token. A run hands the tracker token, the agent credential, the agent's repository token, the tracker site and its account to its container, and nothing else from the worker's environment: the worker's repository token stays with the worker, which merges with it (see [Protecting the base branch](#protecting-the-base-branch)).
-10. Optionally, tighten a limit under `limits`; a value above the header ceiling is refused.
+10. Optionally, tighten a limit under `limits`; a value above the header ceiling is refused, and so is a `run_timeout_seconds` that does not exceed `review_timeout_seconds` plus the 180 seconds kept for the agent to wait for the CI.
 
 Real instances and secrets stay outside the repository: the file under `examples/` is fictional and is the only instance committed here.
 
