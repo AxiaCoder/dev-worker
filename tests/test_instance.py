@@ -5,7 +5,12 @@ import pytest
 from pydantic import ValidationError
 
 from dev_worker.header import Header
-from dev_worker.instance import Instance, InstanceError, load_instance
+from dev_worker.instance import (
+    CI_WAIT_MARGIN_SECONDS,
+    Instance,
+    InstanceError,
+    load_instance,
+)
 
 HEADER = Header.model_validate(
     {
@@ -110,6 +115,46 @@ def test_looser_limit_is_refused(tmp_path: Path) -> None:
         match="limits.max_turns: 80 is looser than the header ceiling 60",
     ):
         load(tmp_path, VALID.replace("max_turns: 40", "max_turns: 80"))
+
+
+REVIEWED_HEADER = HEADER.model_copy(
+    update={
+        "ceilings": {
+            "run_timeout_seconds": 1800,
+            "review_timeout_seconds": 600,
+            "max_turns": 60,
+        }
+    }
+)
+CI_WAIT_MARGIN = CI_WAIT_MARGIN_SECONDS
+
+
+def load_reviewed(tmp_path: Path, run_timeout: int) -> Instance:
+    """Load `VALID` with `run_timeout` as its run timeout, against a header reserving 600 s for review."""
+    text = VALID + f"  run_timeout_seconds: {run_timeout}\n"
+    return load_instance(write(tmp_path, text), REVIEWED_HEADER)
+
+
+@pytest.mark.parametrize("run_timeout", [600, 600 + CI_WAIT_MARGIN])
+def test_run_timeout_leaving_no_room_past_the_review_and_ci_margin_is_refused(
+    tmp_path: Path, run_timeout: int
+) -> None:
+    with pytest.raises(InstanceError) as raised:
+        load_reviewed(tmp_path, run_timeout)
+
+    message = str(raised.value)
+    assert "run_timeout_seconds" in message
+    assert str(run_timeout) in message
+    assert "600" in message
+    assert str(CI_WAIT_MARGIN) in message
+
+
+def test_run_timeout_one_second_past_the_review_and_ci_margin_loads(
+    tmp_path: Path,
+) -> None:
+    instance = load_reviewed(tmp_path, 600 + CI_WAIT_MARGIN + 1)
+
+    assert instance.limits["run_timeout_seconds"] == 781
 
 
 def test_unknown_limit_is_refused(tmp_path: Path) -> None:

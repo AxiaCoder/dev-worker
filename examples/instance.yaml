@@ -53,6 +53,7 @@ hold_merge_label: hold-merge
 # Optional. Each limit may only tighten the header ceiling of the same name; review_max_turns
 # caps the turns of the guard review a pull request gets before its merge, review_timeout_seconds
 # the seconds of the run kept for that review, and max_attempts the runs that may die on a ticket
-# before the worker blocks it.
+# before the worker blocks it. run_timeout_seconds must exceed review_timeout_seconds by more
+# than the 180 seconds kept for the agent to wait for the CI.
 limits:
   max_turns: 40

@@ -39,6 +39,7 @@ from dev_worker.contract import (
 from dev_worker.github import GitHubRepository
 from dev_worker.header import HeaderError, WorkerFile, load_worker_file
 from dev_worker.instance import (
+    CI_WAIT_MARGIN_SECONDS,
     Instance,
     InstanceError,
     Provider,
@@ -92,7 +93,6 @@ RECENT_RUNS = 10
 CLAIM_TAKE_LIMIT_SECONDS = 300
 CLAIM_EXPIRY_SECONDS = 600
 TAKE_DATING_LIMIT_SECONDS = CLAIM_TAKE_LIMIT_SECONDS + TWG_TIMEOUT_SECONDS
-CI_WAIT_MARGIN_SECONDS = 180
 
 
 class Benign(str):
@@ -1150,9 +1150,10 @@ def run_container(
     is missing.
     `began` is the `time.monotonic()` reading taken when the run started; the
     container's time is `run_timeout_seconds` minus the seconds elapsed since, minus
-    the `review_timeout_seconds` kept for the guard review. None left: the container is
-    not started. The prompt carries the CI deadline, in UTC: the moment the container's
-    time runs out, read from `datetime.now`, less `CI_WAIT_MARGIN_SECONDS`. The outcome
+    the `review_timeout_seconds` kept for the guard review. No more than
+    `CI_WAIT_MARGIN_SECONDS` left: the container is not started. The prompt carries the
+    CI deadline, in UTC: the moment the container's time runs out, read from
+    `datetime.now`, less `CI_WAIT_MARGIN_SECONDS`. The outcome
     is read from what the container wrote (see `read_outcome`); a container that cannot
     be run, or reaches the ceiling, gives none.
     """
@@ -1164,6 +1165,13 @@ def run_container(
             f"The container was not started: the run ceiling of {ceiling} seconds, "
             f"less the {reserve} seconds kept for the guard review, was reached "
             "before it."
+        )
+    if left <= CI_WAIT_MARGIN_SECONDS:
+        return (
+            f"The container was not started: the run ceiling of {ceiling} seconds, "
+            f"less the {reserve} seconds kept for the guard review, left no more than "
+            f"the {CI_WAIT_MARGIN_SECONDS} seconds kept for the agent to wait for the "
+            "CI and end."
         )
     environment = container_environment(instance)
     if isinstance(environment, str):

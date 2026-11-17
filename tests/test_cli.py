@@ -2078,7 +2078,7 @@ def test_container_runs_under_the_run_timeout_of_the_instance_less_its_review_re
     container: FakeContainer,
 ) -> None:
     with instance.open("a", encoding="utf-8") as file:
-        file.write("  run_timeout_seconds: 5\n  review_timeout_seconds: 1\n")
+        file.write("  run_timeout_seconds: 200\n  review_timeout_seconds: 1\n")
 
     run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
 
@@ -2087,7 +2087,7 @@ def test_container_runs_under_the_run_timeout_of_the_instance_less_its_review_re
     assert reviewed[0] == "run"
     assert (step, worktree, checkout) == ("run", Path("worktree"), CHECKOUT)
     assert isinstance(time_left, float)
-    assert 3 < time_left <= 4
+    assert 198 < time_left <= 199
 
 
 def test_prompt_carries_the_ci_deadline_of_the_container_time_less_the_margin(
@@ -2197,6 +2197,40 @@ def test_run_that_reached_its_ceiling_before_the_container_fails_without_startin
     assert container.calls == [("check_none_running",)]
     assert ran == []
     assert workspace.calls[-2:] == [RESCUED, ("close", "agent/DEMO-1")]
+
+
+def test_run_left_with_only_the_ci_margin_fails_without_starting_the_container(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    container: FakeContainer,
+) -> None:
+    slow_refresh(monkeypatch, workspace, 1200 - 180)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", "The container was not started")
+    assert_failed(answer, "task-1", "180 seconds")
+    assert_failed(answer, "task-1", "CI")
+    assert container.calls == [("check_none_running",)]
+    assert workspace.calls[-2:] == [RESCUED, ("close", "agent/DEMO-1")]
+
+
+def test_run_left_one_second_past_the_ci_margin_starts_the_container(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    container: FakeContainer,
+) -> None:
+    slow_refresh(monkeypatch, workspace, 1200 - 181)
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert container.calls[0] == ("run", workspace.worktree, 181, CHECKOUT)
 
 
 def test_container_that_fails_fails_the_run_naming_why_without_the_mandate(
@@ -4605,13 +4639,13 @@ def test_health_uses_the_run_timeout_of_the_instance(
     instance: Path,
 ) -> None:
     with instance.open("a", encoding="utf-8") as file:
-        file.write("  run_timeout_seconds: 60\n")
-    hold_lock(instance, lock_started(61))
+        file.write("  run_timeout_seconds: 900\n")
+    hold_lock(instance, lock_started(901))
 
     answer = health(monkeypatch, capsysbinary, instance)
 
     assert answer["status"] == "degraded"
-    assert "run timeout of 60 seconds" in str(answer["reason"])
+    assert "run timeout of 900 seconds" in str(answer["reason"])
 
 
 @pytest.mark.usefixtures("frozen_now")
