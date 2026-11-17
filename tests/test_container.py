@@ -3,6 +3,7 @@ import re
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,7 @@ OWNER = "/srv/instances/demo"
 PLUGIN = Path("instance", "plugin")
 COMMAND = ("claude", "-p", "Ticket: ABC-1")
 OUTCOMES = ("done", "blocked", "needs_human", "abandoned")
+DEADLINE = datetime(2026, 11, 17, 10, 30, tzinfo=UTC)
 TICKET = Ticket(
     key="ABC-1",
     status="To Do",
@@ -193,10 +195,15 @@ def test_run_hands_the_container_no_variable_of_the_worker_but_those_it_names(
     )
 
 
-def test_ticket_prompt_holds_the_key_title_and_description() -> None:
-    assert ticket_prompt(TICKET) == (
+def test_ticket_prompt_holds_the_key_title_ci_deadline_in_utc_and_description() -> None:
+    deadline = datetime(
+        2026, 11, 17, 11, 30, 5, 900000, tzinfo=timezone(timedelta(hours=1))
+    )
+
+    assert ticket_prompt(TICKET, deadline) == (
         "Ticket: ABC-1\n"
         "Title: Add a login page\n"
+        "CI deadline: 2026-11-17T10:30:05Z\n"
         "\n"
         "Description:\n"
         "The page asks for an email.\nThen a password.\n"
@@ -218,12 +225,12 @@ def test_outcome_schema_requires_one_of_the_outcomes_and_a_message() -> None:
 def test_agent_command_runs_claude_headless_with_the_rules_plugin_turns_and_schema() -> (
     None
 ):
-    command = agent_command(TICKET, "# Worker\nRules.\n", 40, OUTCOMES)
+    command = agent_command(TICKET, "# Worker\nRules.\n", 40, OUTCOMES, DEADLINE)
 
     assert command == (
         "claude",
         "-p",
-        ticket_prompt(TICKET),
+        ticket_prompt(TICKET, DEADLINE),
         "--append-system-prompt",
         "# Worker\nRules.\n",
         "--plugin-dir",

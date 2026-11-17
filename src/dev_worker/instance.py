@@ -31,6 +31,7 @@ IMAGE_REFERENCE = re.compile(
     r"(?:@(?P<digest>sha256:[0-9a-f]{64}|sha384:[0-9a-f]{96}|sha512:[0-9a-f]{128}))?"
 )
 PATH_LENGTH_MAX = 255
+CI_WAIT_MARGIN_SECONDS = 180
 _DOCKER_HUB_HOSTS = (None, "docker.io", "index.docker.io")
 _OFFICIAL_PREFIX = "library/"
 
@@ -246,7 +247,12 @@ def _status_problems(statuses: Mapping[str, str], header: Header) -> list[str]:
 
 
 def _limit_problems(limits: Mapping[str, int], header: Header) -> list[str]:
-    """Return one sentence per limit of `limits` unknown to `header`, or looser than its ceiling."""
+    """Return one sentence per limit of `limits` unknown to `header`, or looser than its ceiling.
+
+    Adds a sentence when `header` has a `review_timeout_seconds` ceiling and the effective
+    `run_timeout_seconds` is not above the effective `review_timeout_seconds` plus
+    `CI_WAIT_MARGIN_SECONDS`, which would leave the container no time to start.
+    """
     problems: list[str] = []
     for name, value in limits.items():
         ceiling = header.ceilings.get(name)
@@ -256,6 +262,16 @@ def _limit_problems(limits: Mapping[str, int], header: Header) -> list[str]:
         elif value > ceiling:
             problems.append(
                 f"limits.{name}: {value} is looser than the header ceiling {ceiling}"
+            )
+    effective = {**header.ceilings, **limits}
+    if "review_timeout_seconds" in effective:
+        run = effective["run_timeout_seconds"]
+        review = effective["review_timeout_seconds"]
+        if run <= review + CI_WAIT_MARGIN_SECONDS:
+            problems.append(
+                f"limits.run_timeout_seconds: {run} leaves the container no time, it"
+                f" must exceed the {review} seconds of review_timeout_seconds plus the"
+                f" {CI_WAIT_MARGIN_SECONDS} seconds kept for the agent to wait for the CI"
             )
     return problems
 
@@ -296,7 +312,9 @@ def load_instance(path: Path, header: Header) -> Instance:
     Raises `InstanceError` when the file is not valid UTF-8, is not valid YAML (a key repeated
     within one mapping included), nests too deeply to be read, does not match the instance shape, maps a status key the header does not
     declare or leaves one unmapped, maps two status keys to the same real status name, sets
-    a limit the header has no ceiling for, sets a limit above its ceiling, or names the
+    a limit the header has no ceiling for, sets a limit above its ceiling, leaves an
+    effective `run_timeout_seconds` not above the effective `review_timeout_seconds` plus
+    `CI_WAIT_MARGIN_SECONDS` when the header has a review ceiling, or names the
     same variable for the agent's and the worker's repository tokens. The message
     names key paths, lines and columns, and quotes no value written in the file but a
     shared real status name.

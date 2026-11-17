@@ -39,6 +39,7 @@ from dev_worker.contract import (
 from dev_worker.github import GitHubRepository
 from dev_worker.header import HeaderError, WorkerFile, load_worker_file
 from dev_worker.instance import (
+    CI_WAIT_MARGIN_SECONDS,
     Instance,
     InstanceError,
     Provider,
@@ -1147,23 +1148,39 @@ def run_container(
     `max_turns` limit of `instance` and the outcomes of the header of `worker`; it
     receives the variables `container_environment` gives, and is not started when one
     is missing.
-    `began` is the `time.monotonic()` reading taken when the run started; the time left
-    is `run_timeout_seconds` minus the seconds elapsed since. None left: the container
-    is not started. The outcome is read from what the container wrote (see
-    `read_outcome`); a container that cannot be run, or reaches the ceiling, gives none.
+    `began` is the `time.monotonic()` reading taken when the run started; the
+    container's time is `run_timeout_seconds` minus the seconds elapsed since, minus
+    the `review_timeout_seconds` kept for the guard review. No more than
+    `CI_WAIT_MARGIN_SECONDS` left: the container is not started. The prompt carries the
+    CI deadline, in UTC: the moment the container's time runs out, read from
+    `datetime.now`, less `CI_WAIT_MARGIN_SECONDS`. The outcome
+    is read from what the container wrote (see `read_outcome`); a container that cannot
+    be run, or reaches the ceiling, gives none.
     """
     ceiling = instance.limits["run_timeout_seconds"]
-    left = ceiling - (time.monotonic() - began)
+    reserve = instance.limits["review_timeout_seconds"]
+    left = ceiling - (time.monotonic() - began) - reserve
     if left <= 0:
         return (
-            f"The container was not started: the run ceiling of {ceiling} seconds "
-            "was reached before it."
+            f"The container was not started: the run ceiling of {ceiling} seconds, "
+            f"less the {reserve} seconds kept for the guard review, was reached "
+            "before it."
+        )
+    if left <= CI_WAIT_MARGIN_SECONDS:
+        return (
+            f"The container was not started: the run ceiling of {ceiling} seconds, "
+            f"less the {reserve} seconds kept for the guard review, left no more than "
+            f"the {CI_WAIT_MARGIN_SECONDS} seconds kept for the agent to wait for the "
+            "CI and end."
         )
     environment = container_environment(instance)
     if isinstance(environment, str):
         return environment
     outcomes = list(worker.header.outcomes.model_dump())
-    command = agent_command(ticket, worker.body, instance.limits["max_turns"], outcomes)
+    ci_deadline = datetime.now(UTC) + timedelta(seconds=left - CI_WAIT_MARGIN_SECONDS)
+    command = agent_command(
+        ticket, worker.body, instance.limits["max_turns"], outcomes, ci_deadline
+    )
     try:
         exited = make_container(instance.container.image, directory).run(
             worktree, left, plugin, command, environment

@@ -1830,7 +1830,7 @@ def test_container_runs_from_the_instance_image_on_the_worktree_before_the_manda
                 ("refresh",),
                 ("open", "agent/DEMO-1"),
             ],
-            [("run", workspace.worktree, 1800, CHECKOUT)],
+            [("run", workspace.worktree, 1200, CHECKOUT)],
         )
     ]
 
@@ -1839,8 +1839,12 @@ def test_container_runs_claude_on_the_ticket_with_the_worker_rules_and_only_the_
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
+    workspace: FakeWorkspace,
     container: FakeContainer,
+    frozen_now: datetime,
 ) -> None:
+    slow_refresh(monkeypatch, workspace, 0)
+
     answer = run_mandate(
         monkeypatch, capsysbinary, encode(valid_input()), instance=instance
     )
@@ -1854,6 +1858,7 @@ def test_container_runs_claude_on_the_ticket_with_the_worker_rules_and_only_the_
             worker.body,
             40,
             ["done", "blocked", "needs_human", "abandoned"],
+            frozen_now + timedelta(seconds=1020),
         ),
         review_command(BASE_COMMIT, PULL.head, 40),
     ]
@@ -2066,14 +2071,14 @@ def test_make_plugin_keeps_the_checkout_in_the_instance_directory(
     assert made.checkout == tmp_path / "plugin"
 
 
-def test_container_runs_under_the_run_timeout_of_the_instance(
+def test_container_runs_under_the_run_timeout_of_the_instance_less_its_review_reserve(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
     container: FakeContainer,
 ) -> None:
     with instance.open("a", encoding="utf-8") as file:
-        file.write("  run_timeout_seconds: 5\n")
+        file.write("  run_timeout_seconds: 200\n  review_timeout_seconds: 1\n")
 
     run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
 
@@ -2082,7 +2087,23 @@ def test_container_runs_under_the_run_timeout_of_the_instance(
     assert reviewed[0] == "run"
     assert (step, worktree, checkout) == ("run", Path("worktree"), CHECKOUT)
     assert isinstance(time_left, float)
-    assert 4 < time_left <= 5
+    assert 198 < time_left <= 199
+
+
+def test_prompt_carries_the_ci_deadline_of_the_container_time_less_the_margin(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    container: FakeContainer,
+    frozen_now: datetime,
+) -> None:
+    slow_refresh(monkeypatch, workspace, 600)
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    prompt = container.commands[0][2]
+    assert "\nCI deadline: 2026-11-05T12:07:00Z\n" in prompt
 
 
 def slow_refresh(
@@ -2112,7 +2133,7 @@ def test_container_is_given_the_time_left_once_the_worktree_is_ready(
     run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
 
     assert container.calls == [
-        ("run", workspace.worktree, 1200, CHECKOUT),
+        ("run", workspace.worktree, 600, CHECKOUT),
         ("check_none_running",),
         ("run", workspace.review, 600, CHECKOUT),
     ]
@@ -2137,13 +2158,13 @@ def test_container_time_left_counts_the_time_spent_taking_the_ticket(
     run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
 
     assert container.calls == [
-        ("run", workspace.worktree, 1500, CHECKOUT),
+        ("run", workspace.worktree, 900, CHECKOUT),
         ("check_none_running",),
         ("run", workspace.review, 1500, CHECKOUT),
     ]
 
 
-@pytest.mark.parametrize("seconds", [1800, 2400])
+@pytest.mark.parametrize("seconds", [1200, 2400])
 def test_run_that_reached_its_ceiling_before_the_container_fails_without_starting_it(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
@@ -2170,12 +2191,46 @@ def test_run_that_reached_its_ceiling_before_the_container_fails_without_startin
     assert_failed(
         answer,
         "task-1",
-        "The container was not started: the run ceiling of 1800 seconds "
-        "was reached before it.",
+        "The container was not started: the run ceiling of 1800 seconds, less the "
+        "600 seconds kept for the guard review, was reached before it.",
     )
     assert container.calls == [("check_none_running",)]
     assert ran == []
     assert workspace.calls[-2:] == [RESCUED, ("close", "agent/DEMO-1")]
+
+
+def test_run_left_with_only_the_ci_margin_fails_without_starting_the_container(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    container: FakeContainer,
+) -> None:
+    slow_refresh(monkeypatch, workspace, 1200 - 180)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_failed(answer, "task-1", "The container was not started")
+    assert_failed(answer, "task-1", "180 seconds")
+    assert_failed(answer, "task-1", "CI")
+    assert container.calls == [("check_none_running",)]
+    assert workspace.calls[-2:] == [RESCUED, ("close", "agent/DEMO-1")]
+
+
+def test_run_left_one_second_past_the_ci_margin_starts_the_container(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    container: FakeContainer,
+) -> None:
+    slow_refresh(monkeypatch, workspace, 1200 - 181)
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert container.calls[0] == ("run", workspace.worktree, 181, CHECKOUT)
 
 
 def test_container_that_fails_fails_the_run_naming_why_without_the_mandate(
@@ -4584,13 +4639,13 @@ def test_health_uses_the_run_timeout_of_the_instance(
     instance: Path,
 ) -> None:
     with instance.open("a", encoding="utf-8") as file:
-        file.write("  run_timeout_seconds: 60\n")
-    hold_lock(instance, lock_started(61))
+        file.write("  run_timeout_seconds: 900\n")
+    hold_lock(instance, lock_started(901))
 
     answer = health(monkeypatch, capsysbinary, instance)
 
     assert answer["status"] == "degraded"
-    assert "run timeout of 60 seconds" in str(answer["reason"])
+    assert "run timeout of 900 seconds" in str(answer["reason"])
 
 
 @pytest.mark.usefixtures("frozen_now")
@@ -5873,10 +5928,10 @@ def test_ceiling_reached_before_the_container_comments_why_and_moves_the_ticket_
     workspace: FakeWorkspace,
 ) -> None:
     stub = serve(monkeypatch, demo_ticket())
-    slow_refresh(monkeypatch, workspace, 1800)
+    slow_refresh(monkeypatch, workspace, 1200)
     reason = (
-        "The container was not started: the run ceiling of 1800 seconds "
-        "was reached before it."
+        "The container was not started: the run ceiling of 1800 seconds, less the "
+        "600 seconds kept for the guard review, was reached before it."
     )
 
     answer = run_mandate(
@@ -7214,7 +7269,7 @@ def uncreatable_directory(setup: Wake) -> None:
         (overdue_claims, "were read back more than 300 seconds"),
         (unpreparable_worktree, "The worktree cannot be prepared: refresh broke"),
         (failing_container, "The container failed: docker failed while running"),
-        (ceiling_reached, "the run ceiling of 1800 seconds was reached"),
+        (ceiling_reached, "less the 600 seconds kept for the guard review"),
         (unreadable_outcome, "The run ended without a usable outcome"),
         (uncreatable_directory, "cannot be created"),
     ],
