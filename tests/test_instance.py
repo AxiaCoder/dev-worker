@@ -41,6 +41,8 @@ repository:
 agent:
   provider: subscription
   token_env: CLAUDE_CODE_OAUTH_TOKEN
+  model: opus
+  review_model: claude-sonnet-4-5
 branch: agent/{key}
 container:
   image: python:3.12-slim
@@ -82,6 +84,8 @@ def test_valid_instance_loads(tmp_path: Path) -> None:
     assert instance.repository.worker_token_env == "GITHUB_WORKER_TOKEN"
     assert instance.agent.provider == "subscription"
     assert instance.agent.token_env == "CLAUDE_CODE_OAUTH_TOKEN"
+    assert instance.agent.model == "opus"
+    assert instance.agent.review_model == "claude-sonnet-4-5"
     assert instance.statuses == {
         "ready": "To Do",
         "in_progress": "In Progress",
@@ -356,6 +360,8 @@ def test_invalid_field_is_refused(
         ("hold_merge_label: hold-merge", "hold_merge_label"),
         ("name: example/project", "repository.name"),
         ("blocked: Blocked", "statuses.blocked"),
+        ("  model: opus", "agent.model"),
+        ("review_model: claude-sonnet-4-5", "agent.review_model"),
     ],
 )
 @pytest.mark.parametrize("blank", ['" "', '"   "', '"\\t"', '" \\t "'])
@@ -412,7 +418,8 @@ def test_status_name_with_surrounding_blanks_is_kept_as_written(
         (VALID.split("statuses:")[0], "statuses: Field required"),
         (
             VALID.replace(
-                "agent:\n  provider: subscription\n  token_env: CLAUDE_CODE_OAUTH_TOKEN\n",
+                "agent:\n  provider: subscription\n  token_env: CLAUDE_CODE_OAUTH_TOKEN\n"
+                "  model: opus\n  review_model: claude-sonnet-4-5\n",
                 "",
             ),
             "agent: Field required",
@@ -428,9 +435,17 @@ def test_status_name_with_surrounding_blanks_is_kept_as_written(
         (
             VALID.replace(
                 "  token_env: CLAUDE_CODE_OAUTH_TOKEN\n",
-                "  token_env: CLAUDE_CODE_OAUTH_TOKEN\n  model: x\n",
+                "  token_env: CLAUDE_CODE_OAUTH_TOKEN\n  effort: high\n",
             ),
-            "agent.model: Extra inputs",
+            "agent.effort: Extra inputs",
+        ),
+        (
+            VALID.replace("  model: opus\n", ""),
+            "agent.model: Field required",
+        ),
+        (
+            VALID.replace("  review_model: claude-sonnet-4-5\n", ""),
+            "agent.review_model: Field required",
         ),
     ],
 )
