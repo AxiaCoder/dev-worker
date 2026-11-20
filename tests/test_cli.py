@@ -8882,3 +8882,73 @@ def test_wake_that_loses_the_claim_leaves_a_ticket_with_an_empty_required_field_
     assert stub.comments == []
     assert stub.moves == []
     assert journal_lines(instance) == []
+
+
+class ChangedOnClaimTracker(ListingTracker):
+    """A `ListingTracker` whose reads answer `before` until a claim is posted, then `after`."""
+
+    def __init__(self, before: Ticket, after: Ticket) -> None:
+        super().__init__((before,), before)
+        self.after = after
+
+    def claim(self, key: str, task_id: str) -> int:
+        """Record the claim, then answer `after` to every later read."""
+        self.answer = self.after
+        return super().claim(key, task_id)
+
+
+def changed_on_claim(
+    monkeypatch: pytest.MonkeyPatch, before: Ticket, after: Ticket
+) -> ChangedOnClaimTracker:
+    """Make `wake` list and read `before`, then read `after` once its claim is posted; return the tracker."""
+    stub = ChangedOnClaimTracker(before, after)
+    monkeypatch.setattr(cli, "make_tracker", stub.make)
+    return stub
+
+
+def test_wake_blocks_a_ticket_whose_required_field_is_emptied_by_the_time_it_is_claimed(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+) -> None:
+    listed = replace(
+        demo_ticket(),
+        fields=(("Acceptance criteria", "It logs in."), ("Environment", "Staging")),
+    )
+    stub = changed_on_claim(monkeypatch, listed, unfilled_ticket())
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert code == 0
+    assert answer is not None
+    assert_failed(
+        answer,
+        answer["task_id"],
+        "Ticket 'DEMO-1' has empty required fields: Acceptance criteria.",
+    )
+    assert stub.moves == [("DEMO-1", "Blocked")]
+    assert container.commands == []
+    assert journal_lines(instance) == []
+
+
+def test_wake_runs_a_ticket_whose_required_field_is_filled_by_the_time_it_is_claimed_with_the_value_read_again(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+) -> None:
+    claimed = replace(
+        demo_ticket(),
+        fields=(("Acceptance criteria", "It logs in."), ("Environment", "Staging")),
+    )
+    stub = changed_on_claim(monkeypatch, unfilled_ticket(), claimed)
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert code == 0
+    assert answer is not None
+    assert answer["status"] == "completed"
+    assert stub.moves[0] == ("DEMO-1", "In Progress")
+    assert "Blocked" not in [status for _, status in stub.moves]
+    assert "It logs in." in container.commands[0][2]

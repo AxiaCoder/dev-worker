@@ -1500,7 +1500,7 @@ def test_read_asks_for_the_required_fields_and_gives_them_in_declared_order(
 def test_tickets_in_asks_for_the_required_fields_and_reads_them(
     record: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    filled = {**ITEM, "customfield_10042": "It logs in."}
+    filled = {**ITEM, "customfield_10042": "It logs in.", "environment": None}
     answer(monkeypatch, issues(filled))
 
     (ticket,) = requiring_tracker().tickets_in("À faire")
@@ -1539,7 +1539,10 @@ def test_without_required_fields_a_ticket_has_none(
 def test_a_required_field_is_read_as_text_whatever_its_readable_shape(
     record: Path, monkeypatch: pytest.MonkeyPatch, value: object, text: str
 ) -> None:
-    answer(monkeypatch, {"data": [{**ITEM, "customfield_10042": value}]})
+    answer(
+        monkeypatch,
+        {"data": [{**ITEM, "customfield_10042": value, "environment": None}]},
+    )
 
     fields = requiring_tracker().read("ABC-218").fields
 
@@ -1553,7 +1556,10 @@ def test_a_required_field_is_read_as_text_whatever_its_readable_shape(
 def test_an_empty_required_field_is_read_as_blank(
     record: Path, monkeypatch: pytest.MonkeyPatch, value: object
 ) -> None:
-    answer(monkeypatch, {"data": [{**ITEM, "customfield_10042": value}]})
+    answer(
+        monkeypatch,
+        {"data": [{**ITEM, "customfield_10042": value, "environment": None}]},
+    )
 
     ticket = requiring_tracker().read("ABC-218")
 
@@ -1574,3 +1580,21 @@ def test_a_required_field_of_an_unreadable_shape_raises_naming_it(
         TrackerError, match="field 'customfield_10042' of ticket ABC-218"
     ):
         requiring_tracker().read("ABC-218")
+
+
+def test_read_raises_naming_a_required_field_missing_from_the_answer(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, {"data": [{**ITEM, "environment": None}]})
+
+    with pytest.raises(TrackerError, match=r"customfield_10042.*ABC-218"):
+        requiring_tracker().read("ABC-218")
+
+
+def test_tickets_in_raises_naming_a_required_field_missing_from_the_answer(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, issues({**ITEM, "customfield_10042": "It logs in."}))
+
+    with pytest.raises(TrackerError, match=r"'environment'.*ABC-218"):
+        requiring_tracker().tickets_in("À faire")

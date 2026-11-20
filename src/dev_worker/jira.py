@@ -375,12 +375,18 @@ def _required_fields(
 ) -> tuple[tuple[str, str], ...]:
     """Return each field of `required` read from `item`, as its shown name and plain text, in order.
 
-    Raises `TrackerError` naming the field id when its value cannot be read as text.
+    A field the answer holds as null reads as empty. Raises `TrackerError` naming the
+    field id when the answer lacks it, or when its value cannot be read as text.
     """
     values = item.model_dump()
     fields: list[tuple[str, str]] = []
     for field_id, name in required.items():
-        text = _field_text(values.get(field_id))
+        if field_id not in values:
+            raise TrackerError(
+                f"field {field_id!r} is missing from the answer for ticket {item.key}:"
+                " the site has no field with this id"
+            )
+        text = _field_text(values[field_id])
         if text is None:
             raise TrackerError(
                 f"field {field_id!r} of ticket {item.key} holds a value that cannot be"

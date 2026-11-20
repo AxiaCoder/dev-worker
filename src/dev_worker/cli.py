@@ -334,8 +334,8 @@ def claim_ticket(
     instance: Instance,
     tracker: TicketTracker,
     start: ClaimStart,
-) -> str | None:
-    """Claim the ticket `key` for `task_id` through `tracker`; return why the run may not take it, or None.
+) -> Ticket | str:
+    """Claim the ticket `key` for `task_id` through `tracker`; return the ticket read again once the claim wins, or why the run may not take it.
 
     The claims posted since the ticket last entered the real status of the `ready` key
     are judged in the order of their ids: a claim wins unless an older winning claim was
@@ -346,7 +346,8 @@ def claim_ticket(
     cannot be read, whose claims are read back too late after `start` (see
     `claim_overdue`), or whose own claim is not found among them may not take it; the
     reason says whether the claim may have been posted. A run whose claim wins reads the
-    ticket again and may not take it unless it is still in the `ready` status. `start` is
+    ticket again and may not take it unless it is still in the `ready` status; that reading
+    is the ticket returned. `start` is
     taken right before the claim is posted. A claim that loses, and a ticket read again
     out of `ready`, give a `Benign` reason.
     """
@@ -406,7 +407,7 @@ def claim_ticket(
             f"Ticket {key!r} is no longer in {ready!r}: it is in {ticket.status!r}. "
             f"The claim of task {task_id!r} was posted."
         )
-    return None
+    return ticket
 
 
 def block_unfilled_ticket(
@@ -746,7 +747,8 @@ def run_journaled(
     The ticket key is checked first, then the ticket is read from the tracker and
     refused unless it is ready (see `read_ready_ticket`), then the lock is taken, or
     taken over from a run that is gone (see `take_over_lock`); a task_id already in the
-    journal is refused, otherwise the ticket is claimed for the run (see `claim_ticket`),
+    journal is refused, otherwise the ticket is claimed for the run (see `claim_ticket`)
+    and read again, and that reading, not the first, is
     blocked when a field the instance requires is empty (see `block_unfilled_ticket`),
     and otherwise moved to the real status of the `in_progress` key (see `take_ticket`)
     before the run is journaled. A refused run, a run whose ticket is blocked, and one
@@ -871,7 +873,9 @@ def run_under_lock(
     """Run `handler` unless its task_id is already journaled, journaling the run twice; return its output and whether the worker failed.
 
     `worker` is the `WORKER.md` the run follows and `ticket` the ticket as read before
-    the lock was taken (see `run_in_worktree`).
+    the lock was taken; once the claim wins, the ticket read again by `claim_ticket`
+    replaces it, both for the required fields check and for the run (see
+    `run_in_worktree`).
     Before anything is journaled, a worktree an earlier run left in `directory` is
     rescued and removed (see `rescue_left_worktree`); a run that cannot do so fails
     without taking its ticket nor being journaled. Then the ticket is claimed for the run
@@ -924,11 +928,14 @@ def run_under_lock(
     refusal = rescue_left_worktree(instance, directory)
     if refusal is None:
         claim_start = start_claim()
-        refusal = (
-            claim_ticket(ticket_key, task_id, instance, tracker, claim_start)
-            or block_unfilled_ticket(ticket, instance, tracker)
-            or take_ticket(ticket_key, task_id, instance, tracker, claim_start)
-        )
+        claimed = claim_ticket(ticket_key, task_id, instance, tracker, claim_start)
+        if isinstance(claimed, str):
+            refusal = claimed
+        else:
+            ticket = claimed
+            refusal = block_unfilled_ticket(ticket, instance, tracker) or take_ticket(
+                ticket_key, task_id, instance, tracker, claim_start
+            )
     if refusal is not None:
         return refused(task_id, refusal)
     entry: dict[str, object] = {
