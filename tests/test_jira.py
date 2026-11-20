@@ -1462,3 +1462,139 @@ def test_requeues_on_a_key_that_is_not_a_ticket_key_are_refused(record: Path) ->
     with pytest.raises(TrackerError, match="is not a Jira ticket key"):
         tracker().requeues("abc-218", frozenset({"Blocked"}))
     assert not record.exists()
+
+
+REQUIRING = TRACKER.model_copy(
+    update={
+        "required_fields": {
+            "customfield_10042": "Acceptance criteria",
+            "environment": "Environment",
+        }
+    }
+)
+
+
+def requiring_tracker() -> JiraTracker:
+    return JiraTracker(REQUIRING, command=[sys.executable, str(FAKE_TWG)])
+
+
+def test_read_asks_for_the_required_fields_and_gives_them_in_declared_order(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    filled = {**ITEM, "environment": "Staging", "customfield_10042": "It logs in."}
+    answer(monkeypatch, {"data": [filled]})
+
+    ticket = requiring_tracker().read("ABC-218")
+
+    assert ticket.fields == (
+        ("Acceptance criteria", "It logs in."),
+        ("Environment", "Staging"),
+    )
+    called = json.loads(record.read_text(encoding="utf-8"))
+    fields = called["argv"][called["argv"].index("--fields") + 1]
+    assert fields == (
+        "status,labels,issuelinks,summary,description,customfield_10042,environment"
+    )
+
+
+def test_tickets_in_asks_for_the_required_fields_and_reads_them(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    filled = {**ITEM, "customfield_10042": "It logs in.", "environment": None}
+    answer(monkeypatch, issues(filled))
+
+    (ticket,) = requiring_tracker().tickets_in("À faire")
+
+    assert ticket.fields == (
+        ("Acceptance criteria", "It logs in."),
+        ("Environment", ""),
+    )
+    called = json.loads(record.read_text(encoding="utf-8"))
+    fields = called["argv"][called["argv"].index("--fields") + 1]
+    assert fields.endswith(",customfield_10042,environment")
+
+
+def test_without_required_fields_a_ticket_has_none(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, {"data": [{**ITEM, "customfield_10042": "ignored"}]})
+
+    assert tracker().read("ABC-218").fields == ()
+
+
+@pytest.mark.parametrize(
+    ("value", "text"),
+    [
+        ("  Kept as it is\n", "  Kept as it is\n"),
+        (adf("From a document"), "From a document"),
+        ({"value": "Chrome", "id": "10001"}, "Chrome"),
+        ({"name": "Backend", "id": "10002"}, "Backend"),
+        (
+            [{"value": "Chrome"}, "Firefox", {"name": "Safari"}],
+            "Chrome, Firefox, Safari",
+        ),
+        ([{"value": ""}, "Firefox"], "Firefox"),
+    ],
+)
+def test_a_required_field_is_read_as_text_whatever_its_readable_shape(
+    record: Path, monkeypatch: pytest.MonkeyPatch, value: object, text: str
+) -> None:
+    answer(
+        monkeypatch,
+        {"data": [{**ITEM, "customfield_10042": value, "environment": None}]},
+    )
+
+    fields = requiring_tracker().read("ABC-218").fields
+
+    assert fields[0] == ("Acceptance criteria", text)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, "", "   \n", {"type": "doc", "version": 1, "content": []}, []],
+)
+def test_an_empty_required_field_is_read_as_blank(
+    record: Path, monkeypatch: pytest.MonkeyPatch, value: object
+) -> None:
+    answer(
+        monkeypatch,
+        {"data": [{**ITEM, "customfield_10042": value, "environment": None}]},
+    )
+
+    ticket = requiring_tracker().read("ABC-218")
+
+    assert ticket.fields[0][1].strip() == ""
+    assert ticket.empty_fields() == ("Acceptance criteria", "Environment")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [42, True, {"accountId": "abc"}, [{"accountId": "abc"}], [["nested"]], [1]],
+)
+def test_a_required_field_of_an_unreadable_shape_raises_naming_it(
+    record: Path, monkeypatch: pytest.MonkeyPatch, value: object
+) -> None:
+    answer(monkeypatch, {"data": [{**ITEM, "customfield_10042": value}]})
+
+    with pytest.raises(
+        TrackerError, match="field 'customfield_10042' of ticket ABC-218"
+    ):
+        requiring_tracker().read("ABC-218")
+
+
+def test_read_raises_naming_a_required_field_missing_from_the_answer(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, {"data": [{**ITEM, "environment": None}]})
+
+    with pytest.raises(TrackerError, match=r"customfield_10042.*ABC-218"):
+        requiring_tracker().read("ABC-218")
+
+
+def test_tickets_in_raises_naming_a_required_field_missing_from_the_answer(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, issues({**ITEM, "customfield_10042": "It logs in."}))
+
+    with pytest.raises(TrackerError, match=r"'environment'.*ABC-218"):
+        requiring_tracker().tickets_in("À faire")

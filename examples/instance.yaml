@@ -9,6 +9,13 @@ tracker:
   project: DEMO
   # The name of the environment variable that holds the token, never the token itself.
   token_env: JIRA_TOKEN
+  # Optional. The fields a ticket must fill before a run takes it: each Jira field id,
+  # customfield_ followed by digits or a lowercase system field name, mapped to the name the
+  # worker shows for it. A ticket that leaves one empty is commented on and moved to blocked;
+  # the agent gets the filled ones after the description, in this order.
+  required_fields:
+    customfield_10042: Acceptance criteria
+    environment: Environment
 
 repository:
   type: github

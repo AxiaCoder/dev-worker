@@ -61,18 +61,21 @@ class ContainerExit:
 
 
 def ticket_prompt(ticket: Ticket, ci_deadline: datetime) -> str:
-    """Return the prompt of a run on `ticket`: its key, title, CI deadline and description.
+    """Return the prompt of a run on `ticket`: its key, title, CI deadline, description and required fields.
 
     `ci_deadline` is an aware datetime, written in UTC to the second as
-    `YYYY-MM-DDTHH:MM:SSZ`.
+    `YYYY-MM-DDTHH:MM:SSZ`. Each required field follows the description as a section of
+    its own, its shown name then its text, in the ticket's order.
     """
     deadline = ci_deadline.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    sections = "".join(f"{name}:\n{text}\n" for name, text in ticket.fields)
     return (
         f"Ticket: {ticket.key}\n"
         f"Title: {ticket.title}\n"
         f"CI deadline: {deadline}\n"
         "\n"
         f"Description:\n{ticket.description}\n"
+        f"{sections}"
     )
 
 

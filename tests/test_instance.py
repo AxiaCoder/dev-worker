@@ -855,3 +855,52 @@ def test_unpinned_image_is_refused_without_echo(tmp_path: Path) -> None:
 
     assert SECRET not in str(caught.value)
     assert "(got" not in str(caught.value)
+
+
+def test_required_fields_are_empty_by_default(tmp_path: Path) -> None:
+    instance = load(tmp_path, VALID)
+
+    assert dict(instance.tracker.required_fields) == {}
+
+
+def test_required_fields_keep_their_names_in_the_order_written(tmp_path: Path) -> None:
+    text = VALID.replace(
+        "  token_env: JIRA_TOKEN\n",
+        "  token_env: JIRA_TOKEN\n"
+        "  required_fields:\n"
+        "    environment: Environment\n"
+        "    customfield_10042: Acceptance criteria\n",
+    )
+
+    instance = load(tmp_path, text)
+
+    assert list(instance.tracker.required_fields.items()) == [
+        ("environment", "Environment"),
+        ("customfield_10042", "Acceptance criteria"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "field_id",
+    ["customfield_", "customfield_12a", "Environment", "fix_versions", "custom-field"],
+)
+def test_a_required_field_id_that_is_not_a_jira_field_id_is_refused(
+    tmp_path: Path, field_id: str
+) -> None:
+    text = VALID.replace(
+        "  token_env: JIRA_TOKEN\n",
+        f"  token_env: JIRA_TOKEN\n  required_fields:\n    {field_id}: Criteria\n",
+    )
+
+    with pytest.raises(InstanceError, match="must be a Jira field id"):
+        load(tmp_path, text)
+
+
+def test_a_required_field_with_a_blank_name_is_refused(tmp_path: Path) -> None:
+    text = VALID.replace(
+        "  token_env: JIRA_TOKEN\n",
+        "  token_env: JIRA_TOKEN\n  required_fields:\n    customfield_10042: ' '\n",
+    )
+
+    with pytest.raises(InstanceError, match="must not be blank"):
+        load(tmp_path, text)
