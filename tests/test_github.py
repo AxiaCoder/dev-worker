@@ -1286,3 +1286,44 @@ def test_a_default_branch_answer_of_the_wrong_shape_raises(
         match="^the answer of gh to reading the CI of the default branch cannot be",
     ):
         repository().base_ci_failure()
+
+
+def test_base_failures_of_a_forge_run_and_a_code_run_rerun_neither(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = answer_in_turn(
+        monkeypatch,
+        record,
+        base_history(
+            base_commit(
+                BASE_COMMIT,
+                action_run("lint", "FAILURE", 501),
+                action_run("tests", "FAILURE", 502),
+            )
+        ),
+        workflow_run("failure", SETUP_FAILED),
+        workflow_run("failure", TESTS_FAILED),
+    )
+
+    assert repository().base_ci_failure() == BaseCiFailure(
+        branch="main", commit=BASE_COMMIT, checks=("lint", "tests")
+    )
+    assert [call[:2] for call in every_call(calls)[1:]] == [
+        ["run", "view"],
+        ["run", "view"],
+    ]
+
+
+def test_a_base_check_that_failed_while_another_still_runs_is_a_failure(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(
+        monkeypatch,
+        base_history(
+            base_commit(BASE_COMMIT, action_run("build", None), context("FAILURE"))
+        ),
+    )
+
+    assert repository().base_ci_failure() == BaseCiFailure(
+        branch="main", commit=BASE_COMMIT, checks=("ci/legacy",)
+    )
