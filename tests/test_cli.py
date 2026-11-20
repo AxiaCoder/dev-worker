@@ -39,7 +39,7 @@ from dev_worker.repositories import (
     RepositoryError,
 )
 from dev_worker.text import writable_text
-from dev_worker.tickets import Blocker, Claim, Ticket, TrackerError
+from dev_worker.tickets import REQUEUE_MARKER, Blocker, Claim, Ticket, TrackerError
 from dev_worker.workspace import Workspace, WorkspaceError
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -5761,7 +5761,11 @@ def ending_on(outcome: str, message: str) -> ContainerExit:
     """Return how a container ends when Claude Code ends on `outcome` with `message`."""
     structured = {"outcome": outcome, "message": message}
     return ContainerExit(
-        0, json.dumps({"subtype": "success", "structured_output": structured}), ""
+        0,
+        json.dumps(
+            {"type": "result", "subtype": "success", "structured_output": structured}
+        ),
+        "",
     )
 
 
@@ -6101,14 +6105,19 @@ def test_outcome_other_than_done_comments_the_reason_moves_the_ticket_to_blocked
         pytest.param(
             ContainerExit(0, "Error: boom", ""),
             "The run ended without a usable outcome: "
-            "the output of Claude Code is not a JSON object.",
+            "the output of Claude Code does not end on a result.",
             id="not-json",
         ),
         pytest.param(
             ContainerExit(
                 1,
                 json.dumps(
-                    {"subtype": "error_max_turns", "is_error": True, "result": "Max."}
+                    {
+                        "type": "result",
+                        "subtype": "error_max_turns",
+                        "is_error": True,
+                        "result": "Max.",
+                    }
                 ),
                 "",
             ),
@@ -6332,8 +6341,8 @@ def test_run_without_outcome_whose_work_cannot_be_rescued_comments_both_reasons(
     run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
 
     reason = (
-        "The run ended without a usable outcome: the output of Claude Code is "
-        "not a JSON object. The work of the run cannot be rescued, its worktree "
+        "The run ended without a usable outcome: the output of Claude Code does "
+        "not end on a result. The work of the run cannot be rescued, its worktree "
         "is kept: rescue broke"
     )
     assert stub.comments == [("DEMO-1", reason)]
@@ -8437,3 +8446,252 @@ def test_wake_does_not_recover_while_the_process_of_the_lock_it_took_over_still_
     assert code == 0
     assert stub.comments == []
     assert stub.moves == []
+
+
+USAGE_RESET = datetime.fromtimestamp(1792854600, UTC)
+LIMIT_RESULT = {
+    "type": "result",
+    "subtype": "success",
+    "is_error": True,
+    "result": "You've hit your limit",
+}
+
+
+def usage_limit_event(status: str) -> dict[str, object]:
+    """Return a `rate_limit_event` at `status`, resetting at `USAGE_RESET`."""
+    return {
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+            "status": status,
+            "resetsAt": 1792854600,
+            "rateLimitType": "five_hour",
+        },
+    }
+
+
+def ending_at_the_usage_limit(*events: object) -> ContainerExit:
+    """Return how a run container ends when Claude Code writes `events` then the result of a run stopped by the usage limit."""
+    lines = [*events, LIMIT_RESULT]
+    return ContainerExit(0, "".join(json.dumps(line) + "\n" for line in lines), "")
+
+
+def usage_limit_file(instance: Path) -> Path:
+    """Return the usage limit file of the instance directory of `instance`."""
+    return instance.with_suffix("") / cli.USAGE_LIMIT_FILE
+
+
+def recorded_reset(instance: Path) -> datetime:
+    """Return the reset moment written in the usage limit file of `instance`."""
+    recorded = json.loads(usage_limit_file(instance).read_text(encoding="utf-8"))
+    return datetime.fromisoformat(recorded["resets_at"])
+
+
+def write_reset(instance: Path, content: str) -> None:
+    """Write `content` as the usage limit file of `instance`, its directory created."""
+    path = usage_limit_file(instance)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+@pytest.mark.usefixtures("workspace", "plugin", "reachable_repository")
+def test_wake_whose_run_is_rejected_by_the_usage_limit_puts_its_ticket_back_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+) -> None:
+    stub = list_tickets(monkeypatch)
+    container.exited = ending_at_the_usage_limit(
+        usage_limit_event("allowed"), usage_limit_event("rejected")
+    )
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert code == 0
+    assert answer is not None
+    assert_failed(answer, answer["task_id"], "Claude Code gave no structured output")
+    assert stub.moves == [("DEMO-1", "In Progress"), ("DEMO-1", "To Do")]
+    assert recorded_reset(instance) == USAGE_RESET
+    ((_, body),) = stub.comments
+    assert not body.startswith(REQUEUE_MARKER)
+    assert "usage limit" in body
+    assert "2026-10-24 15:10:00 UTC" in body
+    assert len(container.readonly) == 1
+
+
+@pytest.mark.usefixtures("workspace", "plugin", "reachable_repository")
+def test_wake_whose_run_fails_with_a_429_waits_the_instance_delay(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+) -> None:
+    stub = list_tickets(monkeypatch)
+    container.exited = ContainerExit(
+        1, json.dumps(LIMIT_RESULT | {"api_error_status": 429}), ""
+    )
+    before = datetime.now(UTC)
+
+    code, _ = wake(capsysbinary, instance)
+
+    after = datetime.now(UTC)
+    assert code == 0
+    assert stub.moves[-1] == ("DEMO-1", "To Do")
+    wait = timedelta(seconds=3600)
+    assert before + wait <= recorded_reset(instance) <= after + wait
+
+
+def test_wake_before_the_usage_limit_resets_takes_no_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+) -> None:
+    stub = list_tickets(monkeypatch)
+    resets_at = datetime(2999, 1, 2, 3, 4, 5, tzinfo=UTC)
+    write_reset(instance, json.dumps({"resets_at": resets_at.isoformat()}))
+
+    code = cli.main(["wake", "--instance", str(instance)])
+
+    captured = capsysbinary.readouterr()
+    assert code == 0
+    assert captured.out == b""
+    assert captured.err.decode("utf-8") == (
+        "dev-worker takes no ticket: the agent's account reached its usage limit, "
+        "which resets at 2999-01-02 03:04:05 UTC.\n"
+    )
+    assert stub.listings == ["In Progress"]
+    assert stub.reads == []
+    assert stub.posted == []
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(json.dumps({"resets_at": "2000-01-01T00:00:00+00:00"}), id="past"),
+        pytest.param(json.dumps({"resets_at": "2999-01-01T00:00:00"}), id="naive"),
+        pytest.param(json.dumps(["2999-01-01T00:00:00+00:00"]), id="not-object"),
+        pytest.param("{", id="not-json"),
+    ],
+)
+@pytest.mark.usefixtures("workspace", "container", "plugin", "reachable_repository")
+def test_wake_with_a_past_or_unreadable_usage_limit_takes_its_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    content: str,
+) -> None:
+    stub = list_tickets(monkeypatch)
+    write_reset(instance, content)
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert code == 0
+    assert answer is not None
+    assert answer["status"] == "completed"
+    assert stub.listings == ["In Progress", "To Do"]
+
+
+@pytest.mark.usefixtures("workspace", "plugin", "reachable_repository")
+def test_usage_limit_that_cannot_be_recorded_still_puts_the_ticket_back_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+) -> None:
+    stub = list_tickets(monkeypatch)
+    container.exited = ending_at_the_usage_limit(usage_limit_event("rejected"))
+    usage_limit_file(instance).mkdir(parents=True)
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert code == 1
+    assert answer is not None
+    assert_failed(answer, answer["task_id"], "cannot be written")
+    assert stub.moves[-1] == ("DEMO-1", "To Do")
+    assert len(stub.comments) == 1
+
+
+@pytest.mark.usefixtures("workspace", "plugin", "reachable_repository")
+def test_usage_limit_whose_ticket_cannot_be_commented_on_nor_moved_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+) -> None:
+    stub = list_tickets(monkeypatch)
+    container.exited = ending_at_the_usage_limit(usage_limit_event("rejected"))
+    stub.comment_error = TrackerError("twg failed: down")
+    set_status = stub.set_status
+
+    def refuse_ready(key: str, status: str) -> None:
+        set_status(key, status)
+        if status == "To Do":
+            raise TrackerError("twg failed: down")
+
+    monkeypatch.setattr(stub, "set_status", refuse_ready)
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert code == 1
+    assert answer is not None
+    assert_failed(answer, answer["task_id"], "cannot be commented on")
+    assert_failed(answer, answer["task_id"], "cannot be moved to 'To Do'")
+    assert recorded_reset(instance) == USAGE_RESET
+
+
+@pytest.mark.usefixtures("plugin", "reachable_repository")
+def test_usage_limit_whose_work_cannot_be_rescued_blocks_the_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    container: FakeContainer,
+) -> None:
+    stub = list_tickets(monkeypatch)
+    container.exited = ending_at_the_usage_limit(usage_limit_event("rejected"))
+    workspace.fail = "rescue"
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert code == 1
+    assert answer is not None
+    assert stub.moves[-1] == ("DEMO-1", "Blocked")
+    ((_, body),) = stub.comments
+    assert body.startswith("The run ended without a usable outcome: ")
+    assert not usage_limit_file(instance).exists()
+
+
+@pytest.mark.usefixtures("workspace", "plugin", "reachable_repository")
+def test_a_run_dead_after_its_ticket_came_back_from_the_usage_limit_is_its_first_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+) -> None:
+    limited = list_tickets(monkeypatch)
+    container.exited = ending_at_the_usage_limit(usage_limit_event("rejected"))
+    wake(capsysbinary, instance)
+    assert limited.moves[-1] == ("DEMO-1", "To Do")
+    ((_, limit_comment),) = limited.comments
+    stub = timeline(
+        monkeypatch,
+        *DEAD_RUN,
+        ("comment", limit_comment),
+        ENTERS_READY,
+        ("claim", "t2"),
+        ENTERS_IN_PROGRESS,
+    )
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert (code, answer) == (0, None)
+    assert stub.comments == [
+        (
+            "DEMO-1",
+            (
+                f"{REQUEUE}the run that took it is gone without settling it "
+                "(attempt 1 of 3)."
+            ),
+        )
+    ]
+    assert stub.moves == [("DEMO-1", "To Do")]

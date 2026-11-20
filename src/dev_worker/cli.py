@@ -48,7 +48,7 @@ from dev_worker.instance import (
     load_instance,
 )
 from dev_worker.jira import TWG_TIMEOUT_SECONDS, JiraTracker
-from dev_worker.outcome import Outcome, read_outcome, read_verdict
+from dev_worker.outcome import Outcome, UsageLimit, read_outcome, read_verdict
 from dev_worker.plugin import PluginCheckout, PluginError
 from dev_worker.repositories import (
     CodeRepository,
@@ -93,6 +93,7 @@ RECENT_RUNS = 10
 CLAIM_TAKE_LIMIT_SECONDS = 300
 CLAIM_EXPIRY_SECONDS = 600
 TAKE_DATING_LIMIT_SECONDS = CLAIM_TAKE_LIMIT_SECONDS + TWG_TIMEOUT_SECONDS
+USAGE_LIMIT_FILE = "usage-limit.json"
 
 
 class Benign(str):
@@ -548,7 +549,7 @@ def land_done(
 
 def settle_ticket(
     key: str,
-    ending: Outcome | str,
+    ending: Outcome | UsageLimit | str,
     instance: Instance,
     worker: WorkerFile,
     tracker: TicketTracker,
@@ -569,7 +570,13 @@ def settle_ticket(
     or that the status is unknown. The reason a `done` run left the ticket blocked is the
     one `land_done` gives, `None` for any other ending; the errors `land_done` gives
     that did not block it come first among the errors.
+
+    A run that reached the usage limit of the agent's account is the one exception: its
+    ticket is moved back to the real status of the `ready` key, as `settle_usage_limit`
+    says, without counting as an attempt.
     """
+    if isinstance(ending, UsageLimit):
+        return None, settle_usage_limit(key, ending, instance, tracker, directory)
     tied = worker.header.outcomes.model_dump()
     blocking: str | None = None
     errors: list[str] = []
@@ -603,6 +610,79 @@ def settle_ticket(
             "Its status is unknown and is to be read again in the tracker."
         )
     return blocking, errors
+
+
+def settle_usage_limit(
+    key: str,
+    limit: UsageLimit,
+    instance: Instance,
+    tracker: TicketTracker,
+    directory: Path,
+) -> list[str]:
+    """Record when `limit` resets, comment on the ticket `key` then move it back to the ready status; return why a step failed.
+
+    The UTC moment `limit` resets is written in ISO 8601 as `resets_at` in the
+    `USAGE_LIMIT_FILE` of the instance directory `directory`, where `wake` reads it.
+    The comment says the run reached the usage limit, why it gave no outcome, and when
+    the worker takes a ticket again, in UTC; it does not start with `REQUEUE_MARKER`,
+    so the run is not counted as an attempt. The ticket is moved to the real status of
+    the `ready` key even when the file cannot be written or the comment fails. After a
+    tracker failure the sentence says whether the comment may have been posted, or that
+    the status is unknown.
+    """
+    errors: list[str] = []
+    resets_at = limit.resets_at.astimezone(UTC)
+    usage_file = directory / USAGE_LIMIT_FILE
+    try:
+        usage_file.write_text(
+            json.dumps({"resets_at": resets_at.isoformat()}) + "\n", encoding="utf-8"
+        )
+    except OSError as error:
+        errors.append(
+            f"Usage limit file '{usage_file}' cannot be written: {os_reason(error)} "
+            "The next wake may take a ticket before the limit resets."
+        )
+    ready = instance.statuses["ready"]
+    body = (
+        f"The run reached the usage limit of the agent's account. {limit.reason} "
+        f"The ticket goes back to {ready!r} without counting as an attempt; the worker "
+        f"takes no ticket before {resets_at:%Y-%m-%d %H:%M:%S} UTC."
+    )
+    try:
+        tracker.comment(key, writable_text(body))
+    except TrackerError as error:
+        errors.append(
+            f"Ticket {key!r} cannot be commented on: {error} "
+            "The comment may have been posted."
+        )
+    try:
+        tracker.set_status(key, ready)
+    except TrackerError as error:
+        errors.append(
+            f"Ticket {key!r} cannot be moved to {ready!r}: {error} "
+            "Its status is unknown and is to be read again in the tracker."
+        )
+    return errors
+
+
+def usage_limit_reset(instance_path: Path) -> datetime | None:
+    """Return when the usage limit a run of the instance at `instance_path` reached resets, while that moment is still to come.
+
+    The moment is read from the `USAGE_LIMIT_FILE` of the instance directory (see
+    `settle_usage_limit`). `None` when it is past, or when the file is missing, cannot
+    be read or holds no timezone-aware ISO 8601 `resets_at`. Never raises on a file
+    error.
+    """
+    try:
+        recorded = json.loads(
+            (instance_directory(instance_path) / USAGE_LIMIT_FILE).read_text(
+                encoding="utf-8"
+            )
+        )
+        resets_at = datetime.fromisoformat(recorded["resets_at"])
+        return resets_at if resets_at > datetime.now(UTC) else None
+    except (OSError, ValueError, RecursionError, KeyError, TypeError):
+        return None
 
 
 def with_errors(output: MandateOutput, errors: Sequence[str]) -> MandateOutput:
@@ -769,8 +849,9 @@ def run_under_lock(
 
     Once its ticket is taken, the run settles it before the final line is written (see
     `settle_ticket`): by the outcome the run ended on when it is usable and its work
-    rescued, as `blocked` with the reason otherwise, a `running` line that cannot be
-    written included. A `done` run has its pull request given its guard review, after
+    rescued, back to ready when the run reached the usage limit of the agent's account
+    and its work was rescued, as `blocked` with the reason otherwise, a `running` line
+    that cannot be written included. A `done` run has its pull request given its guard review, after
     its worktree is removed and within the time left since `began`, before it is merged. A run that ended on `done` but whose ticket is left blocked fails,
     the reason as its first error ahead of the errors its output already carried, and
     is journaled `failed`. A tracker failure while
@@ -778,7 +859,7 @@ def run_under_lock(
     ticket as it is.
 
     The worker did not fail when the run was refused for a `Benign` reason, or when it
-    ended on an outcome of its container, its worktree removed, its ticket commented on
+    ended on an outcome of its container or on the usage limit, its worktree removed, its ticket commented on
     and moved and its final line written; a `done` run left blocked for a `Benign`
     reason included (see `land_done`). It failed otherwise, a run that ended without a
     usable outcome, and a `done` run left blocked for any other reason, included.
@@ -839,7 +920,7 @@ def run_under_lock(
         )
     output = with_errors(output, errors)
     settled = (
-        isinstance(ending, Outcome)
+        isinstance(ending, Outcome | UsageLimit)
         and closed
         and not errors
         and (blocking is None or isinstance(blocking, Benign))
@@ -1149,7 +1230,7 @@ def run_container(
     began: float,
     worker: WorkerFile,
     ticket: Ticket,
-) -> Outcome | str:
+) -> Outcome | UsageLimit | str:
     """Run the container of `instance` on `worktree` for the time left in the run; return the outcome it ended on, or why there is none.
 
     `directory` is the instance directory of `instance`, `plugin` the plugin checkout
@@ -1165,7 +1246,9 @@ def run_container(
     CI deadline, in UTC: the moment the container's time runs out, read from
     `datetime.now`, less `CI_WAIT_MARGIN_SECONDS`. The outcome
     is read from what the container wrote (see `read_outcome`); a container that cannot
-    be run, or reaches the ceiling, gives none.
+    be run, or reaches the ceiling, gives none. A run that reached the usage limit of
+    the agent's account gives a `UsageLimit`, which resets when the account says, or
+    `usage_limit_wait_seconds` after the container ended when it does not say.
     """
     ceiling = instance.limits["run_timeout_seconds"]
     reserve = instance.limits["review_timeout_seconds"]
@@ -1202,9 +1285,17 @@ def run_container(
         )
     except ContainerError as error:
         return f"The container failed: {error}"
-    outcome = read_outcome(exited, outcomes)
+    fallback_reset = datetime.now(UTC) + timedelta(
+        seconds=instance.limits["usage_limit_wait_seconds"]
+    )
+    outcome = read_outcome(exited, outcomes, fallback_reset)
     if isinstance(outcome, str):
         return f"The run ended without a usable outcome: {outcome}."
+    if isinstance(outcome, UsageLimit):
+        return UsageLimit(
+            outcome.resets_at,
+            f"The run ended without a usable outcome: {outcome.reason}.",
+        )
     return outcome
 
 
@@ -1216,11 +1307,12 @@ def run_in_worktree(
     ticket: Ticket,
     directory: Path,
     began: float,
-) -> tuple[MandateOutput, Outcome | str, bool]:
+) -> tuple[MandateOutput, Outcome | UsageLimit | str, bool]:
     """Run `handler` once the plugin is prepared, the mirror in `directory` refreshed and a fresh worktree opened.
 
     Returns the output with how the run ended: the outcome the container ended on when
-    it is usable and the work rescued, else the reasons it is not, joined by a space;
+    it is usable and the work rescued, the usage limit it reached when the work is
+    rescued, else the reasons it is not, joined by a space;
     then whether no worktree was left behind: none was opened, or it was rescued and
     removed.
 
@@ -1242,8 +1334,8 @@ def run_in_worktree(
     is removed when the run reaches its `run_timeout_seconds` limit, counted from
     `began`, the `time.monotonic()` reading taken when the run started (see
     `run_container`); a container that cannot be run, that reaches that limit, that
-    the run reached it before, or that ends without a usable outcome gives a failed
-    output naming the reason, without running `handler`. Otherwise `handler` gets the
+    the run reached it before, or that ends without a usable outcome, the usage limit
+    included, gives a failed output naming the reason, without running `handler`. Otherwise `handler` gets the
     outcome and gives the output.
     """
     ticket_key = mandate.params["ticket_key"]
@@ -1267,6 +1359,8 @@ def run_in_worktree(
         )
         if isinstance(ending, str):
             output = failed(mandate.task_id, ending)
+        elif isinstance(ending, UsageLimit):
+            output = failed(mandate.task_id, ending.reason)
         else:
             output = handler(mandate, instance, ending)
     except BaseException as error:
@@ -1277,7 +1371,12 @@ def run_in_worktree(
     rescue_error = rescue_worktree(workspace, branch, instance, directory)
     end_error = rescue_error or close_worktree(workspace, branch)
     if rescue_error is not None:
-        reasons = [ending, rescue_error] if isinstance(ending, str) else [rescue_error]
+        unusable = ending.reason if isinstance(ending, UsageLimit) else ending
+        reasons = (
+            [rescue_error]
+            if isinstance(unusable, Outcome)
+            else [unusable, rescue_error]
+        )
         ending = " ".join(reasons)
         output = output.model_copy(update={"status": "failed"})
     return with_errors(output, [end_error] if end_error else []), ending, not end_error
@@ -1356,11 +1455,14 @@ def run_mandate(
     return run_journaled(handler, mandate, instance, worker, instance_path).output
 
 
-def wake(instance_path: Path) -> RunReport | None:
+def wake(instance_path: Path) -> RunReport | str | None:
     """Run the `deliver_ticket` mandate on the first ticket ready to be taken; return its report, `None` when no ticket is.
 
     The instance is read from `instance_path` as `run` reads it. The tickets its dead
-    runs left in progress are first handed back (see `recover_dead_runs`). Then the
+    runs left in progress are first handed back (see `recover_dead_runs`). While the
+    usage limit a run of the instance reached has not reset (see `usage_limit_reset`),
+    no ticket is listed nor taken, and the sentence saying so and until when, in UTC, is
+    returned. Then the
     tickets in the real status of its `ready` key are listed in the tracker's rank order,
     and the first whose blockers are all in the real status of the `done` key is run
     under a fresh task_id, `wake-` followed by a UUID, as `run` runs a mandate (see
@@ -1377,6 +1479,12 @@ def wake(instance_path: Path) -> RunReport | None:
     errors = recover_dead_runs(task_id, instance, tracker, instance_path)
     if errors:
         return worker_failure(None, *errors)
+    resets_at = usage_limit_reset(instance_path)
+    if resets_at is not None:
+        return (
+            "dev-worker takes no ticket: the agent's account reached its usage limit, "
+            f"which resets at {resets_at.astimezone(UTC):%Y-%m-%d %H:%M:%S} UTC."
+        )
     ready = instance.statuses["ready"]
     try:
         tickets = tracker.tickets_in(ready)
@@ -2046,13 +2154,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     mandate; argparse exits with 2 on incorrect usage.
 
     `wake` writes the output of the run it made, or of its own failure, and nothing when
-    no ticket is ready; it returns 1 when the worker failed (see `RunReport`), 0
-    otherwise.
+    no ticket is ready; while the usage limit has not reset, it writes nothing on
+    stdout and the reason on stderr. It returns 1 when the worker failed (see
+    `RunReport`), 0 otherwise.
     """
     args = build_parser().parse_args(argv)
     if args.command == "wake":
         report = wake(args.instance)
         if report is None:
+            return 0
+        if isinstance(report, str):
+            sys.stderr.write(f"{report}\n")
             return 0
         write_answer(report.output)
         return 1 if report.worker_failed else 0

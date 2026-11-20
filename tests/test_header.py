@@ -57,6 +57,7 @@ def test_shipped_worker_file_loads() -> None:
         "review_max_turns": 40,
         "review_timeout_seconds": 600,
         "max_attempts": 3,
+        "usage_limit_wait_seconds": 3600,
     }
     assert worker.header.plugin.model_dump() == {
         "repository": "https://github.com/AxiaCoder/claude-config.git",
