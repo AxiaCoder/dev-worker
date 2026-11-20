@@ -3,12 +3,14 @@
 Claude Code puts its answer in the `structured_output` field of its result, and leaves
 the field out when the run ends without a valid one: the outcome of a run on a ticket
 (see `container.outcome_schema`), or the verdict of a guard review (see
-`container.verdict_schema`).
+`container.verdict_schema`). A run on a ticket writes its events as JSON lines, its
+result last; a guard review writes its result alone.
 """
 
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from dev_worker.container import DEFECT_FIELDS, ContainerExit
@@ -27,6 +29,18 @@ class Outcome:
 
 
 @dataclass(frozen=True)
+class UsageLimit:
+    """A run that ended without a usable outcome once the agent's account reached its usage limit.
+
+    `resets_at` is the UTC moment the limit resets, and `reason` why the run gave no
+    outcome, as `read_outcome` gives it.
+    """
+
+    resets_at: datetime
+    reason: str
+
+
+@dataclass(frozen=True)
 class Defect:
     """A reachable defect a guard review found: the path of its file, its line in the head commit, and its summary."""
 
@@ -35,22 +49,36 @@ class Defect:
     summary: str
 
 
-def read_outcome(exited: ContainerExit, outcomes: Sequence[str]) -> Outcome | str:
+def read_outcome(
+    exited: ContainerExit, outcomes: Sequence[str], fallback_reset: datetime
+) -> Outcome | UsageLimit | str:
     """Return the outcome the container `exited` reports, or why it reports none.
 
-    The outcome is usable when Claude Code exited 0 and wrote a JSON object whose
-    `structured_output` holds exactly `outcome`, one of `outcomes`, and `message`, a
-    string. Otherwise the reason is a clause saying why: the output is not a JSON object,
-    Claude Code exited nonzero, gave no structured output, or one that does not match the
-    schema. It quotes the `subtype` and `result` of the JSON result when they are
-    strings, and the stderr of the container when its output is not JSON and it exited
-    nonzero. The message and the reason hold no NUL and encode as UTF-8: each NUL and
-    each character UTF-8 cannot encode is written as its backslash escape.
+    The output is read as JSON lines, its result being its last line not blank when that
+    line is a JSON object whose `type` is `result`. The outcome is usable when Claude
+    Code exited 0 and wrote a result whose `structured_output` holds exactly `outcome`,
+    one of `outcomes`, and `message`, a string. Otherwise the reason is a clause saying
+    why: the output does not end on a result, Claude Code exited nonzero, gave no
+    structured output, or one that does not match the schema. It quotes the `subtype`
+    and `result` of the result when they are strings, and the stderr of the container
+    when its output ends on no result and it exited nonzero. The message and the reason
+    hold no NUL and encode as UTF-8: each NUL and each character UTF-8 cannot encode is
+    written as its backslash escape.
+
+    A run without a usable outcome reached the usage limit of the agent's account when
+    its last `rate_limit_event` line has the `status` `rejected`, or when its result has
+    the `api_error_status` 429: it gives a `UsageLimit` carrying the reason, which
+    resets at the `resetsAt` of that event, in epoch seconds, or at `fallback_reset`
+    when the event gives no valid one or there is none.
     """
     found = _read(exited, outcomes)
     if isinstance(found, Outcome):
         return Outcome(found.outcome, writable_text(found.message))
-    return writable_text(found)
+    reason = writable_text(found)
+    rejected, resets_at = _rate_limit(exited.stdout)
+    if rejected or _result_status(exited.stdout) == 429:
+        return UsageLimit(resets_at or fallback_reset, reason)
+    return reason
 
 
 def read_verdict(exited: ContainerExit) -> tuple[Defect, ...] | str:
@@ -65,7 +93,7 @@ def read_verdict(exited: ContainerExit) -> tuple[Defect, ...] | str:
     take place: " followed by the `reason` of the verdict. The file, the summary and the
     reason are made writable as `read_outcome` makes its message.
     """
-    found = _structured_output(exited)
+    found = _structured_output(exited, _parsed(exited.stdout))
     if isinstance(found, str):
         return writable_text(found)
     verdict = found[0]
@@ -89,7 +117,7 @@ def read_verdict(exited: ContainerExit) -> tuple[Defect, ...] | str:
 
 def _read(exited: ContainerExit, outcomes: Sequence[str]) -> Outcome | str:
     """Return the outcome the container `exited` reports, or why it reports none, its text as read."""
-    found = _structured_output(exited)
+    found = _structured_output(exited, _last_result(exited.stdout))
     if isinstance(found, str):
         return found
     outcome = found[0]
@@ -102,12 +130,55 @@ def _read(exited: ContainerExit, outcomes: Sequence[str]) -> Outcome | str:
     return Outcome(outcome["outcome"], outcome["message"])
 
 
-def _structured_output(exited: ContainerExit) -> tuple[Any] | str:
-    """Return, alone in a tuple, the structured output Claude Code wrote in the container `exited`, or why there is none, its text as read."""
+def _parsed(text: str) -> object:
+    """Return the JSON value `text` holds, or None when it holds none."""
     try:
-        answer = json.loads(exited.stdout)
+        return json.loads(text)
     except (ValueError, RecursionError):
-        answer = None
+        return None
+
+
+def _lines(stdout: str) -> list[object]:
+    """Return the JSON value of each line of `stdout` not blank, None for a line that holds none."""
+    return [_parsed(line) for line in stdout.splitlines() if line.strip()]
+
+
+def _last_result(stdout: str) -> dict[Any, Any] | None:
+    """Return the last line of `stdout` not blank when it is a JSON object whose `type` is `result`, None otherwise."""
+    lines = _lines(stdout)
+    last = lines[-1] if lines else None
+    if isinstance(last, dict) and last.get("type") == "result":
+        return last
+    return None
+
+
+def _rate_limit(stdout: str) -> tuple[bool, datetime | None]:
+    """Return whether the last `rate_limit_event` line of `stdout` rejects the run, and the UTC moment its limit resets, None when it gives no valid one."""
+    events = [
+        line
+        for line in _lines(stdout)
+        if isinstance(line, dict) and line.get("type") == "rate_limit_event"
+    ]
+    info = events[-1].get("rate_limit_info") if events else None
+    if not isinstance(info, dict) or info.get("status") != "rejected":
+        return False, None
+    resets_at = info.get("resetsAt")
+    if not isinstance(resets_at, int | float) or isinstance(resets_at, bool):
+        return True, None
+    try:
+        return True, datetime.fromtimestamp(resets_at, UTC)
+    except (OverflowError, OSError, ValueError):
+        return True, None
+
+
+def _result_status(stdout: str) -> object:
+    """Return the `api_error_status` of the result `stdout` ends on, None when it ends on none."""
+    result = _last_result(stdout)
+    return None if result is None else result.get("api_error_status")
+
+
+def _structured_output(exited: ContainerExit, answer: object) -> tuple[Any] | str:
+    """Return, alone in a tuple, the structured output of `answer`, the result Claude Code wrote in the container `exited`, or why there is none, its text as read."""
     if not isinstance(answer, dict):
         reason = "the output of Claude Code is not a JSON object"
         if exited.code == 0:

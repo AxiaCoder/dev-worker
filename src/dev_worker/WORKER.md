@@ -16,6 +16,7 @@ ceilings:
   review_max_turns: 40
   review_timeout_seconds: 600
   max_attempts: 3
+  usage_limit_wait_seconds: 3600
 plugin:
   repository: https://github.com/AxiaCoder/claude-config.git
   tag: atelier--v1.0.0

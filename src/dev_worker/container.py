@@ -107,7 +107,7 @@ def agent_command(
     system prompt, `max_turns` caps its turns and `outcomes`
     are the outcomes it may end on (see `outcome_schema`); it loads the plugin mounted at
     `PLUGIN_DIR`, runs on `model`, passed by `--model`, runs in `bypassPermissions` mode, never prompting for a permission, and
-    answers in JSON.
+    writes its events as JSON lines, its result last.
     """
     return (
         AGENT_PROGRAM,
@@ -126,7 +126,8 @@ def agent_command(
         "--json-schema",
         json.dumps(outcome_schema(outcomes)),
         "--output-format",
-        "json",
+        "stream-json",
+        "--verbose",
     )
 
 

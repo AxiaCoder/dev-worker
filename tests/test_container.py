@@ -246,7 +246,8 @@ def test_agent_command_runs_claude_headless_with_the_rules_plugin_model_turns_an
         "--json-schema",
         json.dumps(outcome_schema(OUTCOMES)),
         "--output-format",
-        "json",
+        "stream-json",
+        "--verbose",
     )
 
 

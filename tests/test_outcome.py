@@ -1,11 +1,19 @@
 import json
+from datetime import UTC, datetime
 
 import pytest
 
 from dev_worker.container import ContainerExit
-from dev_worker.outcome import Defect, Outcome, read_outcome, read_verdict
+from dev_worker.outcome import (
+    Defect,
+    Outcome,
+    UsageLimit,
+    read_outcome,
+    read_verdict,
+)
 
 OUTCOMES = ("done", "blocked", "needs_human", "abandoned")
+FALLBACK = datetime(2026, 11, 20, 18, 0, tzinfo=UTC)
 SCHEMA_MISMATCH = (
     "the structured output of Claude Code does not match the outcome schema: "
 )
@@ -26,7 +34,7 @@ def test_a_structured_output_matching_the_schema_is_the_outcome() -> None:
         "",
     )
 
-    assert read_outcome(exited, OUTCOMES) == Outcome("blocked", "No spec.")
+    assert read_outcome(exited, OUTCOMES, FALLBACK) == Outcome("blocked", "No spec.")
 
 
 @pytest.mark.parametrize(
@@ -146,7 +154,7 @@ def test_a_structured_output_matching_the_schema_is_the_outcome() -> None:
 def test_an_output_without_a_usable_outcome_gives_why(
     exited: ContainerExit, reason: str
 ) -> None:
-    assert read_outcome(exited, OUTCOMES) == reason
+    assert read_outcome(exited, OUTCOMES, FALLBACK) == reason
 
 
 def assert_transmissible(text: str) -> None:
@@ -163,7 +171,7 @@ def test_a_message_holding_a_nul_or_a_lone_surrogate_is_made_transmissible(
         0, result(structured_output={"outcome": "done", "message": message}), ""
     )
 
-    found = read_outcome(exited, OUTCOMES)
+    found = read_outcome(exited, OUTCOMES, FALLBACK)
 
     assert isinstance(found, Outcome)
     assert found.outcome == "done"
@@ -187,10 +195,176 @@ def test_a_message_holding_a_nul_or_a_lone_surrogate_is_made_transmissible(
 def test_a_reason_quoting_a_nul_or_a_lone_surrogate_is_made_transmissible(
     exited: ContainerExit,
 ) -> None:
-    found = read_outcome(exited, OUTCOMES)
+    found = read_outcome(exited, OUTCOMES, FALLBACK)
 
     assert isinstance(found, str)
     assert_transmissible(found)
+
+
+def stream(*events: object) -> str:
+    """Return Claude Code stream-json output holding `events`, one JSON line each."""
+    return "".join(json.dumps(event) + "\n" for event in events)
+
+
+def rate_limit(status: str, resets_at: object = 1792854600) -> dict[str, object]:
+    """Return a `rate_limit_event` of the five-hour window, at `status`, resetting at `resets_at`."""
+    return {
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+            "status": status,
+            "resetsAt": resets_at,
+            "rateLimitType": "five_hour",
+        },
+    }
+
+
+SYSTEM = {"type": "system", "subtype": "init"}
+LIMIT_HIT = {
+    "type": "result",
+    "subtype": "success",
+    "is_error": True,
+    "result": "You've hit your limit",
+}
+RESET = datetime.fromtimestamp(1792854600, UTC)
+NO_STRUCTURED_OUTPUT = (
+    "Claude Code gave no structured output (subtype success, result: You've hit "
+    "your limit)"
+)
+
+
+def test_the_outcome_is_read_from_the_result_that_ends_the_stream() -> None:
+    exited = ContainerExit(
+        0,
+        stream(
+            SYSTEM,
+            rate_limit("allowed"),
+            {"type": "assistant"},
+            {
+                "type": "result",
+                "structured_output": {"outcome": "done", "message": "Done."},
+            },
+        )
+        + "\n",
+        "",
+    )
+
+    assert read_outcome(exited, OUTCOMES, FALLBACK) == Outcome("done", "Done.")
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        pytest.param(
+            stream(
+                {
+                    "type": "result",
+                    "structured_output": {"outcome": "done", "message": "Done."},
+                },
+                SYSTEM,
+            ),
+            id="result-not-last",
+        ),
+        pytest.param(
+            stream({"structured_output": {"outcome": "done", "message": "Done."}}),
+            id="no-result-type",
+        ),
+    ],
+)
+def test_a_stream_that_does_not_end_on_a_result_gives_why(stdout: str) -> None:
+    assert (
+        read_outcome(ContainerExit(0, stdout, ""), OUTCOMES, FALLBACK)
+        == "the output of Claude Code is not a JSON object"
+    )
+
+
+def test_a_usable_outcome_wins_over_a_rejected_rate_limit() -> None:
+    exited = ContainerExit(
+        0,
+        stream(
+            rate_limit("rejected"),
+            {
+                "type": "result",
+                "structured_output": {"outcome": "done", "message": "Done."},
+                "api_error_status": 429,
+            },
+        ),
+        "",
+    )
+
+    assert read_outcome(exited, OUTCOMES, FALLBACK) == Outcome("done", "Done.")
+
+
+def test_a_rejected_rate_limit_resets_when_its_event_says() -> None:
+    exited = ContainerExit(
+        0, stream(SYSTEM, rate_limit("allowed"), rate_limit("rejected"), LIMIT_HIT), ""
+    )
+
+    assert read_outcome(exited, OUTCOMES, FALLBACK) == UsageLimit(
+        RESET, NO_STRUCTURED_OUTPUT
+    )
+
+
+def test_a_rejected_rate_limit_without_a_result_is_a_usage_limit() -> None:
+    exited = ContainerExit(1, stream(SYSTEM, rate_limit("rejected")), "")
+
+    assert read_outcome(exited, OUTCOMES, FALLBACK) == UsageLimit(
+        RESET,
+        "the output of Claude Code is not a JSON object; it exited with code 1",
+    )
+
+
+@pytest.mark.parametrize(
+    "resets_at",
+    [
+        pytest.param(None, id="missing"),
+        pytest.param("soon", id="not-a-number"),
+        pytest.param(True, id="boolean"),
+        pytest.param(10**20, id="out-of-range"),
+    ],
+)
+def test_a_rejected_rate_limit_without_a_valid_reset_resets_at_the_fallback(
+    resets_at: object,
+) -> None:
+    exited = ContainerExit(0, stream(rate_limit("rejected", resets_at), LIMIT_HIT), "")
+
+    assert read_outcome(exited, OUTCOMES, FALLBACK) == UsageLimit(
+        FALLBACK, NO_STRUCTURED_OUTPUT
+    )
+
+
+def test_an_api_error_429_without_a_rejected_rate_limit_resets_at_the_fallback() -> (
+    None
+):
+    exited = ContainerExit(
+        1, stream(rate_limit("allowed"), LIMIT_HIT | {"api_error_status": 429}), ""
+    )
+
+    assert read_outcome(exited, OUTCOMES, FALLBACK) == UsageLimit(
+        FALLBACK,
+        "Claude Code exited with code 1 (subtype success, result: You've hit your "
+        "limit)",
+    )
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        pytest.param(
+            stream(rate_limit("rejected"), rate_limit("allowed"), LIMIT_HIT),
+            id="allowed-again",
+        ),
+        pytest.param(
+            stream({"type": "rate_limit_event", "rate_limit_info": "x"}, LIMIT_HIT),
+            id="info-not-object",
+        ),
+        pytest.param(stream(LIMIT_HIT | {"api_error_status": 500}), id="other-error"),
+    ],
+)
+def test_a_run_without_a_rejected_rate_limit_nor_a_429_gives_why(stdout: str) -> None:
+    assert (
+        read_outcome(ContainerExit(0, stdout, ""), OUTCOMES, FALLBACK)
+        == NO_STRUCTURED_OUTPUT
+    )
 
 
 VERDICT_MISMATCH = (
