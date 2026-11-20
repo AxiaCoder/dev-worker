@@ -354,7 +354,7 @@ def _option_text(value: object) -> str | None:
 def _field_text(value: object) -> str | None:
     """Return the plain text of a field value; None when its shape cannot be read.
 
-    Absent and null read as empty; a string and an Atlassian document as `_document_text`
+    Null reads as empty; a string and an Atlassian document as `_document_text`
     reads them; an option as its `value`, else its `name`; a list of strings and options
     as their texts joined by `, `, empty when the list is.
     """
@@ -384,7 +384,8 @@ def _required_fields(
         if field_id not in values:
             raise TrackerError(
                 f"field {field_id!r} is missing from the answer for ticket {item.key}:"
-                " the site has no field with this id"
+                " the site has no field with this id, or none on this ticket's project"
+                " or type"
             )
         text = _field_text(values[field_id])
         if text is None:

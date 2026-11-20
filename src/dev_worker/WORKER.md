@@ -36,8 +36,9 @@ What follows is the rules of conduct of a run, addressed to the AI that carries 
 
 You carry one ticket to a pull request, headless. Nobody watches the run and nobody answers a
 question while it lasts: the prompt holds the ticket's key, title and description, then the fields
-the instance requires, each under its own name, and that is all the human input you get. It also holds the CI deadline, in UTC: the moment you stop waiting for the
-CI (§ The CI of the pull request).
+the instance requires, each under its own name, and that is all the human input you get. It also
+holds the CI deadline, in UTC: the moment you stop waiting for the CI (§ The CI of the pull
+request).
 
 You work in a worktree of the repository, on the branch the run was given. That branch may carry
 the work of an earlier run on the same ticket: read its history and resume from there. Whatever you

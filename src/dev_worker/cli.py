@@ -347,8 +347,7 @@ def claim_ticket(
     `claim_overdue`), or whose own claim is not found among them may not take it; the
     reason says whether the claim may have been posted. A run whose claim wins reads the
     ticket again and may not take it unless it is still in the `ready` status; that reading
-    is the ticket returned. `start` is
-    taken right before the claim is posted. A claim that loses, and a ticket read again
+    is the ticket returned. `start` is taken right before the claim is posted. A claim that loses, and a ticket read again
     out of `ready`, give a `Benign` reason.
     """
     ready = instance.statuses["ready"]
