@@ -232,7 +232,9 @@ query($owner: String!, $name: String!) {{
   }}
 }}
 """
-FORGE_RUN_CONCLUSIONS = frozenset({"cancelled", "startup_failure"})
+CANCELLED = "CANCELLED"
+CANCELLED_RUN = "cancelled"
+FORGE_RUN_CONCLUSIONS = frozenset({CANCELLED_RUN, "startup_failure"})
 FINE_JOB_CONCLUSIONS = frozenset({"success", "neutral", "skipped", "cancelled"})
 FAILURE = "failure"
 SETUP_STEP = "Set up job"
@@ -479,12 +481,14 @@ class GitHubRepository:
         check, even while others still run. When every failed check belongs to a GitHub
         Actions workflow run on its first attempt whose failure the forge caused (see
         `_forge_caused`), those runs are rerun — their failed jobs, or the whole run when
-        it was cancelled or failed to start — and this returns `None`; when a rerun
-        fails, the failure is returned. `None` too when the repository has no commit or
-        none of those commits reports a check.
+        it was cancelled or failed to start — and this returns `None`; when one of
+        those runs cannot be read or a rerun fails, the failure is returned. On a
+        commit older than the head of the branch, a cancelled check run does not count
+        — a later push superseded it — and a cancelled workflow run is not rerun. `None`
+        too when the repository has no commit or none of those commits reports a check.
 
         Raises `RepositoryError` when the token variable is not set, or `gh` fails or
-        its answer cannot be read while reading the commits or their workflow runs.
+        its answer cannot be read while reading the commits.
         """
         action = "reading the CI of the default branch"
         owner, _, name = self._repository.name.partition("/")
@@ -508,20 +512,36 @@ class GitHubRepository:
             raise self._unreadable(action, error) from None
         if branch is None:
             return None
-        for commit in branch.target.history.nodes:
+        commits = branch.target.history.nodes
+        for commit in commits:
             rollup = commit.statusCheckRollup
             if rollup is not None and rollup.contexts.nodes:
-                return self._settle_failure(branch.name, commit.oid, rollup.contexts)
+                return self._settle_failure(
+                    branch.name,
+                    commit.oid,
+                    rollup.contexts,
+                    superseded=commit.oid != commits[0].oid,
+                )
         return None
 
     def _settle_failure(
-        self, branch: str, commit: str, contexts: _Contexts
+        self, branch: str, commit: str, contexts: _Contexts, *, superseded: bool
     ) -> BaseCiFailure | None:
         """Return the failure of the checks `contexts` of `commit` on `branch`, or `None` when none failed or the forge's failure was rerun, as `base_ci_failure` says.
 
-        Raises `RepositoryError` as `_read_run` does.
+        `superseded` tells that `commit` is not the head of `branch`: its cancelled
+        checks then do not count, and its cancelled runs are not rerun.
         """
-        failed = [check for check in contexts.nodes if _check_state(check) == "failed"]
+        failed = [
+            check
+            for check in contexts.nodes
+            if _check_state(check) == "failed"
+            and not (
+                superseded
+                and isinstance(check, _NamedCheckRun)
+                and check.conclusion == CANCELLED
+            )
+        ]
         if not failed:
             return None
         failure = BaseCiFailure(
@@ -537,9 +557,14 @@ class GitHubRepository:
         runs = _workflow_runs(failed)
         if runs is None:
             return failure
-        answers = {run: self._read_run(run) for run in runs}
+        try:
+            answers = {run: self._read_run(run) for run in runs}
+        except RepositoryError:
+            return failure
         if not all(
-            answer.attempt == FIRST_ATTEMPT and _forge_caused(answer)
+            answer.attempt == FIRST_ATTEMPT
+            and _forge_caused(answer)
+            and not (superseded and answer.conclusion == CANCELLED_RUN)
             for answer in answers.values()
         ):
             return failure

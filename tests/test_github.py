@@ -1235,37 +1235,86 @@ def test_a_base_failure_whose_rerun_fails_stays_a_failure(
     assert repository().base_ci_failure() == RED
 
 
-def test_a_workflow_run_that_cannot_be_read_raises(
-    record: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "run",
+    [
+        pytest.param(GhFailure("HTTP 404: Not Found"), id="gh-fails"),
+        pytest.param({"attempt": "first"}, id="wrong-shape"),
+    ],
+)
+def test_a_base_failure_whose_workflow_run_cannot_be_read_stays_a_failure(
+    record: Path, monkeypatch: pytest.MonkeyPatch, run: object
 ) -> None:
-    answer_in_turn(
+    calls = answer_in_turn(
         monkeypatch,
         record,
         base_history(base_commit(BASE_COMMIT, action_run("tests", "FAILURE"))),
-        GhFailure("HTTP 404: Not Found"),
+        run,
     )
 
-    with pytest.raises(
-        RepositoryError, match="^gh failed while reading workflow run 501: HTTP 404"
-    ):
-        repository().base_ci_failure()
+    assert repository().base_ci_failure() == RED
+    assert len(every_call(calls)) == 2
 
 
-def test_a_workflow_run_of_the_wrong_shape_raises(
+def test_a_check_cancelled_on_a_commit_older_than_the_head_is_not_a_failure(
     record: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    answer_in_turn(
+    calls = answer_in_turn(
         monkeypatch,
         record,
-        base_history(base_commit(BASE_COMMIT, action_run("tests", "FAILURE"))),
-        {"attempt": "first"},
+        base_history(
+            base_commit(BASE_COMMIT, None),
+            base_commit(
+                OLDER_COMMIT,
+                action_run("tests", "CANCELLED"),
+                action_run("lint", "SUCCESS"),
+            ),
+        ),
     )
 
-    with pytest.raises(
-        RepositoryError,
-        match="^the answer of gh to reading workflow run 501 cannot be read",
-    ):
-        repository().base_ci_failure()
+    assert repository().base_ci_failure() is None
+    assert len(every_call(calls)) == 1
+
+
+def test_a_cancelled_run_on_a_commit_older_than_the_head_is_not_rerun(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = answer_in_turn(
+        monkeypatch,
+        record,
+        base_history(
+            base_commit(BASE_COMMIT),
+            base_commit(
+                OLDER_COMMIT,
+                action_run("tests", "FAILURE"),
+                action_run("lint", "CANCELLED"),
+            ),
+        ),
+        workflow_run("cancelled", SETUP_FAILED),
+    )
+
+    assert repository().base_ci_failure() == BaseCiFailure(
+        branch="main", commit=OLDER_COMMIT, checks=("tests",)
+    )
+    assert [call[:2] for call in every_call(calls)[1:]] == [["run", "view"]]
+
+
+def test_a_forge_failure_on_a_commit_older_than_the_head_is_rerun(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = answer_in_turn(
+        monkeypatch,
+        record,
+        base_history(
+            base_commit(BASE_COMMIT),
+            base_commit(OLDER_COMMIT, action_run("tests", "FAILURE")),
+        ),
+        workflow_run("failure", SETUP_FAILED),
+        "",
+    )
+
+    assert repository().base_ci_failure() is None
+    assert every_call(calls)[2][:3] == ["run", "rerun", "501"]
 
 
 @pytest.mark.parametrize(
