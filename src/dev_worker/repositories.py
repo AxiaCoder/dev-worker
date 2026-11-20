@@ -37,6 +37,15 @@ class PullRequest:
     base: str
 
 
+@dataclass(frozen=True)
+class BaseCiFailure:
+    """A failed CI on the default branch: the branch name, the full SHA of the commit and the names of its failed checks, in the order they were reported."""
+
+    branch: str
+    commit: str
+    checks: tuple[str, ...]
+
+
 class CodeRepository(Protocol):
     """A code repository: finds the pull request of a branch, reads its CI and merges it."""
 
@@ -58,6 +67,15 @@ class CodeRepository(Protocol):
         found, and `RepositoryError` when the CI cannot be read, or when no check is
         reported and the repository has no CI that could report one. No check reported
         while the repository has such a CI is `"unreported"`.
+        """
+        ...
+
+    def base_ci_failure(self) -> BaseCiFailure | None:
+        """Return the failure of the CI of the most recent commit of the default branch that reports one, or `None` when it did not fail.
+
+        A failure the forge caused rather than the code may be rerun once; it then counts
+        as not failed. `None` too when no recent commit reports a check. Raises
+        `RepositoryError` when the CI cannot be read.
         """
         ...
 
