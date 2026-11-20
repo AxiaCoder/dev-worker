@@ -484,7 +484,7 @@ class GitHubRepository:
         it was cancelled or failed to start — and this returns `None`; when one of
         those runs cannot be read or a rerun fails, the failure is returned. On a
         commit older than the head of the branch, a cancelled check run does not count
-        — a later push superseded it — and a cancelled workflow run is not rerun. `None`
+        and a cancelled workflow run is not rerun. `None`
         too when the repository has no commit or none of those commits reports a check.
 
         Raises `RepositoryError` when the token variable is not set, or `gh` fails or
