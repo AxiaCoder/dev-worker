@@ -3,6 +3,7 @@ import re
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -752,4 +753,20 @@ def test_review_command_runs_the_reviewer_agent_headless_with_its_model_turns_an
         json.dumps(verdict_schema()),
         "--output-format",
         "json",
+    )
+
+
+def test_ticket_prompt_gives_each_required_field_a_section_after_the_description() -> (
+    None
+):
+    ticket = replace(
+        TICKET,
+        fields=(("Acceptance criteria", "It logs in."), ("Environment", "Staging")),
+    )
+
+    assert ticket_prompt(ticket, DEADLINE).endswith(
+        "Description:\n"
+        "The page asks for an email.\nThen a password.\n"
+        "Acceptance criteria:\nIt logs in.\n"
+        "Environment:\nStaging\n"
     )

@@ -101,7 +101,7 @@ class Benign(str):
     """Why a run did not take its ticket when no part of the worker failed.
 
     The lock is held by a run that is not gone, another run claimed the ticket first,
-    or the ticket is not ready to be taken. A `done` run is also left blocked for a
+    the ticket is not ready to be taken, or it was blocked for an empty required field. A `done` run is also left blocked for a
     `Benign` reason when its pull request is missing, its CI has not passed or has
     reported no check yet on its head commit, its guard review found a reachable defect,
     or its head moved before the merge.
@@ -409,6 +409,44 @@ def claim_ticket(
     return None
 
 
+def block_unfilled_ticket(
+    ticket: Ticket, instance: Instance, tracker: TicketTracker
+) -> str | None:
+    """Block `ticket` when a field the instance requires is empty; return why the run may not take it, or None.
+
+    The comment posted on the ticket names the empty fields by their shown name, then the
+    ticket is moved to the real status of the `blocked` key, and the reason is `Benign`.
+    A ticket whose comment fails is not moved. After a tracker failure the reason is not
+    `Benign` and says whether the comment may have been posted, or that the status is
+    unknown.
+    """
+    empty = ticket.empty_fields()
+    if not empty:
+        return None
+    key = ticket.key
+    named = ", ".join(empty)
+    body = (
+        f"This ticket cannot be taken, these required fields are empty: {named}. "
+        f"Fill them, then move it back to {instance.statuses['ready']!r}."
+    )
+    try:
+        tracker.comment(key, body)
+    except TrackerError as error:
+        return (
+            f"Ticket {key!r} cannot be commented on: {error} The comment may have "
+            "been posted; the ticket was not moved."
+        )
+    blocked = instance.statuses["blocked"]
+    try:
+        tracker.set_status(key, blocked)
+    except TrackerError as error:
+        return (
+            f"Ticket {key!r} cannot be moved to {blocked!r}: {error} "
+            "Its status is unknown and is to be read again in the tracker."
+        )
+    return Benign(f"Ticket {key!r} has empty required fields: {named}.")
+
+
 def take_ticket(
     key: str,
     task_id: str,
@@ -708,10 +746,11 @@ def run_journaled(
     The ticket key is checked first, then the ticket is read from the tracker and
     refused unless it is ready (see `read_ready_ticket`), then the lock is taken, or
     taken over from a run that is gone (see `take_over_lock`); a task_id already in the
-    journal is refused, otherwise the ticket is claimed for the run (see `claim_ticket`)
-    and moved to the real status of the `in_progress` key (see `take_ticket`) before the
-    run is journaled. A refused run, or one whose ticket cannot be claimed or moved, is
-    not journaled. A run that took its ticket settles it once it ends (see
+    journal is refused, otherwise the ticket is claimed for the run (see `claim_ticket`),
+    blocked when a field the instance requires is empty (see `block_unfilled_ticket`),
+    and otherwise moved to the real status of the `in_progress` key (see `take_ticket`)
+    before the run is journaled. A refused run, a run whose ticket is blocked, and one
+    whose ticket cannot be claimed, blocked or moved, are not journaled. A run that took its ticket settles it once it ends (see
     `run_under_lock`). The lock is
     released only if no other run has taken it over meanwhile. Every file error
     becomes a failed output naming the reason, except a lock that cannot be removed:
@@ -837,9 +876,11 @@ def run_under_lock(
     rescued and removed (see `rescue_left_worktree`); a run that cannot do so fails
     without taking its ticket nor being journaled. Then the ticket is claimed for the run
     through `tracker` (see `claim_ticket`): the claim must be read back in time, win
-    over the live claims and find the ticket still ready. The ticket is then moved to the
-    real status of the `in_progress` key; a run whose ticket cannot be claimed or moved
-    fails without being journaled. A `running` line is appended before `handler` runs, so that the
+    over the live claims and find the ticket still ready. A ticket that leaves a field the
+    instance requires empty is then commented on and blocked, and the run refused for a
+    `Benign` reason (see `block_unfilled_ticket`). The ticket is otherwise moved to the
+    real status of the `in_progress` key; a run whose ticket cannot be claimed, blocked or
+    moved fails without being journaled. A `running` line is appended before `handler` runs, so that the
     task is never run again even if its final line, appended once `handler` returns,
     cannot be written; the output is then kept, with the journal error added to
     `errors`. A run whose `running` line cannot be written fails without running
@@ -883,9 +924,11 @@ def run_under_lock(
     refusal = rescue_left_worktree(instance, directory)
     if refusal is None:
         claim_start = start_claim()
-        refusal = claim_ticket(
-            ticket_key, task_id, instance, tracker, claim_start
-        ) or take_ticket(ticket_key, task_id, instance, tracker, claim_start)
+        refusal = (
+            claim_ticket(ticket_key, task_id, instance, tracker, claim_start)
+            or block_unfilled_ticket(ticket, instance, tracker)
+            or take_ticket(ticket_key, task_id, instance, tracker, claim_start)
+        )
     if refusal is not None:
         return refused(task_id, refusal)
     entry: dict[str, object] = {

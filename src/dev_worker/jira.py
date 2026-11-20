@@ -13,13 +13,13 @@ import os
 import re
 import subprocess
 import textwrap
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from datetime import datetime
 from functools import partial
 from itertools import count, repeat
 from typing import Annotated, Any
 
-from pydantic import AwareDatetime, BaseModel, Field, ValidationError
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
 
 from dev_worker.header import _describe
 from dev_worker.instance import Tracker
@@ -71,7 +71,9 @@ class _Link(BaseModel):
 
 
 class _Item(BaseModel):
-    """A ticket as `twg jira workitem get` writes it."""
+    """A ticket as `twg jira workitem get` writes it, its other fields kept as written."""
+
+    model_config = ConfigDict(extra="allow")
 
     key: str
     status: _Status
@@ -337,8 +339,63 @@ _RENDERERS: dict[object, Callable[[dict[Any, Any]], str]] = {
 }
 
 
-def _ticket(item: _Item) -> Ticket:
-    """Return the ticket `item` describes; its blockers are the tickets on the inward side of its "Blocks" links."""
+def _option_text(value: object) -> str | None:
+    """Return a string as it is, or the `value`, else `name`, string of an option; None for any other shape."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for name in ("value", "name"):
+            text = value.get(name)
+            if isinstance(text, str):
+                return text
+    return None
+
+
+def _field_text(value: object) -> str | None:
+    """Return the plain text of a field value; None when its shape cannot be read.
+
+    Absent and null read as empty; a string and an Atlassian document as `_document_text`
+    reads them; an option as its `value`, else its `name`; a list of strings and options
+    as their texts joined by `, `, empty when the list is.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, dict) and value.get("type") == "doc":
+        return _document_text(value)
+    if isinstance(value, list):
+        texts = [_option_text(element) for element in value]
+        if None in texts:
+            return None
+        return ", ".join(text for text in texts if text)
+    return _option_text(value)
+
+
+def _required_fields(
+    item: _Item, required: Mapping[str, str]
+) -> tuple[tuple[str, str], ...]:
+    """Return each field of `required` read from `item`, as its shown name and plain text, in order.
+
+    Raises `TrackerError` naming the field id when its value cannot be read as text.
+    """
+    values = item.model_dump()
+    fields: list[tuple[str, str]] = []
+    for field_id, name in required.items():
+        text = _field_text(values.get(field_id))
+        if text is None:
+            raise TrackerError(
+                f"field {field_id!r} of ticket {item.key} holds a value that cannot be"
+                " read as text"
+            )
+        fields.append((name, text))
+    return tuple(fields)
+
+
+def _ticket(item: _Item, required: Mapping[str, str]) -> Ticket:
+    """Return the ticket `item` describes, with the fields `required` maps by id to their shown name.
+
+    Its blockers are the tickets on the inward side of its "Blocks" links. Raises
+    `TrackerError` when a required field cannot be read as text.
+    """
     return Ticket(
         key=item.key,
         status=item.status.name,
@@ -352,6 +409,7 @@ def _ticket(item: _Item) -> Ticket:
         ),
         title=item.summary,
         description=_document_text(item.description),
+        fields=_required_fields(item, required),
     )
 
 
@@ -385,19 +443,21 @@ class JiraTracker:
         self._tracker = tracker
         self._command = tuple(command)
         self._timeout = timeout
+        self._fields = ",".join([TICKET_FIELDS, *tracker.required_fields])
 
     def read(self, key: str) -> Ticket:
-        """Return the ticket `key`, with its status, labels, blockers, title and description.
+        """Return the ticket `key`, with its status, labels, blockers, title, description and required fields.
 
         A blocker is a ticket linked to `key` by a "Blocks" link that blocks it. The
-        description is read as plain text (see `_document_text`). Raises `TrackerError`
+        description is read as plain text (see `_document_text`), and so is each field the
+        tracker's `required_fields` names (see `_field_text`). Raises `TrackerError`
         when `key` is not a ticket key, the token variable is not set, `twg` fails, or its
-        answer cannot be read.
+        answer cannot be read, a required field whose value has no readable shape included.
         """
         _check_key(key)
         answer = self._run(
             f"reading {key}",
-            ["jira", "workitem", "get", key, "--fields", TICKET_FIELDS],
+            ["jira", "workitem", "get", key, "--fields", self._fields],
         )
         try:
             item = _GetAnswer.model_validate(answer).data[0]
@@ -406,7 +466,7 @@ class JiraTracker:
             raise TrackerError(
                 f"the answer of twg to reading {key} cannot be read: {description}"
             ) from None
-        return _ticket(item)
+        return _ticket(item, self._tracker.required_fields)
 
     def tickets_in(self, status: str) -> tuple[Ticket, ...]:
         """Return the tickets of the instance project in the real status `status`, in Jira's rank order.
@@ -421,10 +481,13 @@ class JiraTracker:
         )
         pages = self._pages(
             f"listing the tickets in {status!r}",
-            ["jira", "workitem", "query", "--jql", jql, "--fields", TICKET_FIELDS],
+            ["jira", "workitem", "query", "--jql", jql, "--fields", self._fields],
             _QueryPage,
         )
-        return tuple(_ticket(item) for page in pages for item in page.data.issues)
+        required = self._tracker.required_fields
+        return tuple(
+            _ticket(item, required) for page in pages for item in page.data.issues
+        )
 
     def set_status(self, key: str, status: str) -> None:
         """Move the ticket `key` to the real status name `status`.

@@ -28,7 +28,8 @@ class Ticket:
 
     `status` is the tracker's real status name; `blockers` are the tickets this one is
     blocked by, in the tracker's order. `description` is plain text, empty when the
-    ticket has none.
+    ticket has none. `fields` holds the fields the instance requires, in the order it
+    declares them, each as its shown name and its plain text, empty when the field is.
     """
 
     key: str
@@ -37,6 +38,11 @@ class Ticket:
     blockers: tuple[Blocker, ...]
     title: str
     description: str
+    fields: tuple[tuple[str, str], ...] = ()
+
+    def empty_fields(self) -> tuple[str, ...]:
+        """Return the shown names of the required fields whose text is blank, in their order."""
+        return tuple(name for name, text in self.fields if not text.strip())
 
 
 @dataclass(frozen=True)

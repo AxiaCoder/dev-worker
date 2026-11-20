@@ -20,6 +20,7 @@ from dev_worker.header import (
 )
 
 ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]*")
+FIELD_ID = re.compile(r"customfield_[0-9]+|[a-z]+")
 _PATH_COMPONENT = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
 _DOMAIN_COMPONENT = r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
 _DOMAIN = rf"{_DOMAIN_COMPONENT}(?:\.{_DOMAIN_COMPONENT})*"
@@ -70,6 +71,19 @@ def _check_env_name(value: str) -> str:
 EnvName = Annotated[str, AfterValidator(_check_env_name)]
 
 
+def _check_field_id(value: str) -> str:
+    """Return `value` when it is a Jira field id, custom or system; raise `ValueError` otherwise."""
+    if not FIELD_ID.fullmatch(value):
+        raise ValueError(
+            "must be a Jira field id, customfield_ followed by digits or a lowercase"
+            " system field name, e.g. customfield_10042 or environment"
+        )
+    return value
+
+
+FieldId = Annotated[str, AfterValidator(_check_field_id)]
+
+
 def _check_branch_template(value: str) -> str:
     """Return `value` when it contains `{key}` and no other brace; raise `ValueError` otherwise."""
     rest = value.replace("{key}", "")
@@ -117,6 +131,9 @@ class Tracker(BaseModel):
     """The ticket tracker of an instance, its account and the variable holding its token.
 
     `site` is the Jira site address and `user` the email of the account the token belongs to.
+    `required_fields` maps the id of each field a ticket must fill before a run takes it
+    (`customfield_` followed by digits, or a lowercase system field name) to the name the
+    worker shows for it, in the order written; it is empty when the instance requires none.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -126,6 +143,7 @@ class Tracker(BaseModel):
     user: Name
     project: Name
     token_env: EnvName
+    required_fields: Mapping[FieldId, Name] = Field(default_factory=dict)
 
 
 class Repository(BaseModel):
@@ -314,7 +332,9 @@ def load_instance(path: Path, header: Header) -> Instance:
     """Read the YAML instance file at `path`, UTF-8 with an optional BOM, against `header`.
 
     Raises `InstanceError` when the file is not valid UTF-8, is not valid YAML (a key repeated
-    within one mapping included), nests too deeply to be read, does not match the instance shape, maps a status key the header does not
+    within one mapping included), nests too deeply to be read, does not match the instance
+    shape (a required tracker field whose id is not a Jira field id or whose name is blank
+    included), maps a status key the header does not
     declare or leaves one unmapped, maps two status keys to the same real status name, sets
     a limit the header has no ceiling for, sets a limit above its ceiling, leaves an
     effective `run_timeout_seconds` not above the effective `review_timeout_seconds` plus
