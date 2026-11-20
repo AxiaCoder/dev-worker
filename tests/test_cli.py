@@ -6105,7 +6105,7 @@ def test_outcome_other_than_done_comments_the_reason_moves_the_ticket_to_blocked
         pytest.param(
             ContainerExit(0, "Error: boom", ""),
             "The run ended without a usable outcome: "
-            "the output of Claude Code is not a JSON object.",
+            "the output of Claude Code does not end on a result.",
             id="not-json",
         ),
         pytest.param(
@@ -6341,8 +6341,8 @@ def test_run_without_outcome_whose_work_cannot_be_rescued_comments_both_reasons(
     run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
 
     reason = (
-        "The run ended without a usable outcome: the output of Claude Code is "
-        "not a JSON object. The work of the run cannot be rescued, its worktree "
+        "The run ended without a usable outcome: the output of Claude Code does "
+        "not end on a result. The work of the run cannot be rescued, its worktree "
         "is kept: rescue broke"
     )
     assert stub.comments == [("DEMO-1", reason)]

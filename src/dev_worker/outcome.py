@@ -66,10 +66,11 @@ def read_outcome(
     written as its backslash escape.
 
     A run without a usable outcome reached the usage limit of the agent's account when
-    its last `rate_limit_event` line has the `status` `rejected`, or when its result has
-    the `api_error_status` 429: it gives a `UsageLimit` carrying the reason, which
-    resets at the `resetsAt` of that event, in epoch seconds, or at `fallback_reset`
-    when the event gives no valid one or there is none.
+    its last `rate_limit_event` line has the `status` `rejected` and an
+    `isUsingOverage` other than true, or when its result has the `api_error_status`
+    429: it gives a `UsageLimit` carrying the reason, which resets at the `resetsAt` of
+    that event, in epoch seconds, or at `fallback_reset` when the event gives no valid
+    one or there is none.
     """
     found = _read(exited, outcomes)
     if isinstance(found, Outcome):
@@ -89,11 +90,16 @@ def read_verdict(exited: ContainerExit) -> tuple[Defect, ...] | str:
     `defects`, a list of objects each holding exactly `file`, a string, `line`, an
     integer from 1, and `summary`, a string, and when `reviewed` is true: an empty list
     is then a review that found no reachable defect. Otherwise the reason is a clause
-    saying why, as `read_outcome` gives it; a `reviewed` false gives "the review did not
+    saying why, as `read_outcome` gives it, an output that is not a JSON object saying
+    so where `read_outcome` says it does not end on a result; a `reviewed` false gives "the review did not
     take place: " followed by the `reason` of the verdict. The file, the summary and the
     reason are made writable as `read_outcome` makes its message.
     """
-    found = _structured_output(exited, _parsed(exited.stdout))
+    found = _structured_output(
+        exited,
+        _parsed(exited.stdout),
+        "the output of Claude Code is not a JSON object",
+    )
     if isinstance(found, str):
         return writable_text(found)
     verdict = found[0]
@@ -117,7 +123,11 @@ def read_verdict(exited: ContainerExit) -> tuple[Defect, ...] | str:
 
 def _read(exited: ContainerExit, outcomes: Sequence[str]) -> Outcome | str:
     """Return the outcome the container `exited` reports, or why it reports none, its text as read."""
-    found = _structured_output(exited, _last_result(exited.stdout))
+    found = _structured_output(
+        exited,
+        _last_result(exited.stdout),
+        "the output of Claude Code does not end on a result",
+    )
     if isinstance(found, str):
         return found
     outcome = found[0]
@@ -153,14 +163,22 @@ def _last_result(stdout: str) -> dict[Any, Any] | None:
 
 
 def _rate_limit(stdout: str) -> tuple[bool, datetime | None]:
-    """Return whether the last `rate_limit_event` line of `stdout` rejects the run, and the UTC moment its limit resets, None when it gives no valid one."""
+    """Return whether the last `rate_limit_event` line of `stdout` rejects the run, and the UTC moment its limit resets, None when it gives no valid one.
+
+    An event whose `isUsingOverage` is true does not reject the run: the account goes on
+    past its limit.
+    """
     events = [
         line
         for line in _lines(stdout)
         if isinstance(line, dict) and line.get("type") == "rate_limit_event"
     ]
     info = events[-1].get("rate_limit_info") if events else None
-    if not isinstance(info, dict) or info.get("status") != "rejected":
+    if (
+        not isinstance(info, dict)
+        or info.get("status") != "rejected"
+        or info.get("isUsingOverage") is True
+    ):
         return False, None
     resets_at = info.get("resetsAt")
     if not isinstance(resets_at, int | float) or isinstance(resets_at, bool):
@@ -177,10 +195,15 @@ def _result_status(stdout: str) -> object:
     return None if result is None else result.get("api_error_status")
 
 
-def _structured_output(exited: ContainerExit, answer: object) -> tuple[Any] | str:
-    """Return, alone in a tuple, the structured output of `answer`, the result Claude Code wrote in the container `exited`, or why there is none, its text as read."""
+def _structured_output(
+    exited: ContainerExit, answer: object, no_answer: str
+) -> tuple[Any] | str:
+    """Return, alone in a tuple, the structured output of `answer`, the result Claude Code wrote in the container `exited`, or why there is none, its text as read.
+
+    `no_answer` is the reason given when `answer` is not a JSON object.
+    """
     if not isinstance(answer, dict):
-        reason = "the output of Claude Code is not a JSON object"
+        reason = no_answer
         if exited.code == 0:
             return reason
         stderr = " ".join(

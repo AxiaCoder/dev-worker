@@ -42,28 +42,28 @@ def test_a_structured_output_matching_the_schema_is_the_outcome() -> None:
     [
         pytest.param(
             ContainerExit(0, "Error: boom", ""),
-            "the output of Claude Code is not a JSON object",
+            "the output of Claude Code does not end on a result",
             id="not-json",
         ),
         pytest.param(
             ContainerExit(0, "[1, 2]", ""),
-            "the output of Claude Code is not a JSON object",
+            "the output of Claude Code does not end on a result",
             id="json-not-object",
         ),
         pytest.param(
             ContainerExit(0, "[" * 100_000 + "]" * 100_000, ""),
-            "the output of Claude Code is not a JSON object",
+            "the output of Claude Code does not end on a result",
             id="nested-too-deeply",
         ),
         pytest.param(
             ContainerExit(1, "", "OCI runtime failed\n\nfor good\n"),
-            "the output of Claude Code is not a JSON object; it exited with code 1: "
+            "the output of Claude Code does not end on a result; it exited with code 1: "
             "OCI runtime failed for good",
             id="not-json-nonzero-with-stderr",
         ),
         pytest.param(
             ContainerExit(2, "", ""),
-            "the output of Claude Code is not a JSON object; it exited with code 2",
+            "the output of Claude Code does not end on a result; it exited with code 2",
             id="not-json-nonzero-without-stderr",
         ),
         pytest.param(
@@ -273,8 +273,44 @@ def test_the_outcome_is_read_from_the_result_that_ends_the_stream() -> None:
 def test_a_stream_that_does_not_end_on_a_result_gives_why(stdout: str) -> None:
     assert (
         read_outcome(ContainerExit(0, stdout, ""), OUTCOMES, FALLBACK)
-        == "the output of Claude Code is not a JSON object"
+        == "the output of Claude Code does not end on a result"
     )
+
+
+def test_a_stream_cut_before_its_result_says_it_does_not_end_on_one() -> None:
+    exited = ContainerExit(0, stream(SYSTEM, {"type": "assistant"}), "")
+
+    found = read_outcome(exited, OUTCOMES, FALLBACK)
+
+    assert isinstance(found, str)
+    assert "does not end on a result" in found
+
+
+def test_a_rejected_rate_limit_using_overage_is_not_a_usage_limit() -> None:
+    overage = {
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+            "status": "rejected",
+            "resetsAt": 1792854600,
+            "rateLimitType": "five_hour",
+            "isUsingOverage": True,
+        },
+    }
+    exited = ContainerExit(
+        0,
+        stream(
+            SYSTEM,
+            overage,
+            {"type": "assistant"},
+            {"type": "result", "subtype": "error_max_turns", "is_error": True},
+        ),
+        "",
+    )
+
+    found = read_outcome(exited, OUTCOMES, FALLBACK)
+
+    assert not isinstance(found, UsageLimit)
+    assert isinstance(found, str)
 
 
 def test_a_usable_outcome_wins_over_a_rejected_rate_limit() -> None:
@@ -309,7 +345,7 @@ def test_a_rejected_rate_limit_without_a_result_is_a_usage_limit() -> None:
 
     assert read_outcome(exited, OUTCOMES, FALLBACK) == UsageLimit(
         RESET,
-        "the output of Claude Code is not a JSON object; it exited with code 1",
+        "the output of Claude Code does not end on a result; it exited with code 1",
     )
 
 
