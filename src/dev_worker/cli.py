@@ -94,6 +94,7 @@ CLAIM_TAKE_LIMIT_SECONDS = 300
 CLAIM_EXPIRY_SECONDS = 600
 TAKE_DATING_LIMIT_SECONDS = CLAIM_TAKE_LIMIT_SECONDS + TWG_TIMEOUT_SECONDS
 USAGE_LIMIT_FILE = "usage-limit.json"
+SHORT_SHA_LENGTH = 7
 
 
 class Benign(str):
@@ -1466,7 +1467,10 @@ def wake(instance_path: Path) -> RunReport | str | None:
     tickets in the real status of its `ready` key are listed in the tracker's rank order,
     and the first whose blockers are all in the real status of the `done` key is run
     under a fresh task_id, `wake-` followed by a UUID, as `run` runs a mandate (see
-    `run_journaled`). An instance that cannot be loaded, a recovery that fails, or a
+    `run_journaled`) — unless the CI of the default branch failed (see
+    `CodeRepository.base_ci_failure`): then no ticket is taken, and the sentence naming
+    the branch, the short SHA of the commit and its failed checks is returned. A CI
+    that cannot be read does not stop the wake. An instance that cannot be loaded, a recovery that fails, or a
     tracker that cannot list the tickets gives a failed output with no task_id, as a
     failure of the worker.
     """
@@ -1503,6 +1507,15 @@ def wake(instance_path: Path) -> RunReport | str | None:
     )
     if ticket is None:
         return None
+    try:
+        failure = make_repository(instance.repository).base_ci_failure()
+    except RepositoryError:
+        failure = None
+    if failure is not None:
+        return (
+            f"dev-worker takes no ticket: the CI of {failure.branch} is red at "
+            f"{failure.commit[:SHORT_SHA_LENGTH]} ({', '.join(failure.checks)})."
+        )
     mandate = MandateInput(
         contract_version=CONTRACT_VERSION,
         task_id=task_id,
@@ -2154,8 +2167,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     mandate; argparse exits with 2 on incorrect usage.
 
     `wake` writes the output of the run it made, or of its own failure, and nothing when
-    no ticket is ready; while the usage limit has not reset, it writes nothing on
-    stdout and the reason on stderr. It returns 1 when the worker failed (see
+    no ticket is ready; while the usage limit has not reset, or when the CI of the
+    default branch failed, it writes nothing on stdout and the reason on stderr. It returns 1 when the worker failed (see
     `RunReport`), 0 otherwise.
     """
     args = build_parser().parse_args(argv)

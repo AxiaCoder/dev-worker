@@ -11,7 +11,12 @@ import pytest
 
 from dev_worker.github import GitHubRepository
 from dev_worker.instance import Repository
-from dev_worker.repositories import HeadMovedError, PullRequest, RepositoryError
+from dev_worker.repositories import (
+    BaseCiFailure,
+    HeadMovedError,
+    PullRequest,
+    RepositoryError,
+)
 
 FAKE_GH = Path(__file__).with_name("fake_gh.py")
 TOKEN = "s3cret-token-value"
@@ -932,3 +937,352 @@ def test_gh_that_does_not_answer_is_stopped_at_the_timeout(
     assert str(raised.value) == f"gh did not answer within 0.5 seconds while {action}"
     assert TOKEN not in str(raised.value)
     assert elapsed < 10
+
+
+BASE_COMMIT = "abc1234def5678abc1234def5678abc1234def56"
+OLDER_COMMIT = "9999999def5678abc1234def5678abc1234def56"
+
+
+def action_run(
+    name: str, conclusion: str | None, run_id: int | None = 501, *, suite: bool = True
+) -> dict[str, Any]:
+    """Return a check run of the default branch query, of the workflow run `run_id`."""
+    check: dict[str, Any] = {
+        "__typename": "CheckRun",
+        "name": name,
+        "status": "COMPLETED" if conclusion else "IN_PROGRESS",
+        "conclusion": conclusion,
+    }
+    if suite:
+        check["checkSuite"] = {
+            "workflowRun": None if run_id is None else {"databaseId": run_id}
+        }
+    return check
+
+
+def base_commit(oid: str, *checks: dict[str, Any] | None) -> dict[str, Any]:
+    """Return a commit of the default branch history; `None` alone gives it no rollup."""
+    if checks == (None,):
+        return {"oid": oid, "statusCheckRollup": None}
+    return {"oid": oid, "statusCheckRollup": {"contexts": {"nodes": list(checks)}}}
+
+
+def base_history(*commits: dict[str, Any]) -> dict[str, Any]:
+    """Return the answer of the default branch query for a `main` branch of `commits`."""
+    return {
+        "data": {
+            "repository": {
+                "defaultBranchRef": {
+                    "name": "main",
+                    "target": {"history": {"nodes": list(commits)}},
+                }
+            }
+        }
+    }
+
+
+def job(conclusion: str, *steps: tuple[str, str]) -> dict[str, Any]:
+    """Return a job of `gh run view`, with its steps as (name, conclusion) pairs."""
+    return {
+        "conclusion": conclusion,
+        "steps": [{"name": name, "conclusion": state} for name, state in steps],
+    }
+
+
+def workflow_run(
+    conclusion: str, *jobs: dict[str, Any], attempt: int = 1
+) -> dict[str, Any]:
+    """Return the answer of `gh run view --json attempt,conclusion,jobs`."""
+    return {"attempt": attempt, "conclusion": conclusion, "jobs": list(jobs)}
+
+
+SETUP_FAILED = job("failure", ("Set up job", "failure"))
+TESTS_FAILED = job("failure", ("Set up job", "success"), ("Run tests", "failure"))
+RED = BaseCiFailure(branch="main", commit=BASE_COMMIT, checks=("tests",))
+
+
+def test_base_ci_failure_queries_the_default_branch_history_of_the_repository(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = answer_in_turn(
+        monkeypatch, record, base_history(base_commit(BASE_COMMIT, None))
+    )
+
+    assert repository().base_ci_failure() is None
+
+    ((api, graphql, query_flag, query, *variables),) = every_call(calls)
+    assert (api, graphql, query_flag) == ("api", "graphql", "-f")
+    assert query.startswith("query=")
+    assert "defaultBranchRef" in query and "history(first: 10)" in query
+    assert variables == ["-f", "owner=octo", "-f", "name=widgets"]
+
+
+def test_a_repository_without_a_default_branch_has_no_base_failure(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, {"data": {"repository": {"defaultBranchRef": None}}})
+
+    assert repository().base_ci_failure() is None
+
+
+@pytest.mark.parametrize(
+    "checks",
+    [
+        pytest.param([action_run("tests", "SUCCESS")], id="passed"),
+        pytest.param([action_run("tests", None)], id="running"),
+        pytest.param(
+            [action_run("tests", "SUCCESS"), context("SUCCESS")], id="passed-status"
+        ),
+    ],
+)
+def test_a_base_ci_that_passed_or_still_runs_is_not_a_failure(
+    record: Path, monkeypatch: pytest.MonkeyPatch, checks: list[dict[str, Any]]
+) -> None:
+    calls = answer_in_turn(
+        monkeypatch, record, base_history(base_commit(BASE_COMMIT, *checks))
+    )
+
+    assert repository().base_ci_failure() is None
+    assert len(every_call(calls)) == 1
+
+
+def test_the_base_ci_is_read_on_the_most_recent_commit_that_reports_a_check(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(
+        monkeypatch,
+        base_history(
+            base_commit(BASE_COMMIT, None),
+            base_commit("5555555def5678abc1234def5678abc1234def56"),
+            base_commit(OLDER_COMMIT, context("FAILURE")),
+            base_commit("7777777def5678abc1234def5678abc1234def56", context("SUCCESS")),
+        ),
+    )
+
+    assert repository().base_ci_failure() == BaseCiFailure(
+        branch="main", commit=OLDER_COMMIT, checks=("ci/legacy",)
+    )
+
+
+def test_a_history_without_checks_has_no_base_failure(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(
+        monkeypatch,
+        base_history(base_commit(BASE_COMMIT), base_commit(OLDER_COMMIT, None)),
+    )
+
+    assert repository().base_ci_failure() is None
+
+
+@pytest.mark.parametrize(
+    "checks",
+    [
+        pytest.param([context("ERROR")], id="status"),
+        pytest.param([action_run("tests", "FAILURE"), context("ERROR")], id="mixed"),
+        pytest.param([action_run("tests", "FAILURE", suite=False)], id="no-suite"),
+        pytest.param([action_run("tests", "FAILURE", None)], id="no-workflow-run"),
+    ],
+)
+def test_a_base_failure_outside_github_actions_is_not_rerun(
+    record: Path, monkeypatch: pytest.MonkeyPatch, checks: list[dict[str, Any]]
+) -> None:
+    calls = answer_in_turn(
+        monkeypatch, record, base_history(base_commit(BASE_COMMIT, *checks))
+    )
+
+    failure = repository().base_ci_failure()
+
+    assert failure is not None
+    assert failure.commit == BASE_COMMIT
+    assert len(every_call(calls)) == 1
+
+
+def test_a_base_failure_names_each_failed_check_once_in_order(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = answer_in_turn(
+        monkeypatch,
+        record,
+        base_history(
+            base_commit(
+                BASE_COMMIT,
+                action_run("lint", "FAILURE"),
+                action_run("build", "SUCCESS"),
+                action_run("tests", "TIMED_OUT"),
+                action_run("lint", "FAILURE"),
+            )
+        ),
+        workflow_run("failure", TESTS_FAILED),
+    )
+
+    assert repository().base_ci_failure() == BaseCiFailure(
+        branch="main", commit=BASE_COMMIT, checks=("lint", "tests")
+    )
+    assert every_call(calls)[1] == [
+        "run", "view", "501", "--json", "attempt,conclusion,jobs",
+        "--repo", "octo/widgets",
+    ]  # fmt: skip
+    assert len(every_call(calls)) == 2
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        pytest.param(workflow_run("failure", TESTS_FAILED), id="test-step"),
+        pytest.param(
+            workflow_run("failure", SETUP_FAILED, TESTS_FAILED), id="setup-and-test"
+        ),
+        pytest.param(workflow_run("timed_out", job("timed_out")), id="timed-out"),
+        pytest.param(workflow_run("failure", SETUP_FAILED, attempt=2), id="rerun"),
+        pytest.param(workflow_run("cancelled", attempt=2), id="cancelled-rerun"),
+    ],
+)
+def test_a_base_failure_of_the_code_or_already_rerun_is_not_rerun(
+    record: Path, monkeypatch: pytest.MonkeyPatch, run: dict[str, Any]
+) -> None:
+    calls = answer_in_turn(
+        monkeypatch,
+        record,
+        base_history(base_commit(BASE_COMMIT, action_run("tests", "FAILURE"))),
+        run,
+    )
+
+    assert repository().base_ci_failure() == RED
+    assert len(every_call(calls)) == 2
+
+
+@pytest.mark.parametrize(
+    ("run", "rerun"),
+    [
+        pytest.param(
+            workflow_run("failure", SETUP_FAILED, job("success"), job("cancelled")),
+            ["--failed"],
+            id="setup-step",
+        ),
+        pytest.param(
+            workflow_run("failure", job("failure")), ["--failed"], id="no-step"
+        ),
+        pytest.param(workflow_run("cancelled", TESTS_FAILED), [], id="cancelled"),
+        pytest.param(workflow_run("startup_failure"), [], id="startup-failure"),
+    ],
+)
+def test_a_base_failure_the_forge_caused_on_a_first_attempt_is_rerun_once(
+    record: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run: dict[str, Any],
+    rerun: list[str],
+) -> None:
+    calls = answer_in_turn(
+        monkeypatch,
+        record,
+        base_history(
+            base_commit(
+                BASE_COMMIT,
+                action_run("tests", "FAILURE"),
+                action_run("lint", "CANCELLED"),
+            )
+        ),
+        run,
+        "",
+    )
+
+    assert repository().base_ci_failure() is None
+    assert every_call(calls)[2] == [
+        "run", "rerun", "501", *rerun, "--repo", "octo/widgets",
+    ]  # fmt: skip
+
+
+def test_base_failures_of_two_runs_the_forge_caused_rerun_both(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = answer_in_turn(
+        monkeypatch,
+        record,
+        base_history(
+            base_commit(
+                BASE_COMMIT,
+                action_run("tests", "FAILURE", 501),
+                action_run("lint", "FAILURE", 502),
+            )
+        ),
+        workflow_run("failure", SETUP_FAILED),
+        workflow_run("cancelled"),
+        "",
+        "",
+    )
+
+    assert repository().base_ci_failure() is None
+    assert [call[:3] for call in every_call(calls)[1:]] == [
+        ["run", "view", "501"],
+        ["run", "view", "502"],
+        ["run", "rerun", "501"],
+        ["run", "rerun", "502"],
+    ]
+
+
+def test_a_base_failure_whose_rerun_fails_stays_a_failure(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer_in_turn(
+        monkeypatch,
+        record,
+        base_history(base_commit(BASE_COMMIT, action_run("tests", "FAILURE"))),
+        workflow_run("failure", SETUP_FAILED),
+        GhFailure("HTTP 403: Resource not accessible by integration"),
+    )
+
+    assert repository().base_ci_failure() == RED
+
+
+def test_a_workflow_run_that_cannot_be_read_raises(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer_in_turn(
+        monkeypatch,
+        record,
+        base_history(base_commit(BASE_COMMIT, action_run("tests", "FAILURE"))),
+        GhFailure("HTTP 404: Not Found"),
+    )
+
+    with pytest.raises(
+        RepositoryError, match="^gh failed while reading workflow run 501: HTTP 404"
+    ):
+        repository().base_ci_failure()
+
+
+def test_a_workflow_run_of_the_wrong_shape_raises(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer_in_turn(
+        monkeypatch,
+        record,
+        base_history(base_commit(BASE_COMMIT, action_run("tests", "FAILURE"))),
+        {"attempt": "first"},
+    )
+
+    with pytest.raises(
+        RepositoryError,
+        match="^the answer of gh to reading workflow run 501 cannot be read",
+    ):
+        repository().base_ci_failure()
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        {"data": {}},
+        {"data": {"repository": {"defaultBranchRef": {"name": "main"}}}},
+        base_history(base_commit(BASE_COMMIT, {"__typename": "CheckRun"})),
+    ],
+)
+def test_a_default_branch_answer_of_the_wrong_shape_raises(
+    record: Path, monkeypatch: pytest.MonkeyPatch, stdout: object
+) -> None:
+    answer(monkeypatch, stdout)
+
+    with pytest.raises(
+        RepositoryError,
+        match="^the answer of gh to reading the CI of the default branch cannot be",
+    ):
+        repository().base_ci_failure()

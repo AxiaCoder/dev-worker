@@ -33,6 +33,7 @@ from dev_worker.jira import TWG_TIMEOUT_SECONDS, JiraTracker
 from dev_worker.outcome import Outcome
 from dev_worker.plugin import PluginCheckout, PluginError
 from dev_worker.repositories import (
+    BaseCiFailure,
     CiState,
     HeadMovedError,
     PullRequest,
@@ -149,6 +150,7 @@ class ReachableRepository:
     def __init__(self) -> None:
         self.pull: PullRequest | None = PULL
         self.ci: CiState = "passed"
+        self.base_failure: BaseCiFailure | None = None
         self.errors: dict[str, RepositoryError] = {}
         self.calls: list[tuple[str, object]] = []
 
@@ -169,6 +171,11 @@ class ReachableRepository:
         """Record the call; return `ci`."""
         self._step("read_ci", pull_request)
         return self.ci
+
+    def base_ci_failure(self) -> BaseCiFailure | None:
+        """Record the call; return `base_failure`."""
+        self._step("base_ci_failure", None)
+        return self.base_failure
 
     def merge(self, pull_request: PullRequest) -> None:
         """Record the call."""
@@ -8695,3 +8702,59 @@ def test_a_run_dead_after_its_ticket_came_back_from_the_usage_limit_is_its_first
         )
     ]
     assert stub.moves == [("DEMO-1", "To Do")]
+
+
+def test_wake_on_a_red_default_branch_takes_no_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = list_tickets(monkeypatch)
+    reachable_repository.base_failure = BaseCiFailure(
+        branch="main",
+        commit="abc1234def5678abc1234def5678abc1234def56",
+        checks=("lint", "tests"),
+    )
+
+    code = cli.main(["wake", "--instance", str(instance)])
+
+    captured = capsysbinary.readouterr()
+    assert code == 0
+    assert captured.out == b""
+    assert captured.err.decode("utf-8") == (
+        "dev-worker takes no ticket: the CI of main is red at abc1234 (lint, tests).\n"
+    )
+    assert stub.reads == []
+    assert stub.posted == []
+    assert reachable_repository.calls == [("base_ci_failure", None)]
+
+
+@pytest.mark.usefixtures("workspace", "container", "plugin")
+def test_wake_whose_default_branch_ci_cannot_be_read_takes_its_ticket(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    reachable_repository: ReachableRepository,
+) -> None:
+    list_tickets(monkeypatch)
+    reachable_repository.errors["base_ci_failure"] = RepositoryError("gh broke")
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert code == 0
+    assert answer is not None
+    assert answer["status"] == "completed"
+    assert reachable_repository.calls[0] == ("base_ci_failure", None)
+
+
+def test_wake_without_a_ready_ticket_does_not_read_the_default_branch_ci(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    reachable_repository: ReachableRepository,
+) -> None:
+    list_tickets(monkeypatch, listed=())
+
+    assert wake(capsysbinary, instance) == (0, None)
+    assert reachable_repository.calls == []

@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 from dev_worker.header import _describe
 from dev_worker.instance import Repository
 from dev_worker.repositories import (
+    BaseCiFailure,
     CiState,
     HeadMovedError,
     PullRequest,
@@ -92,6 +93,151 @@ class _StateAnswer(BaseModel):
     state: str
 
 
+class _WorkflowRunReference(BaseModel):
+    """The GitHub Actions workflow run of a check suite, by its id."""
+
+    databaseId: int
+
+
+class _CheckSuite(BaseModel):
+    """The check suite of a check run, with its workflow run when GitHub Actions made it."""
+
+    workflowRun: _WorkflowRunReference | None = None
+
+
+class _NamedCheckRun(_CheckRun):
+    """A check run with its name and check suite, as the default branch query writes it."""
+
+    name: str
+    checkSuite: _CheckSuite | None = None
+
+
+class _NamedStatusContext(_StatusContext):
+    """A commit status with its name, as the default branch query writes it."""
+
+    context: str
+
+
+class _Contexts(BaseModel):
+    """The checks of a commit, as `statusCheckRollup.contexts` writes them."""
+
+    nodes: list[
+        Annotated[_NamedCheckRun | _NamedStatusContext, Field(discriminator="typename")]
+    ]
+
+
+class _Rollup(BaseModel):
+    """The `statusCheckRollup` of a commit."""
+
+    contexts: _Contexts
+
+
+class _HistoryCommit(BaseModel):
+    """A commit of the default branch with its checks; `statusCheckRollup` is `None` when it has none."""
+
+    oid: str
+    statusCheckRollup: _Rollup | None = None
+
+
+class _History(BaseModel):
+    """The most recent commits of the default branch."""
+
+    nodes: list[_HistoryCommit]
+
+
+class _BranchTarget(BaseModel):
+    """The commit the default branch points to, by its history."""
+
+    history: _History
+
+
+class _BranchReference(BaseModel):
+    """The default branch, by its name and the commit it points to."""
+
+    name: str
+    target: _BranchTarget
+
+
+class _BaseRepository(BaseModel):
+    """The repository of the default branch query; `defaultBranchRef` is `None` when it has no commit."""
+
+    defaultBranchRef: _BranchReference | None = None
+
+
+class _BaseData(BaseModel):
+    """The `data` of the default branch query."""
+
+    repository: _BaseRepository
+
+
+class _BaseAnswer(BaseModel):
+    """The answer of `gh api graphql` to the default branch query."""
+
+    data: _BaseData
+
+
+class _Step(BaseModel):
+    """A step of a job, as `gh run view --json jobs` writes it."""
+
+    name: str
+    conclusion: str
+
+
+class _Job(BaseModel):
+    """A job of a workflow run, as `gh run view --json jobs` writes it."""
+
+    conclusion: str
+    steps: list[_Step]
+
+
+class _RunAnswer(BaseModel):
+    """The answer of `gh run view --json attempt,conclusion,jobs`."""
+
+    attempt: int
+    conclusion: str
+    jobs: list[_Job]
+
+
+BASE_HISTORY_DEPTH = 10
+BASE_CONTEXTS_PAGE_SIZE = 100
+BASE_CI_QUERY = f"""
+query($owner: String!, $name: String!) {{
+  repository(owner: $owner, name: $name) {{
+    defaultBranchRef {{
+      name
+      target {{
+        ... on Commit {{
+          history(first: {BASE_HISTORY_DEPTH}) {{
+            nodes {{
+              oid
+              statusCheckRollup {{
+                contexts(first: {BASE_CONTEXTS_PAGE_SIZE}) {{
+                  nodes {{
+                    __typename
+                    ... on CheckRun {{
+                      name
+                      status
+                      conclusion
+                      checkSuite {{ workflowRun {{ databaseId }} }}
+                    }}
+                    ... on StatusContext {{ context state }}
+                  }}
+                }}
+              }}
+            }}
+          }}
+        }}
+      }}
+    }}
+  }}
+}}
+"""
+FORGE_RUN_CONCLUSIONS = frozenset({"cancelled", "startup_failure"})
+FINE_JOB_CONCLUSIONS = frozenset({"success", "neutral", "skipped", "cancelled"})
+FAILURE = "failure"
+SETUP_STEP = "Set up job"
+FIRST_ATTEMPT = 1
+
 MERGED = "MERGED"
 ACTIVE = "active"
 WORKFLOW_FILES_DIRECTORY = ".github/workflows/"
@@ -106,6 +252,44 @@ def _parse_json(text: str) -> object:
         return json.loads(text)
     except (ValueError, RecursionError):
         return _UNREADABLE
+
+
+def _forge_caused(run: _RunAnswer) -> bool:
+    """Return whether the failure of the workflow run `run` is the forge's rather than the code's.
+
+    It is when the run was cancelled or failed to start, or when each of its jobs that
+    did not pass was cancelled or failed with no failed step but the setup one.
+    """
+    if run.conclusion in FORGE_RUN_CONCLUSIONS:
+        return True
+    return all(
+        job.conclusion in FINE_JOB_CONCLUSIONS
+        or (
+            job.conclusion == FAILURE
+            and all(
+                step.name == SETUP_STEP
+                for step in job.steps
+                if step.conclusion == FAILURE
+            )
+        )
+        for job in run.jobs
+    )
+
+
+def _workflow_runs(
+    checks: Sequence[_NamedCheckRun | _NamedStatusContext],
+) -> tuple[int, ...] | None:
+    """Return the ids of the GitHub Actions workflow runs of `checks`, each once in the order met, or `None` when one of them belongs to none."""
+    runs: dict[int, None] = {}
+    for check in checks:
+        if (
+            not isinstance(check, _NamedCheckRun)
+            or check.checkSuite is None
+            or check.checkSuite.workflowRun is None
+        ):
+            return None
+        runs[check.checkSuite.workflowRun.databaseId] = None
+    return tuple(runs)
 
 
 def _check_state(check: _CheckRun | _StatusContext) -> CiState:
@@ -287,6 +471,102 @@ class GitHubRepository:
                 f"pull request #{number} is not merged once gh answered: its state "
                 f"is {state}; a merge queue may hold it."
             )
+
+    def base_ci_failure(self) -> BaseCiFailure | None:
+        """Return the failure of the CI of the most recent of the last 10 commits of the default branch that reports a check, or `None` when it did not fail.
+
+        Its first 100 checks are read; it failed when one failed, as `read_ci` reads a
+        check, even while others still run. When every failed check belongs to a GitHub
+        Actions workflow run on its first attempt whose failure the forge caused (see
+        `_forge_caused`), those runs are rerun — their failed jobs, or the whole run when
+        it was cancelled or failed to start — and this returns `None`; when a rerun
+        fails, the failure is returned. `None` too when the repository has no commit or
+        none of those commits reports a check.
+
+        Raises `RepositoryError` when the token variable is not set, or `gh` fails or
+        its answer cannot be read while reading the commits or their workflow runs.
+        """
+        action = "reading the CI of the default branch"
+        owner, _, name = self._repository.name.partition("/")
+        answer = self._run_json(
+            action,
+            [
+                "api",
+                "graphql",
+                "-f",
+                f"query={BASE_CI_QUERY}",
+                "-f",
+                f"owner={owner}",
+                "-f",
+                f"name={name}",
+            ],
+            on_repository=False,
+        )
+        try:
+            branch = _BaseAnswer.model_validate(answer).data.repository.defaultBranchRef
+        except ValidationError as error:
+            raise self._unreadable(action, error) from None
+        if branch is None:
+            return None
+        for commit in branch.target.history.nodes:
+            rollup = commit.statusCheckRollup
+            if rollup is not None and rollup.contexts.nodes:
+                return self._settle_failure(branch.name, commit.oid, rollup.contexts)
+        return None
+
+    def _settle_failure(
+        self, branch: str, commit: str, contexts: _Contexts
+    ) -> BaseCiFailure | None:
+        """Return the failure of the checks `contexts` of `commit` on `branch`, or `None` when none failed or the forge's failure was rerun, as `base_ci_failure` says.
+
+        Raises `RepositoryError` as `_read_run` does.
+        """
+        failed = [check for check in contexts.nodes if _check_state(check) == "failed"]
+        if not failed:
+            return None
+        failure = BaseCiFailure(
+            branch=branch,
+            commit=commit,
+            checks=tuple(
+                dict.fromkeys(
+                    check.name if isinstance(check, _NamedCheckRun) else check.context
+                    for check in failed
+                )
+            ),
+        )
+        runs = _workflow_runs(failed)
+        if runs is None:
+            return failure
+        answers = {run: self._read_run(run) for run in runs}
+        if not all(
+            answer.attempt == FIRST_ATTEMPT and _forge_caused(answer)
+            for answer in answers.values()
+        ):
+            return failure
+        try:
+            for run, answer in answers.items():
+                whole = answer.conclusion in FORGE_RUN_CONCLUSIONS
+                self._run(
+                    f"rerunning workflow run {run}",
+                    ["run", "rerun", str(run), *([] if whole else ["--failed"])],
+                )
+        except RepositoryError:
+            return failure
+        return None
+
+    def _read_run(self, run: int) -> _RunAnswer:
+        """Return the attempt, conclusion and jobs of the GitHub Actions workflow run `run`.
+
+        Raises `RepositoryError` as `_run_json` does, and when the answer cannot be read.
+        """
+        action = f"reading workflow run {run}"
+        answer = self._run_json(
+            action, ["run", "view", str(run), "--json", "attempt,conclusion,jobs"]
+        )
+        try:
+            return _RunAnswer.model_validate(answer)
+        except ValidationError as error:
+            raise self._unreadable(action, error) from None
 
     def _has_active_workflow(self) -> bool:
         """Return whether one of the first 100 GitHub Actions workflows of the repository is active and defined by a workflow file.
