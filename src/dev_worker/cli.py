@@ -659,6 +659,8 @@ def run_journaled(
     record = {
         "task_id": task_id,
         "ticket_key": ticket_key,
+        "model": instance.agent.model,
+        "review_model": instance.agent.review_model,
         "start": start,
         "pid": os.getpid(),
     }
@@ -807,6 +809,8 @@ def run_under_lock(
     entry: dict[str, object] = {
         "task_id": task_id,
         "ticket_key": mandate.params["ticket_key"],
+        "model": instance.agent.model,
+        "review_model": instance.agent.review_model,
         "status": "running",
         "start": start,
         "duration": None,
@@ -1112,7 +1116,10 @@ def run_review(
     if isinstance(environment, str):
         return f"the guard review of the pull request {url} did not run. {environment}"
     command = review_command(
-        base, pull_request.head, instance.limits["review_max_turns"]
+        base,
+        pull_request.head,
+        instance.limits["review_max_turns"],
+        instance.agent.review_model,
     )
     try:
         exited = make_container(instance.container.image, directory).run(
@@ -1182,7 +1189,12 @@ def run_container(
     outcomes = list(worker.header.outcomes.model_dump())
     ci_deadline = datetime.now(UTC) + timedelta(seconds=left - CI_WAIT_MARGIN_SECONDS)
     command = agent_command(
-        ticket, worker.body, instance.limits["max_turns"], outcomes, ci_deadline
+        ticket,
+        worker.body,
+        instance.limits["max_turns"],
+        outcomes,
+        ci_deadline,
+        instance.agent.model,
     )
     try:
         exited = make_container(instance.container.image, directory).run(
@@ -1808,7 +1820,7 @@ def take_over_lock(
     """Take the lock of `directory` from a run that is gone, writing `record` in it.
 
     The gone run (see `gone_reason`) is journaled first, as a failed run with the
-    `task_id`, `ticket_key` and `start` of its lock record and the reason it is gone
+    `task_id`, `ticket_key`, `model`, `review_model` and `start` of its lock record and the reason it is gone
     in `errors`; a torn last journal line is set aside before. Returns the lock file
     path, or why the lock cannot be taken: its run is
     not gone, another run took it first, both `Benign`, or a file cannot be read or
@@ -1830,6 +1842,8 @@ def take_over_lock(
     entry = {
         "task_id": held.get("task_id"),
         "ticket_key": held.get("ticket_key"),
+        "model": held.get("model"),
+        "review_model": held.get("review_model"),
         "status": "failed",
         "start": held.get("start"),
         "duration": None,

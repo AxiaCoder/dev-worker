@@ -415,6 +415,12 @@ def test_valid_ticket_key_completes_and_journals_the_run(
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
 ) -> None:
+    text = instance.read_text(encoding="utf-8")
+    instance.write_text(
+        text.replace("  review_model: opus\n", "  review_model: sonnet\n"),
+        encoding="utf-8",
+    )
+
     answer = run_mandate(
         monkeypatch, capsysbinary, encode(valid_input()), instance=instance
     )
@@ -427,6 +433,8 @@ def test_valid_ticket_key_completes_and_journals_the_run(
     assert running == {
         "task_id": "task-1",
         "ticket_key": "DEMO-1",
+        "model": "opus",
+        "review_model": "sonnet",
         "status": "running",
         "start": line["start"],
         "duration": None,
@@ -435,6 +443,8 @@ def test_valid_ticket_key_completes_and_journals_the_run(
     assert line.keys() == {
         "task_id",
         "ticket_key",
+        "model",
+        "review_model",
         "status",
         "start",
         "duration",
@@ -442,6 +452,8 @@ def test_valid_ticket_key_completes_and_journals_the_run(
     }
     assert line["task_id"] == "task-1"
     assert line["ticket_key"] == "DEMO-1"
+    assert line["model"] == "opus"
+    assert line["review_model"] == "sonnet"
     assert line["status"] == "completed"
     assert datetime.fromisoformat(str(line["start"])).utcoffset() == timedelta(0)
     duration = line["duration"]
@@ -1625,14 +1637,28 @@ def test_lock_holds_the_run_in_progress(
         return cli.deliver_ticket(mandate, resolved, outcome)
 
     monkeypatch.setitem(cli.MANDATES, "deliver_ticket", peek)
+    text = instance.read_text(encoding="utf-8")
+    instance.write_text(
+        text.replace("  review_model: opus\n", "  review_model: sonnet\n"),
+        encoding="utf-8",
+    )
 
     run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
 
     (record,) = seen
-    assert record.keys() == {"task_id", "ticket_key", "start", "pid"}
+    assert record.keys() == {
+        "task_id",
+        "ticket_key",
+        "model",
+        "review_model",
+        "start",
+        "pid",
+    }
     assert record["pid"] == os.getpid()
     assert record["task_id"] == "task-1"
     assert record["ticket_key"] == "DEMO-1"
+    assert record["model"] == "opus"
+    assert record["review_model"] == "sonnet"
     assert record["start"] == journal_lines(instance)[0]["start"]
 
 
@@ -1845,6 +1871,11 @@ def test_container_runs_claude_on_the_ticket_with_the_worker_rules_and_only_the_
     frozen_now: datetime,
 ) -> None:
     slow_refresh(monkeypatch, workspace, 0)
+    text = instance.read_text(encoding="utf-8")
+    instance.write_text(
+        text.replace("  review_model: opus\n", "  review_model: sonnet\n"),
+        encoding="utf-8",
+    )
 
     answer = run_mandate(
         monkeypatch, capsysbinary, encode(valid_input()), instance=instance
@@ -1860,8 +1891,9 @@ def test_container_runs_claude_on_the_ticket_with_the_worker_rules_and_only_the_
             40,
             ["done", "blocked", "needs_human", "abandoned"],
             frozen_now + timedelta(seconds=1020),
+            "opus",
         ),
-        review_command(BASE_COMMIT, PULL.head, 40),
+        review_command(BASE_COMMIT, PULL.head, 40, "sonnet"),
     ]
     assert container.environments == [
         {
@@ -3629,6 +3661,8 @@ def test_state_answers_while_a_run_holds_the_lock(
         {
             "task_id": "task-1",
             "ticket_key": "DEMO-1",
+            "model": "opus",
+            "review_model": "opus",
             "start": NOW.isoformat(),
             "pid": os.getpid(),
         }
@@ -4870,6 +4904,8 @@ def lock_of(seconds_ago: float, **fields: object) -> bytes:
     record: dict[str, object] = {
         "task_id": "old",
         "ticket_key": "DEMO-7",
+        "model": "claude-opus-4-1",
+        "review_model": "sonnet",
         "start": (NOW - timedelta(seconds=seconds_ago)).isoformat(),
     }
     record.update(fields)
@@ -4881,6 +4917,8 @@ def gone_line(seconds_ago: float, reason: str) -> dict[str, object]:
     return {
         "task_id": "old",
         "ticket_key": "DEMO-7",
+        "model": "claude-opus-4-1",
+        "review_model": "sonnet",
         "status": "failed",
         "start": (NOW - timedelta(seconds=seconds_ago)).isoformat(),
         "duration": None,
@@ -5060,6 +5098,8 @@ def test_run_takes_over_a_lock_of_unknown_details_held_beyond_the_timeout(
     old, _, own = journal_lines(instance)
     assert old["task_id"] is None
     assert old["ticket_key"] is None
+    assert old["model"] is None
+    assert old["review_model"] is None
     assert old["start"] is None
     assert old["errors"] == [timed_out(instance, 1801)]
     assert own["task_id"] == "task-1"
@@ -6570,7 +6610,7 @@ def test_done_is_reviewed_read_only_without_repository_or_tracker_tokens_then_me
     assert (step, mounted, plugin_checkout) == ("run", workspace.review, CHECKOUT)
     assert isinstance(time_left, float)
     assert 0 < time_left <= 1800
-    assert container.commands[-1] == review_command(BASE_COMMIT, PULL.head, 40)
+    assert container.commands[-1] == review_command(BASE_COMMIT, PULL.head, 40, "opus")
     review_environment = container.environments[-1]
     assert "GH_TOKEN" not in review_environment
     assert "TWG_TOKEN" not in review_environment
@@ -6594,7 +6634,7 @@ def test_review_max_turns_of_the_instance_caps_the_review(
 
     run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
 
-    assert container.commands[-1] == review_command(BASE_COMMIT, PULL.head, 12)
+    assert container.commands[-1] == review_command(BASE_COMMIT, PULL.head, 12, "opus")
 
 
 def test_done_whose_review_finds_defects_is_not_merged_and_lists_them_in_the_comment(

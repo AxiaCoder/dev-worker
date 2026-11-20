@@ -222,10 +222,12 @@ def test_outcome_schema_requires_one_of_the_outcomes_and_a_message() -> None:
     }
 
 
-def test_agent_command_runs_claude_headless_with_the_rules_plugin_turns_and_schema() -> (
+def test_agent_command_runs_claude_headless_with_the_rules_plugin_model_turns_and_schema() -> (
     None
 ):
-    command = agent_command(TICKET, "# Worker\nRules.\n", 40, OUTCOMES, DEADLINE)
+    command = agent_command(
+        TICKET, "# Worker\nRules.\n", 40, OUTCOMES, DEADLINE, "claude-opus-4-1"
+    )
 
     assert command == (
         "claude",
@@ -235,6 +237,8 @@ def test_agent_command_runs_claude_headless_with_the_rules_plugin_turns_and_sche
         "# Worker\nRules.\n",
         "--plugin-dir",
         "/plugin",
+        "--model",
+        "claude-opus-4-1",
         "--max-turns",
         "40",
         "--permission-mode",
@@ -724,10 +728,10 @@ def test_review_prompt_keeps_the_review_off_gh_and_asks_for_reviewed_false_when_
     assert "`reviewed` is false, `reason` says why" in prompt
 
 
-def test_review_command_runs_the_reviewer_agent_headless_with_its_turns_and_schema() -> (
+def test_review_command_runs_the_reviewer_agent_headless_with_its_model_turns_and_schema() -> (
     None
 ):
-    command = review_command("b" * 40, "h" * 40, 25)
+    command = review_command("b" * 40, "h" * 40, 25, "sonnet")
 
     assert command == (
         "claude",
@@ -737,6 +741,8 @@ def test_review_command_runs_the_reviewer_agent_headless_with_its_turns_and_sche
         "atelier:reviewer",
         "--plugin-dir",
         "/plugin",
+        "--model",
+        "sonnet",
         "--max-turns",
         "25",
         "--permission-mode",

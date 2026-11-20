@@ -99,13 +99,14 @@ def agent_command(
     max_turns: int,
     outcomes: Sequence[str],
     ci_deadline: datetime,
+    model: str,
 ) -> tuple[str, ...]:
     """Return the command that runs Claude Code headless on `ticket` in the container.
 
     The prompt carries `ci_deadline` (see `ticket_prompt`). `rules` is appended to its
     system prompt, `max_turns` caps its turns and `outcomes`
     are the outcomes it may end on (see `outcome_schema`); it loads the plugin mounted at
-    `PLUGIN_DIR`, runs in `bypassPermissions` mode, never prompting for a permission, and
+    `PLUGIN_DIR`, runs on `model`, passed by `--model`, runs in `bypassPermissions` mode, never prompting for a permission, and
     answers in JSON.
     """
     return (
@@ -116,6 +117,8 @@ def agent_command(
         rules,
         "--plugin-dir",
         PLUGIN_DIR,
+        "--model",
+        model,
         "--max-turns",
         str(max_turns),
         "--permission-mode",
@@ -185,11 +188,12 @@ def review_prompt(base: str, head: str) -> str:
     )
 
 
-def review_command(base: str, head: str, max_turns: int) -> tuple[str, ...]:
+def review_command(base: str, head: str, max_turns: int, model: str) -> tuple[str, ...]:
     """Return the command that runs the guard review of the change from the commit `base` to the commit `head`.
 
     Claude Code runs headless as the `REVIEWER_AGENT` of the plugin mounted at
-    `PLUGIN_DIR` (see `review_prompt`), `max_turns` capping its turns, in
+    `PLUGIN_DIR` (see `review_prompt`) on `model`, passed by `--model`, `max_turns`
+    capping its turns, in
     `bypassPermissions` mode, and answers in JSON by `verdict_schema`.
     """
     return (
@@ -200,6 +204,8 @@ def review_command(base: str, head: str, max_turns: int) -> tuple[str, ...]:
         REVIEWER_AGENT,
         "--plugin-dir",
         PLUGIN_DIR,
+        "--model",
+        model,
         "--max-turns",
         str(max_turns),
         "--permission-mode",

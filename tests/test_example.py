@@ -27,3 +27,5 @@ def test_example_instance_sets_the_run_keys() -> None:
     assert instance.container.image == "ghcr.io/example-org/example-app-agent:1.0.0"
     assert instance.git.name == "Example Worker"
     assert instance.git.email.endswith("@users.noreply.github.com")
+    assert instance.agent.model == "opus"
+    assert instance.agent.review_model == "opus"

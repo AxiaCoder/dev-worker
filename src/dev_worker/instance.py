@@ -151,13 +151,17 @@ class Agent(BaseModel):
     """The AI agent a run starts in its container, how it signs in, and the variable holding its credential.
 
     `provider` is `subscription` for a Claude Code OAuth token or `api_key` for an
-    Anthropic API key; `token_env` names the variable holding that credential.
+    Anthropic API key; `token_env` names the variable holding that credential. `model`
+    is the model the agent runs on and `review_model` the one the guard review runs on,
+    each a model name or an alias Claude Code accepts by `--model`.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     provider: Provider
     token_env: EnvName
+    model: Name
+    review_model: Name
 
 
 class Container(BaseModel):

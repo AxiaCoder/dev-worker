@@ -25,6 +25,10 @@ repository:
 agent:
   provider: subscription
   token_env: CLAUDE_CODE_OAUTH_TOKEN
+  # The model of the agent and of the guard review, passed to Claude Code by --model; an
+  # alias like opus follows the latest version of its family.
+  model: opus
+  review_model: opus
 
 # The name of the branch a run works on; {key} is replaced by the ticket key.
 branch: agent/{key}
