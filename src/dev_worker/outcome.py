@@ -90,10 +90,10 @@ def read_verdict(exited: ContainerExit) -> tuple[Defect, ...] | str:
     `defects`, a list of objects each holding exactly `file`, a string, `line`, an
     integer from 1, and `summary`, a string, and when `reviewed` is true: an empty list
     is then a review that found no reachable defect. Otherwise the reason is a clause
-    saying why, as `read_outcome` gives it, an output that is not a JSON object saying
-    so where `read_outcome` says it does not end on a result; a `reviewed` false gives "the review did not
-    take place: " followed by the `reason` of the verdict. The file, the summary and the
-    reason are made writable as `read_outcome` makes its message.
+    saying why, as `read_outcome` gives it, except that an output that is no JSON object
+    is said not to be one; a `reviewed` false gives "the review did not take place: "
+    followed by the `reason` of the verdict. The file, the summary and the reason are
+    made writable as `read_outcome` makes its message.
     """
     found = _structured_output(
         exited,
