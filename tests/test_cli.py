@@ -8659,3 +8659,39 @@ def test_usage_limit_whose_work_cannot_be_rescued_blocks_the_ticket(
     ((_, body),) = stub.comments
     assert body.startswith("The run ended without a usable outcome: ")
     assert not usage_limit_file(instance).exists()
+
+
+@pytest.mark.usefixtures("workspace", "plugin", "reachable_repository")
+def test_a_run_dead_after_its_ticket_came_back_from_the_usage_limit_is_its_first_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+) -> None:
+    limited = list_tickets(monkeypatch)
+    container.exited = ending_at_the_usage_limit(usage_limit_event("rejected"))
+    wake(capsysbinary, instance)
+    assert limited.moves[-1] == ("DEMO-1", "To Do")
+    ((_, limit_comment),) = limited.comments
+    stub = timeline(
+        monkeypatch,
+        *DEAD_RUN,
+        ("comment", limit_comment),
+        ENTERS_READY,
+        ("claim", "t2"),
+        ENTERS_IN_PROGRESS,
+    )
+
+    code, answer = wake(capsysbinary, instance)
+
+    assert (code, answer) == (0, None)
+    assert stub.comments == [
+        (
+            "DEMO-1",
+            (
+                f"{REQUEUE}the run that took it is gone without settling it "
+                "(attempt 1 of 3)."
+            ),
+        )
+    ]
+    assert stub.moves == [("DEMO-1", "To Do")]
