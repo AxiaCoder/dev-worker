@@ -37,6 +37,7 @@ from dev_worker.contract import (
     State,
 )
 from dev_worker.github import GitHubRepository
+from dev_worker.handover import handover_reason
 from dev_worker.header import HeaderError, WorkerFile, load_worker_file
 from dev_worker.instance import (
     CI_WAIT_MARGIN_SECONDS,
@@ -501,8 +502,13 @@ def land_done(
     head commit. The status key is `done` once merged; the one the header of `worker`
     ties the `done` outcome to when the ticket carries the `hold_merge_label` of
     `instance` at either read, the pull request left open, and not reviewed when it
-    carries it at the first read; the one it ties `blocked` to when there is no pull request, its CI has
+    carries it at the first read. When `instance` declares a `handover`, the files of the
+    pull request are read after that first read: when `handover_reason` gives a reason,
+    the status key is that same `done` outcome's, the pull request left open, neither
+    reviewed nor merged, and the body says why. The status key is the one the header ties
+    `blocked` to when there is no pull request, its CI has
     not passed, the review found a reachable defect or gave no verdict, or a step fails,
+    the files of the pull request unreadable included,
     the pull request left open and nothing retried. The body is `summary` followed by
     what happened, the defects found listed; after a merge that failed for a reason
     other than a moved head, it says the merge may have happened. The reason the ticket
@@ -561,6 +567,18 @@ def land_done(
     )
     if held:
         return outcomes.done, left_open, None, errors
+    if instance.handover is not None:
+        try:
+            files = repository.changed_files(pull_request)
+        except RepositoryError as error:
+            return blocked(str(error))
+        handed_over = handover_reason(files, instance.handover)
+        if handed_over is not None:
+            left_for_human = (
+                f"{summary}\n\nThe pull request {pull_request.url} is left open for "
+                f"a human: {handed_over}"
+            )
+            return outcomes.done, left_for_human, None, errors
     reason, removal = review_pull_request(
         pull_request, instance, worker, directory, began
     )
