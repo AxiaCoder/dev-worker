@@ -199,6 +199,41 @@ class GitIdentity(BaseModel):
     email: Name
 
 
+def _check_path_pattern(value: str) -> str:
+    """Return `value` when it is a glob relative to the repository root; raise `ValueError` when it is blank, starts with `/`, holds a backslash, or has a `.` or `..` segment."""
+    if not value.strip():
+        raise ValueError("must not be blank")
+    if value.startswith("/") or "\\" in value:
+        raise ValueError(
+            "must be relative to the repository root and use forward slashes,"
+            " e.g. src/auth/**"
+        )
+    if {".", ".."} & set(value.split("/")):
+        raise ValueError("must not have a . or .. segment, e.g. src/auth/**")
+    return value
+
+
+PathPattern = Annotated[str, AfterValidator(_check_path_pattern)]
+
+
+class Handover(BaseModel):
+    """What leaves a pull request open for a human instead of merging it.
+
+    `sensitive_paths` holds the glob patterns of the paths a merge never touches alone.
+    `max_changed_lines` is the most lines, added plus removed, a pull request may change
+    outside its tests and still merge, or `None` when there is no bound; `test_paths`
+    holds the glob patterns of the test files that count does not include. Patterns are
+    relative to the repository root and matched in full, case-sensitively; `**` spans
+    directories.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    sensitive_paths: tuple[PathPattern, ...] = ()
+    max_changed_lines: Ceiling | None = None
+    test_paths: tuple[PathPattern, ...] = ()
+
+
 class _InstanceData(BaseModel):
     """An instance file as written, before it is checked against a header."""
 
@@ -213,6 +248,7 @@ class _InstanceData(BaseModel):
     statuses: Mapping[StatusKey, Name]
     hold_merge_label: Name
     limits: Mapping[CeilingName, Ceiling] = Field(default_factory=dict)
+    handover: Handover | None = None
 
 
 @dataclass(frozen=True)
@@ -224,6 +260,8 @@ class Instance:
     `hold_merge_label` is the ticket label that holds a merge back.
     `limits` maps every ceiling name of the header to its effective value: the instance's
     own when it sets one, the header ceiling otherwise. Both mappings are read-only.
+    `handover` says what leaves a pull request open for a human, or is `None` when the
+    instance declares nothing.
     """
 
     tracker: Tracker
@@ -235,6 +273,7 @@ class Instance:
     statuses: Mapping[str, str]
     hold_merge_label: str
     limits: Mapping[str, int]
+    handover: Handover | None = None
 
 
 def _status_problems(statuses: Mapping[str, str], header: Header) -> list[str]:
@@ -309,6 +348,27 @@ def _repository_problems(repository: Repository) -> list[str]:
     return [problem]
 
 
+def _handover_problems(handover: Handover | None, written: bool) -> list[str]:
+    """Return the sentence saying `handover` or its `max_changed_lines` has no value, `handover` declares nothing, or sets only one of `max_changed_lines` and `test_paths`, if so; no value is quoted.
+
+    `written` tells whether the instance file holds the `handover` key.
+    """
+    if handover is None:
+        return ["handover: written without a value"] if written else []
+    if (
+        "max_changed_lines" in handover.model_fields_set
+        and handover.max_changed_lines is None
+    ):
+        return ["handover.max_changed_lines: written without a value"]
+    if handover.max_changed_lines is not None and not handover.test_paths:
+        return ["handover.max_changed_lines: needs test_paths, which it does not count"]
+    if handover.test_paths and handover.max_changed_lines is None:
+        return ["handover.test_paths: only serves max_changed_lines, which is not set"]
+    if handover.max_changed_lines is None and not handover.sensitive_paths:
+        return ["handover: declares neither sensitive_paths nor max_changed_lines"]
+    return []
+
+
 def _yaml_reasons(error: yaml.YAMLError) -> str:
     """Return the reasons of a YAML failure, each led by `": "`, without the failing text.
 
@@ -338,8 +398,13 @@ def load_instance(path: Path, header: Header) -> Instance:
     declare or leaves one unmapped, maps two status keys to the same real status name, sets
     a limit the header has no ceiling for, sets a limit above its ceiling, leaves an
     effective `run_timeout_seconds` not above the effective `review_timeout_seconds` plus
-    `CI_WAIT_MARGIN_SECONDS` when the header has a review ceiling, or names the
-    same variable for the agent's and the worker's repository tokens. The message
+    `CI_WAIT_MARGIN_SECONDS` when the header has a review ceiling, names the
+    same variable for the agent's and the worker's repository tokens, sets only one
+    of `handover.max_changed_lines` and `handover.test_paths`, writes `handover` or
+    `handover.max_changed_lines` with no value, has a `handover` pattern with a `.` or
+    `..` segment, or a `handover` with neither a non-empty `sensitive_paths` nor
+    `max_changed_lines`.
+    The message
     names key paths, lines and columns, and quotes no value written in the file but a
     shared real status name.
     """
@@ -364,6 +429,7 @@ def load_instance(path: Path, header: Header) -> Instance:
         _status_problems(data.statuses, header)
         + _limit_problems(data.limits, header)
         + _repository_problems(data.repository)
+        + _handover_problems(data.handover, "handover" in data.model_fields_set)
     )
     if problems:
         raise InstanceError(f"invalid instance file: {'; '.join(problems)}")
@@ -379,4 +445,5 @@ def load_instance(path: Path, header: Header) -> Instance:
         ),
         hold_merge_label=data.hold_merge_label,
         limits=MappingProxyType({**header.ceilings, **data.limits}),
+        handover=data.handover,
     )

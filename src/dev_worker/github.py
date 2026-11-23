@@ -16,6 +16,7 @@ from dev_worker.header import _describe
 from dev_worker.instance import Repository
 from dev_worker.repositories import (
     BaseCiFailure,
+    ChangedFile,
     CiState,
     HeadMovedError,
     PullRequest,
@@ -198,6 +199,17 @@ class _RunAnswer(BaseModel):
     jobs: list[_Job]
 
 
+class _PullRequestFile(BaseModel):
+    """A file of a pull request, as `gh api repos/{name}/pulls/{number}/files` writes it."""
+
+    filename: str
+    previous_filename: str | None = None
+    additions: int
+    deletions: int
+
+
+_FILES_ANSWER = TypeAdapter(list[list[_PullRequestFile]])
+
 BASE_HISTORY_DEPTH = 10
 BASE_CONTEXTS_PAGE_SIZE = 100
 BASE_CI_QUERY = f"""
@@ -244,6 +256,7 @@ MERGED = "MERGED"
 ACTIVE = "active"
 WORKFLOW_FILES_DIRECTORY = ".github/workflows/"
 WORKFLOWS_PAGE_SIZE = 100
+FILES_PAGE_SIZE = 100
 
 _UNREADABLE = object()
 
@@ -422,6 +435,36 @@ class GitHubRepository:
         if "running" in states:
             return "running"
         return "passed"
+
+    def changed_files(self, pull_request: PullRequest) -> tuple[ChangedFile, ...]:
+        """Return the files `pull_request` changes, every page read, at most the 3000 GitHub lists.
+
+        Raises `RepositoryError` when the token variable is not set, `gh` fails, or its
+        answer cannot be read.
+        """
+        number = pull_request.number
+        action = f"reading the files of pull request #{number}"
+        path = (
+            f"repos/{self._repository.name}/pulls/{number}/files"
+            f"?per_page={FILES_PAGE_SIZE}"
+        )
+        answer = self._run_json(
+            action, ["api", "--paginate", "--slurp", path], on_repository=False
+        )
+        try:
+            pages = _FILES_ANSWER.validate_python(answer)
+        except ValidationError as error:
+            raise self._unreadable(action, error) from None
+        return tuple(
+            ChangedFile(
+                path=file.filename,
+                previous_path=file.previous_filename,
+                additions=file.additions,
+                deletions=file.deletions,
+            )
+            for page in pages
+            for file in page
+        )
 
     def merge(self, pull_request: PullRequest) -> None:
         """Merge `pull_request` as one squashed commit whose subject is `pull_request.title`, which GitHub refuses once its head is not `pull_request.head`.

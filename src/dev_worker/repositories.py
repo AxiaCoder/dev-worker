@@ -46,6 +46,16 @@ class BaseCiFailure:
     checks: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class ChangedFile:
+    """A file a pull request changes: its path, the path it was renamed from or `None`, and its added and removed lines."""
+
+    path: str
+    previous_path: str | None
+    additions: int
+    deletions: int
+
+
 class CodeRepository(Protocol):
     """A code repository: finds the pull request of a branch, reads its CI and merges it."""
 
@@ -76,6 +86,13 @@ class CodeRepository(Protocol):
         A failure the forge caused rather than the code may be rerun once; it then counts
         as not failed. `None` too when no recent commit reports a check. Raises
         `RepositoryError` when the CI cannot be read.
+        """
+        ...
+
+    def changed_files(self, pull_request: PullRequest) -> tuple[ChangedFile, ...]:
+        """Return the files `pull_request` changes, as many as the host lists.
+
+        Raises `RepositoryError` when they cannot be read.
         """
         ...
 

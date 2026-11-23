@@ -34,6 +34,7 @@ from dev_worker.outcome import Outcome
 from dev_worker.plugin import PluginCheckout, PluginError
 from dev_worker.repositories import (
     BaseCiFailure,
+    ChangedFile,
     CiState,
     HeadMovedError,
     PullRequest,
@@ -151,6 +152,7 @@ class ReachableRepository:
         self.pull: PullRequest | None = PULL
         self.ci: CiState = "passed"
         self.base_failure: BaseCiFailure | None = None
+        self.files: tuple[ChangedFile, ...] = ()
         self.errors: dict[str, RepositoryError] = {}
         self.calls: list[tuple[str, object]] = []
 
@@ -176,6 +178,11 @@ class ReachableRepository:
         """Record the call; return `base_failure`."""
         self._step("base_ci_failure", None)
         return self.base_failure
+
+    def changed_files(self, pull_request: PullRequest) -> tuple[ChangedFile, ...]:
+        """Record the call; return `files`."""
+        self._step("changed_files", pull_request)
+        return self.files
 
     def merge(self, pull_request: PullRequest) -> None:
         """Record the call."""
@@ -8952,3 +8959,183 @@ def test_wake_runs_a_ticket_whose_required_field_is_filled_by_the_time_it_is_cla
     assert stub.moves[0] == ("DEMO-1", "In Progress")
     assert "Blocked" not in [status for _, status in stub.moves]
     assert "It logs in." in container.commands[0][2]
+
+
+HANDOVER_BLOCK = """
+handover:
+  sensitive_paths:
+    - .github/workflows/**
+  max_changed_lines: 10
+  test_paths:
+    - tests/**
+"""
+LEFT_FOR_HUMAN = f"{SUMMARY}\n\nThe pull request {PULL.url} is left open for a human: "
+
+
+def declare_handover(instance: Path) -> None:
+    """Append a `handover` block to the instance file at `instance`."""
+    with instance.open("a", encoding="utf-8") as file:
+        file.write(HANDOVER_BLOCK)
+
+
+def test_done_touching_a_sensitive_path_stays_open_unreviewed_and_moves_to_review_naming_it(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    workspace: FakeWorkspace,
+    container: FakeContainer,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    declare_handover(instance)
+    reachable_repository.files = (ChangedFile(".github/workflows/ci.yml", None, 1, 0),)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["status"] == "completed"
+    assert answer["errors"] == []
+    assert reachable_repository.calls == [
+        ("find_pull_request", "agent/DEMO-1"),
+        ("read_ci", PULL),
+        ("changed_files", PULL),
+    ]
+    assert container.readonly == [False]
+    assert ("close_review",) not in workspace.calls
+    assert stub.comments == [
+        (
+            "DEMO-1",
+            f"{LEFT_FOR_HUMAN}it touches sensitive paths: .github/workflows/ci.yml.",
+        )
+    ]
+    assert stub.moves == [IN_PROGRESS, IN_REVIEW]
+
+
+def test_done_above_the_size_bound_stays_open_and_moves_to_review_naming_the_count(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    declare_handover(instance)
+    reachable_repository.files = (ChangedFile("src/app.py", None, 6, 5),)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["errors"] == []
+    assert "merge" not in [name for name, _ in reachable_repository.calls]
+    assert container.readonly == [False]
+    assert stub.comments == [
+        (
+            "DEMO-1",
+            f"{LEFT_FOR_HUMAN}it changes 11 lines outside tests, above the bound of 10.",
+        )
+    ]
+    assert stub.moves == [IN_PROGRESS, IN_REVIEW]
+
+
+def test_done_with_a_handover_and_clean_files_is_reviewed_then_merged(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    declare_handover(instance)
+    reachable_repository.files = (ChangedFile("src/app.py", None, 6, 4),)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["errors"] == []
+    assert reachable_repository.calls == [
+        ("find_pull_request", "agent/DEMO-1"),
+        ("read_ci", PULL),
+        ("changed_files", PULL),
+        ("merge", PULL),
+    ]
+    assert container.readonly == [False, True]
+    assert stub.comments == [("DEMO-1", MERGED_BODY)]
+    assert stub.moves == [IN_PROGRESS, MERGED]
+
+
+def test_done_whose_files_cannot_be_read_is_blocked_unreviewed_and_not_merged(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    declare_handover(instance)
+    reachable_repository.errors["changed_files"] = RepositoryError("files unreadable")
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_blocked_run_fails(answer, instance, "files unreadable")
+    assert "merge" not in [name for name, _ in reachable_repository.calls]
+    assert container.readonly == [False]
+    assert stub.comments == [
+        ("DEMO-1", f"{SUMMARY}\n\nThe ticket is blocked: files unreadable")
+    ]
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
+
+
+def test_done_on_a_held_ticket_does_not_read_the_files_of_its_pull_request(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    declare_handover(instance)
+    reachable_repository.errors["changed_files"] = RepositoryError("files unreadable")
+    find = reachable_repository.find_pull_request
+
+    def label_then_find(branch: str) -> PullRequest | None:
+        stub.answer = replace(demo_ticket("In Progress"), labels=("hold-merge",))
+        return find(branch)
+
+    monkeypatch.setattr(reachable_repository, "find_pull_request", label_then_find)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert answer["errors"] == []
+    assert [name for name, _ in reachable_repository.calls] == [
+        "find_pull_request",
+        "read_ci",
+    ]
+    assert "carries the label 'hold-merge'" in stub.comments[0][1]
+    assert stub.moves == [IN_PROGRESS, IN_REVIEW]
+
+
+def test_done_without_a_handover_never_reads_the_files_even_when_they_would_match(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    reachable_repository.files = (
+        ChangedFile(".github/workflows/ci.yml", None, 1000, 0),
+    )
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert [name for name, _ in reachable_repository.calls] == [
+        "find_pull_request",
+        "read_ci",
+        "merge",
+    ]
+    assert stub.moves == [IN_PROGRESS, MERGED]

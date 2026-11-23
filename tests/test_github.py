@@ -13,6 +13,7 @@ from dev_worker.github import GitHubRepository
 from dev_worker.instance import Repository
 from dev_worker.repositories import (
     BaseCiFailure,
+    ChangedFile,
     HeadMovedError,
     PullRequest,
     RepositoryError,
@@ -1376,3 +1377,103 @@ def test_a_base_check_that_failed_while_another_still_runs_is_a_failure(
     assert repository().base_ci_failure() == BaseCiFailure(
         branch="main", commit=BASE_COMMIT, checks=("ci/legacy",)
     )
+
+
+def listed_file(filename: str, **fields: object) -> dict[str, object]:
+    """Return a file as the pull request files endpoint lists it."""
+    return {
+        "filename": filename,
+        "status": "modified",
+        "additions": 3,
+        "deletions": 1,
+        **fields,
+    }
+
+
+def test_changed_files_asks_for_every_page_as_an_array_of_pages(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, [[]])
+
+    repository().changed_files(PULL)
+
+    assert called(record)["argv"] == [
+        "api",
+        "--paginate",
+        "--slurp",
+        "repos/octo/widgets/pulls/42/files?per_page=100",
+    ]
+
+
+def test_changed_files_gathers_the_files_of_every_page_in_order(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(
+        monkeypatch,
+        [[listed_file("a.py"), listed_file("b.py")], [listed_file("c.py")]],
+    )
+
+    assert [file.path for file in repository().changed_files(PULL)] == [
+        "a.py",
+        "b.py",
+        "c.py",
+    ]
+
+
+def test_changed_files_maps_a_rename_and_its_line_counts(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(
+        monkeypatch,
+        [
+            [
+                listed_file("docs/ci.yml", previous_filename=".github/ci.yml"),
+                listed_file("a.py"),
+            ]
+        ],
+    )
+
+    assert repository().changed_files(PULL) == (
+        ChangedFile("docs/ci.yml", ".github/ci.yml", 3, 1),
+        ChangedFile("a.py", None, 3, 1),
+    )
+
+
+@pytest.mark.parametrize("empty", [[], [[]]])
+def test_changed_files_of_an_empty_answer_is_empty(
+    record: Path, monkeypatch: pytest.MonkeyPatch, empty: list[object]
+) -> None:
+    answer(monkeypatch, empty)
+
+    assert repository().changed_files(PULL) == ()
+
+
+@pytest.mark.parametrize(
+    "unreadable",
+    [
+        "not json",
+        {"message": "Not Found"},
+        [{"filename": "flat.py", "additions": 1, "deletions": 0}],
+        [[{"filename": "no-counts.py"}]],
+        [[{"filename": "a.py", "additions": "many", "deletions": 0}]],
+    ],
+)
+def test_changed_files_refuses_an_unreadable_answer(
+    record: Path, monkeypatch: pytest.MonkeyPatch, unreadable: object
+) -> None:
+    answer(monkeypatch, unreadable)
+
+    with pytest.raises(RepositoryError, match="reading the files of pull request #42"):
+        repository().changed_files(PULL)
+
+
+def test_changed_files_raises_when_gh_fails_without_giving_the_token(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, "", stderr="HTTP 502", code=1)
+
+    with pytest.raises(RepositoryError) as caught:
+        repository().changed_files(PULL)
+
+    assert "reading the files of pull request #42" in str(caught.value)
+    assert TOKEN not in str(caught.value)

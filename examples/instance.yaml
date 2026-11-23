@@ -61,6 +61,25 @@ statuses:
 # The ticket label that holds a merge back: with it, the pull request stays open.
 hold_merge_label: hold-merge
 
+# Optional. What leaves a pull request open for a human: its ticket goes to in_review, with a
+# comment saying why, and it is neither reviewed nor merged. Without this block, nothing does.
+# Patterns are globs relative to the repository root, matched in full and case-sensitively;
+# ** spans directories. A pattern ending in / or /** covers everything under that directory,
+# and the directory path itself for sensitive_paths only (a submodule is that single path). A
+# pattern whose last segment holds none of * ? [ covers that path and everything under it.
+# Uncomment to use it.
+# handover:
+#   # A pull request that touches one of these paths, even by renaming a file from or to it.
+#   sensitive_paths:
+#     - .github/workflows/**
+#     - src/auth/**
+#   # The most lines, added plus removed, a pull request may change outside its tests and still
+#   # merge. It needs test_paths, and test_paths needs it: a renamed file is a test only when
+#   # both its old and new paths match.
+#   max_changed_lines: 400
+#   test_paths:
+#     - tests/**
+
 # Optional. Each limit may only tighten the header ceiling of the same name; review_max_turns
 # caps the turns of the guard review a pull request gets before its merge, review_timeout_seconds
 # the seconds of the run kept for that review, and max_attempts the runs that may die on a ticket
