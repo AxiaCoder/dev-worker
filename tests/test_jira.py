@@ -10,7 +10,14 @@ import pytest
 
 from dev_worker.instance import Tracker
 from dev_worker.jira import JiraTracker
-from dev_worker.tickets import Blocker, Claim, Ticket, TrackerError
+from dev_worker.tickets import (
+    REQUEUE_MARKER,
+    RETURN_MARKER,
+    Blocker,
+    Claim,
+    Ticket,
+    TrackerError,
+)
 
 FAKE_TWG = Path(__file__).with_name("fake_twg.py")
 TOKEN = "s3cret-token-value"
@@ -1598,3 +1605,93 @@ def test_tickets_in_raises_naming_a_required_field_missing_from_the_answer(
 
     with pytest.raises(TrackerError, match=r"'environment'.*ABC-218"):
         requiring_tracker().tickets_in("À faire")
+
+
+RETURNED = f"{RETURN_MARKER}the CI failed (attempt 1 of 3)."
+PLAIN_REQUEUE = f"{REQUEUE_MARKER}the run is gone (attempt 1 of 3)."
+
+
+def test_last_return_is_the_comment_with_the_highest_id_without_its_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    serve_pages(
+        monkeypatch,
+        page([]),
+        page(
+            [
+                comment("10", "2026-11-11T10:00:00.000Z", f"{RETURN_MARKER}latest"),
+                comment("9", "2026-11-11T11:00:00.000Z", f"{RETURN_MARKER}older"),
+            ]
+        ),
+    )
+
+    assert tracker().last_return("ABC-218", frozenset({"Blocked"})) == "latest"
+
+
+def test_last_return_reads_an_atlassian_document(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    serve_pages(
+        monkeypatch,
+        page([]),
+        page([comment("10", "2026-11-11T10:00:00.000Z", adf(RETURNED))]),
+    )
+
+    assert (
+        tracker().last_return("ABC-218", frozenset({"Blocked"}))
+        == "the CI failed (attempt 1 of 3)."
+    )
+
+
+def test_last_return_ignores_a_plain_requeue_comment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    serve_pages(
+        monkeypatch,
+        page([]),
+        page(
+            [
+                comment("10", "2026-11-11T10:00:00.000Z", PLAIN_REQUEUE),
+                comment("11", "2026-11-11T11:00:00.000Z", "Looks good"),
+            ]
+        ),
+    )
+
+    assert tracker().last_return("ABC-218", frozenset({"Blocked"})) is None
+
+
+def test_last_return_ignores_those_before_the_last_settled_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    serve_pages(
+        monkeypatch,
+        page([history("2026-11-11T09:00:00.000Z", ("status", "Blocked"))]),
+        page([comment("10", "2026-11-10T10:00:00.000Z", RETURNED)]),
+    )
+
+    assert tracker().last_return("ABC-218", frozenset({"Blocked"})) is None
+
+
+def test_last_return_on_a_key_that_is_not_a_ticket_key_is_refused(
+    record: Path,
+) -> None:
+    with pytest.raises(TrackerError, match="is not a Jira ticket key"):
+        tracker().last_return("abc-218", frozenset({"Blocked"}))
+    assert not record.exists()
+
+
+def test_requeues_count_returns_and_dead_run_requeues_in_one_counter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    serve_pages(
+        monkeypatch,
+        page([]),
+        page(
+            [
+                comment("10", "2026-11-11T10:00:00.000Z", PLAIN_REQUEUE),
+                comment("11", "2026-11-11T11:00:00.000Z", RETURNED),
+            ]
+        ),
+    )
+
+    assert tracker().requeues("ABC-218", frozenset({"Blocked"})) == 2
