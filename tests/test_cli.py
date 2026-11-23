@@ -8109,7 +8109,8 @@ def test_wake_blocks_a_ticket_whose_runs_died_as_many_times_as_the_ceiling(
         (
             "DEMO-1",
             (
-                "The runs that took this ticket died 3 times without settling it. "
+                "Its last run died without settling it. Attempts used, returns and "
+                "dead runs together: 3 (limit 3). "
                 "A person needs to look at it, then move it back to 'To Do'."
             ),
         )
@@ -8128,7 +8129,10 @@ def test_wake_blocks_at_the_attempt_limit_of_the_instance(
 
     wake(capsysbinary, instance)
 
-    assert stub.comments[0][1].startswith("The runs that took this ticket died 1 ")
+    assert stub.comments[0][1].startswith(
+        "Its last run died without settling it. Attempts used, returns and dead "
+        "runs together: 1 (limit 1). "
+    )
     assert stub.moves == [("DEMO-1", "Blocked")]
 
 
@@ -9261,9 +9265,9 @@ def test_a_return_at_the_ceiling_blocks_the_ticket_and_asks_a_person(
         (
             "DEMO-1",
             (
-                f"{SUMMARY}\n\nThe ticket is blocked: {CI_REASON}\n\nIt came back "
-                f"{earlier + 1} times. A person needs to look at it, then move it "
-                "back to 'To Do'."
+                f"{SUMMARY}\n\nThe ticket is blocked: {CI_REASON}\n\nAttempts used, "
+                f"returns and dead runs together: {earlier + 1} (limit 3). "
+                "A person needs to look at it, then move it back to 'To Do'."
             ),
         )
     ]
@@ -9449,7 +9453,7 @@ def test_the_next_run_prompt_holds_the_reason_the_red_checks_and_the_open_thread
     stub = serve(monkeypatch, demo_ticket())
     stub.returned = "- src/app.py:12 The token is logged."
     reachable_repository.feedback_answer = PullRequestFeedback(
-        ("build",), (OpenThread("src/db.py", 3, ("Escape it.",)),)
+        ("build",), (OpenThread("src/db.py", 3, ("Escape it.",), "PRRT_db"),)
     )
 
     run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
@@ -9458,7 +9462,7 @@ def test_the_next_run_prompt_holds_the_reason_the_red_checks_and_the_open_thread
         "\n\nWhat stopped the previous run:\n"
         "- src/app.py:12 The token is logged.\n"
         "Red checks:\n- build\n"
-        "Open review threads:\n- src/db.py:3\n  Escape it.\n"
+        "Open review threads:\n- src/db.py:3 (thread PRRT_db)\n  Escape it.\n"
     )
     assert ("find_pull_request", "agent/DEMO-1") in reachable_repository.calls
     assert ("feedback", PULL) in reachable_repository.calls

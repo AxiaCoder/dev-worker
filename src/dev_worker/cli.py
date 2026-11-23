@@ -760,8 +760,9 @@ def settle_return(
                 return Benign(reason), errors
             return (ReturnToAgent(reason) if move(ready) else Benign(reason)), errors
         body = (
-            f"{summary}\n\nThe ticket is blocked: {reason}\n\nIt came back {attempt} "
-            f"times. A person needs to look at it, then move it back to {ready!r}."
+            f"{summary}\n\nThe ticket is blocked: {reason}\n\nAttempts used, returns "
+            f"and dead runs together: {attempt} (limit {ceiling}). A person needs to "
+            f"look at it, then move it back to {ready!r}."
         )
     try:
         tracker.comment(key, writable_text(body))
@@ -1859,8 +1860,9 @@ def requeue_dead_ticket(
     else:
         status = blocked
         body = (
-            f"The runs that took this ticket died {attempt} times without settling "
-            f"it. A person needs to look at it, then move it back to {ready!r}."
+            "Its last run died without settling it. Attempts used, returns and dead "
+            f"runs together: {attempt} (limit {ceiling}). A person needs to look at "
+            f"it, then move it back to {ready!r}."
         )
     try:
         tracker.comment(key, body)

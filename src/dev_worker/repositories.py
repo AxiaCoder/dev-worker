@@ -58,11 +58,12 @@ class ChangedFile:
 
 @dataclass(frozen=True)
 class OpenThread:
-    """An unresolved review thread: the file it is on, its line or `None` when it has none, and the text of its comments from trusted authors, oldest first."""
+    """An unresolved review thread: the file it is on, its line or `None` when it has none, the text of its comments from trusted authors, oldest first, and its forge id."""
 
     path: str
     line: int | None
     comments: tuple[str, ...]
+    thread_id: str
 
 
 @dataclass(frozen=True)

@@ -785,8 +785,8 @@ def test_stop_section_lists_the_reason_the_red_checks_and_the_open_threads() -> 
     feedback = PullRequestFeedback(
         ("build", "lint"),
         (
-            OpenThread("src/a.py", 3, ("Fix.\nNow.", "Agreed.")),
-            OpenThread("src/b.py", None, ("Why?",)),
+            OpenThread("src/a.py", 3, ("Fix.\nNow.", "Agreed."), "PRRT_a"),
+            OpenThread("src/b.py", None, ("Why?",), "PRRT_b"),
         ),
     )
 
@@ -797,11 +797,11 @@ def test_stop_section_lists_the_reason_the_red_checks_and_the_open_threads() -> 
         "- build\n"
         "- lint\n"
         "Open review threads:\n"
-        "- src/a.py:3\n"
+        "- src/a.py:3 (thread PRRT_a)\n"
         "  Fix.\n"
         "  Now.\n"
         "  Agreed.\n"
-        "- src/b.py\n"
+        "- src/b.py (thread PRRT_b)\n"
         "  Why?\n"
     )
 
@@ -820,7 +820,7 @@ def test_stop_section_omits_an_empty_group_of_threads() -> None:
 
 
 def test_stop_section_omits_an_empty_group_of_checks() -> None:
-    feedback = PullRequestFeedback((), (OpenThread("a.py", 1, ("Fix.",)),))
+    feedback = PullRequestFeedback((), (OpenThread("a.py", 1, ("Fix.",), "PRRT_a"),))
 
     assert "Red checks" not in stop_section("Reason.", feedback)
 
@@ -863,7 +863,7 @@ def test_stop_section_leaves_out_a_huge_first_item_and_those_after_it() -> None:
 
 def test_stop_section_keeps_the_items_before_a_huge_one_without_its_heading() -> None:
     feedback = PullRequestFeedback(
-        ("build",), (OpenThread("a.py", 1, ("y" * MAX_STOP_CHARS,)),)
+        ("build",), (OpenThread("a.py", 1, ("y" * MAX_STOP_CHARS,), "PRRT_a"),)
     )
 
     assert stop_section("Reason.", feedback) == (
@@ -894,11 +894,11 @@ def test_stop_section_leaves_out_a_last_item_one_character_too_long() -> None:
 
 
 def in_thread_comment(text: str) -> PullRequestFeedback:
-    return PullRequestFeedback((), (OpenThread("a.py", 1, (text,)),))
+    return PullRequestFeedback((), (OpenThread("a.py", 1, (text,), "PRRT_a"),))
 
 
 def in_thread_path(text: str) -> PullRequestFeedback:
-    return PullRequestFeedback((), (OpenThread(text, 1, ("Fix.",)),))
+    return PullRequestFeedback((), (OpenThread(text, 1, ("Fix.",), "PRRT_a"),))
 
 
 @pytest.mark.parametrize("character", ["\x00", "\ud800"], ids=["nul", "surrogate"])

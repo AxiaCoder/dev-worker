@@ -230,6 +230,7 @@ class _ThreadComments(BaseModel):
 class _ReviewThread(BaseModel):
     """A review thread of a pull request; `line` is `None` when it no longer maps to one."""
 
+    id: str
     isResolved: bool
     path: str
     line: int | None = None
@@ -310,6 +311,7 @@ query($owner: String!, $name: String!, $number: Int!) {{
       }}
       reviewThreads(first: {FEEDBACK_THREADS_PAGE_SIZE}) {{
         nodes {{
+          id
           isResolved
           path
           line
@@ -444,7 +446,7 @@ def _open_threads(threads: Sequence[_ReviewThread]) -> tuple[OpenThread, ...]:
             if comment.authorAssociation in TRUSTED_ASSOCIATIONS
         )
         if comments and not thread.isResolved:
-            kept.append(OpenThread(thread.path, thread.line, comments))
+            kept.append(OpenThread(thread.path, thread.line, comments, thread.id))
     return tuple(kept)
 
 

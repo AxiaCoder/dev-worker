@@ -1490,8 +1490,10 @@ def review_thread(
     resolved: bool = False,
     path: str = "src/app.py",
     line: int | None = 12,
+    thread_id: str = "PRRT_1",
 ) -> dict[str, Any]:
     return {
+        "id": thread_id,
         "isResolved": resolved,
         "path": path,
         "line": line,
@@ -1579,7 +1581,7 @@ def test_feedback_keeps_the_comment_of_a_trusted_author(
     )
 
     assert repository().feedback(PULL).threads == (
-        OpenThread("src/app.py", 12, ("Fix this.",)),
+        OpenThread("src/app.py", 12, ("Fix this.",), "PRRT_1"),
     )
 
 
@@ -1624,7 +1626,7 @@ def test_feedback_keeps_only_the_trusted_comments_of_a_mixed_thread(
     answer(monkeypatch, feedback_answer(threads=(thread,)))
 
     assert repository().feedback(PULL).threads == (
-        OpenThread("src/app.py", 12, ("First.", "Second.")),
+        OpenThread("src/app.py", 12, ("First.", "Second."), "PRRT_1"),
     )
 
 
@@ -1633,13 +1635,41 @@ def test_feedback_drops_a_resolved_thread(
 ) -> None:
     threads = (
         review_thread(said("OWNER", "Settled."), resolved=True),
-        review_thread(said("OWNER", "Open."), path="src/db.py", line=None),
+        review_thread(
+            said("OWNER", "Open."), path="src/db.py", line=None, thread_id="PRRT_2"
+        ),
     )
     answer(monkeypatch, feedback_answer(threads=threads))
 
     assert repository().feedback(PULL).threads == (
-        OpenThread("src/db.py", None, ("Open.",)),
+        OpenThread("src/db.py", None, ("Open.",), "PRRT_2"),
     )
+
+
+def test_feedback_gives_each_kept_thread_the_id_of_its_node(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    threads = (
+        review_thread(said("OWNER", "One."), thread_id="PRRT_one"),
+        review_thread(said("MEMBER", "Two."), thread_id="PRRT_two"),
+    )
+    answer(monkeypatch, feedback_answer(threads=threads))
+
+    kept = repository().feedback(PULL).threads
+
+    assert [thread.thread_id for thread in kept] == ["PRRT_one", "PRRT_two"]
+
+
+def test_feedback_query_asks_for_the_id_of_each_review_thread(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, feedback_answer())
+
+    repository().feedback(PULL)
+
+    query = next(a for a in called(record)["argv"] if a.startswith("query="))
+    thread_fields = query.split("reviewThreads", 1)[1].split("comments", 1)[0]
+    assert "id" in thread_fields.split()
 
 
 def test_feedback_makes_a_comment_writable(

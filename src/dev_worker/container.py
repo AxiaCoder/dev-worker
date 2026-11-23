@@ -69,12 +69,12 @@ class ContainerExit:
 
 
 def _thread_item(thread: OpenThread) -> str:
-    """Return the list item of `thread`: `- path:line`, or `- path` without a line, then its comments indented."""
+    """Return the list item of `thread`: `- path:line (thread <id>)`, or `- path (thread <id>)` without a line, then its comments indented."""
     place = thread.path if thread.line is None else f"{thread.path}:{thread.line}"
     comments = "".join(
         f"{indent(comment, THREAD_COMMENT_INDENT)}\n" for comment in thread.comments
     )
-    return f"- {place}\n{comments}"
+    return f"- {place} (thread {thread.thread_id})\n{comments}"
 
 
 def _left_out(count: int) -> str:
