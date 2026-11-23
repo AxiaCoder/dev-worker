@@ -343,3 +343,58 @@ def test_a_pattern_not_naming_a_directory_does_not_reach_under_its_match(
     handover = Handover(sensitive_paths=(pattern,))
 
     assert handover_reason([changed(path)], handover) is None
+
+
+@pytest.mark.parametrize(
+    ("pattern", "path"),
+    [
+        ("**/test*/**", "src/test_utils.py"),
+        ("**/test*/**", "src/testing.py"),
+        ("**/test*/", "src/test_utils.py"),
+        ("**/test*/", "src/testing.py"),
+        ("test*/**", "testing.py"),
+        ("**/*test*/**", "src/latest.py"),
+        ("**/*spec*/**", "src/inspector.py"),
+        ("tests/", "tests"),
+        ("tests/**", "tests"),
+    ],
+)
+def test_a_test_path_ending_in_a_slash_or_double_star_counts_a_file_named_like_it(
+    pattern: str, path: str
+) -> None:
+    handover = Handover(max_changed_lines=10, test_paths=(pattern,))
+
+    assert (
+        handover_reason([changed(path, additions=500)], handover)
+        == "it changes 500 lines outside tests, above the bound of 10."
+    )
+
+
+@pytest.mark.parametrize(
+    ("pattern", "path"),
+    [
+        ("**/test*/**", "src/tests/a.py"),
+        ("tests/", "tests/a.py"),
+        ("tests/**", "tests/a.py"),
+        ("tests/conftest.py", "tests/conftest.py"),
+        ("tests", "tests/a.py"),
+    ],
+)
+def test_a_test_path_still_leaves_out_what_it_covers(pattern: str, path: str) -> None:
+    handover = Handover(max_changed_lines=10, test_paths=(pattern,))
+
+    assert handover_reason([changed(path, additions=500)], handover) is None
+
+
+@pytest.mark.parametrize("pattern", ["vendor/auth/**", "vendor/auth/"])
+def test_a_sensitive_path_ending_in_a_slash_or_double_star_still_catches_the_path_itself(
+    pattern: str,
+) -> None:
+    handover = Handover(
+        sensitive_paths=(pattern,), max_changed_lines=10, test_paths=("tests/**",)
+    )
+
+    assert (
+        handover_reason([changed("vendor/auth")], handover)
+        == "it touches sensitive paths: vendor/auth."
+    )

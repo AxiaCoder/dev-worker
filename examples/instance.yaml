@@ -64,8 +64,10 @@ hold_merge_label: hold-merge
 # Optional. What leaves a pull request open for a human: its ticket goes to in_review, with a
 # comment saying why, and it is neither reviewed nor merged. Without this block, nothing does.
 # Patterns are globs relative to the repository root, matched in full and case-sensitively;
-# ** spans directories. A pattern ending in / or /**, or whose last segment holds none of
-# * ? [, names a directory: it covers that path and everything under it. Uncomment to use it.
+# ** spans directories. A pattern ending in / or /** covers everything under that directory,
+# and the directory path itself for sensitive_paths only (a submodule is that single path). A
+# pattern whose last segment holds none of * ? [ covers that path and everything under it.
+# Uncomment to use it.
 # handover:
 #   # A pull request that touches one of these paths, even by renaming a file from or to it.
 #   sensitive_paths:

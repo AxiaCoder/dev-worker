@@ -10,25 +10,34 @@ MAX_LISTED_FILES = 3000
 MAX_NAMED_PATHS = 20
 
 
-def _matches_pattern(path: str, pattern: str) -> bool:
-    """Return whether `path` matches the glob `pattern` in full, case-sensitively, or is the directory it names or lies under it.
+def _matches_pattern(path: str, pattern: str, *, covers_directory_path: bool) -> bool:
+    """Return whether the glob `pattern` covers `path`, matched in full and case-sensitively.
 
-    A pattern names a directory when it ends in `/`, ends in `/**`, or its last segment
-    holds none of `*`, `?` and `[`.
+    A pattern ending in `/` or `/**` covers what is under the directory, and the
+    directory path itself only when `covers_directory_path` is true, as for sensitive
+    paths: a submodule is that single path. Any other pattern covers what it matches
+    and, when its last segment holds none of `*`, `?` and `[`, what is under that path.
     """
     candidate = PurePosixPath(path)
+    directory = pattern.rstrip("/").removesuffix("/**")
+    if directory != pattern:
+        return candidate.full_match(f"{directory}/**") or (
+            covers_directory_path and candidate.full_match(directory)
+        )
     if candidate.full_match(pattern):
         return True
-    directory = pattern.rstrip("/").removesuffix("/**")
     last = directory.rsplit("/", 1)[-1]
-    if directory == pattern and set(last) & set("*?["):
-        return False
-    return candidate.full_match(directory) or candidate.full_match(f"{directory}/**")
+    return not set(last) & set("*?[") and candidate.full_match(f"{directory}/**")
 
 
-def _matches(path: str, patterns: Sequence[str]) -> bool:
-    """Return whether `path` matches one of `patterns`, as `_matches_pattern` reads each."""
-    return any(_matches_pattern(path, pattern) for pattern in patterns)
+def _matches(
+    path: str, patterns: Sequence[str], *, covers_directory_path: bool
+) -> bool:
+    """Return whether one of `patterns` covers `path`, as `_matches_pattern` reads each with `covers_directory_path`."""
+    return any(
+        _matches_pattern(path, pattern, covers_directory_path=covers_directory_path)
+        for pattern in patterns
+    )
 
 
 def _paths(file: ChangedFile) -> tuple[str, ...]:
@@ -61,7 +70,7 @@ def handover_reason(files: Sequence[ChangedFile], handover: Handover) -> str | N
             path
             for file in files
             for path in _paths(file)
-            if _matches(path, handover.sensitive_paths)
+            if _matches(path, handover.sensitive_paths, covers_directory_path=True)
         )
     )
     if sensitive:
@@ -70,7 +79,10 @@ def handover_reason(files: Sequence[ChangedFile], handover: Handover) -> str | N
         changed = sum(
             file.additions + file.deletions
             for file in files
-            if not all(_matches(path, handover.test_paths) for path in _paths(file))
+            if not all(
+                _matches(path, handover.test_paths, covers_directory_path=False)
+                for path in _paths(file)
+            )
         )
         if changed > handover.max_changed_lines:
             reasons.append(
