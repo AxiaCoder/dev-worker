@@ -904,3 +904,102 @@ def test_a_required_field_with_a_blank_name_is_refused(tmp_path: Path) -> None:
 
     with pytest.raises(InstanceError, match="must not be blank"):
         load(tmp_path, text)
+
+
+def with_handover(block: str) -> str:
+    """Return the valid instance text followed by the `handover` lines of `block`."""
+    return f"{VALID}handover:{block}"
+
+
+def test_an_instance_without_handover_declares_none(tmp_path: Path) -> None:
+    assert load(tmp_path, VALID).handover is None
+
+
+def test_sensitive_paths_alone_load(tmp_path: Path) -> None:
+    text = with_handover("\n  sensitive_paths:\n    - .github/**\n    - src/auth/**\n")
+
+    handover = load(tmp_path, text).handover
+
+    assert handover is not None
+    assert handover.sensitive_paths == (".github/**", "src/auth/**")
+    assert handover.max_changed_lines is None
+    assert handover.test_paths == ()
+
+
+def test_a_size_bound_with_its_test_paths_loads(tmp_path: Path) -> None:
+    text = with_handover("\n  max_changed_lines: 400\n  test_paths: [tests/**]\n")
+
+    handover = load(tmp_path, text).handover
+
+    assert handover is not None
+    assert handover.max_changed_lines == 400
+    assert handover.test_paths == ("tests/**",)
+
+
+def test_a_size_bound_without_test_paths_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(
+        InstanceError, match="handover.max_changed_lines: needs test_paths"
+    ):
+        load(tmp_path, with_handover("\n  max_changed_lines: 400\n"))
+
+
+def test_test_paths_without_a_size_bound_are_refused(tmp_path: Path) -> None:
+    text = with_handover("\n  sensitive_paths: [a/**]\n  test_paths: [tests/**]\n")
+
+    with pytest.raises(
+        InstanceError, match="handover.test_paths: only serves max_changed_lines"
+    ):
+        load(tmp_path, text)
+
+
+@pytest.mark.parametrize("block", [" {}\n", "\n  sensitive_paths: []\n"])
+def test_a_handover_block_declaring_nothing_is_refused(
+    tmp_path: Path, block: str
+) -> None:
+    with pytest.raises(InstanceError, match="handover: declares neither"):
+        load(tmp_path, with_handover(block))
+
+
+@pytest.mark.parametrize("block", ["\n", " ~\n", " null\n"])
+def test_a_handover_key_left_without_a_value_is_refused(
+    tmp_path: Path, block: str
+) -> None:
+    with pytest.raises(InstanceError, match="handover"):
+        load(tmp_path, with_handover(block))
+
+
+@pytest.mark.parametrize("key", ["sensitive_paths", "test_paths"])
+@pytest.mark.parametrize(
+    ("pattern", "message"),
+    [
+        ("'   '", "must not be blank"),
+        ("/hidden-value/**", "must be relative to the repository root"),
+        ("'hidden-value\\a'", "must be relative to the repository root"),
+    ],
+)
+def test_a_malformed_pattern_is_refused_without_quoting_it(
+    tmp_path: Path, key: str, pattern: str, message: str
+) -> None:
+    bound = "  max_changed_lines: 1\n" if key == "test_paths" else ""
+    text = with_handover(f"\n{bound}  {key}:\n    - {pattern}\n")
+
+    with pytest.raises(InstanceError, match=message) as caught:
+        load(tmp_path, text)
+
+    assert f"handover.{key}.0" in str(caught.value)
+    assert "hidden-value" not in str(caught.value)
+
+
+@pytest.mark.parametrize("bound", ["0", "-1", "true", "many"])
+def test_a_size_bound_that_is_not_a_positive_integer_is_refused(
+    tmp_path: Path, bound: str
+) -> None:
+    text = with_handover(f"\n  max_changed_lines: {bound}\n  test_paths: [t/**]\n")
+
+    with pytest.raises(InstanceError, match="handover.max_changed_lines"):
+        load(tmp_path, text)
+
+
+def test_an_unknown_handover_key_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(InstanceError, match="handover.sensitive_path"):
+        load(tmp_path, with_handover("\n  sensitive_path: [a/**]\n"))

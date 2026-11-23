@@ -346,10 +346,13 @@ def _repository_problems(repository: Repository) -> list[str]:
     return [problem]
 
 
-def _handover_problems(handover: Handover | None) -> list[str]:
-    """Return the sentence saying `handover` declares nothing, or sets only one of `max_changed_lines` and `test_paths`, if so; no value is quoted."""
+def _handover_problems(handover: Handover | None, written: bool) -> list[str]:
+    """Return the sentence saying `handover` has no value, declares nothing, or sets only one of `max_changed_lines` and `test_paths`, if so; no value is quoted.
+
+    `written` tells whether the instance file holds the `handover` key.
+    """
     if handover is None:
-        return []
+        return ["handover: written without a value"] if written else []
     if handover.max_changed_lines is not None and not handover.test_paths:
         return ["handover.max_changed_lines: needs test_paths, which it does not count"]
     if handover.test_paths and handover.max_changed_lines is None:
@@ -390,8 +393,9 @@ def load_instance(path: Path, header: Header) -> Instance:
     effective `run_timeout_seconds` not above the effective `review_timeout_seconds` plus
     `CI_WAIT_MARGIN_SECONDS` when the header has a review ceiling, names the
     same variable for the agent's and the worker's repository tokens, sets only one
-    of `handover.max_changed_lines` and `handover.test_paths`, or has a `handover` block
-    with neither a non-empty `sensitive_paths` nor `max_changed_lines`. The message
+    of `handover.max_changed_lines` and `handover.test_paths`, or has a `handover` key
+    with no value, or with neither a non-empty `sensitive_paths` nor `max_changed_lines`.
+    The message
     names key paths, lines and columns, and quotes no value written in the file but a
     shared real status name.
     """
@@ -416,7 +420,7 @@ def load_instance(path: Path, header: Header) -> Instance:
         _status_problems(data.statuses, header)
         + _limit_problems(data.limits, header)
         + _repository_problems(data.repository)
-        + _handover_problems(data.handover)
+        + _handover_problems(data.handover, "handover" in data.model_fields_set)
     )
     if problems:
         raise InstanceError(f"invalid instance file: {'; '.join(problems)}")
