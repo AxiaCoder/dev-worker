@@ -41,7 +41,7 @@ def test_a_double_star_spans_directories(path: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "path", ["SRC/AUTH/a.py", "lib/src/auth/a.py", "src/authx/a.py", "src/auth"]
+    "path", ["SRC/AUTH/a.py", "lib/src/auth/a.py", "src/authx/a.py"]
 )
 def test_a_pattern_matches_the_whole_path_case_sensitively(path: str) -> None:
     assert handover_reason([changed(path)], SENSITIVE) is None
@@ -277,3 +277,69 @@ def test_a_single_star_glob_still_stops_at_a_subdirectory() -> None:
     handover = Handover(sensitive_paths=("src/auth/*",))
 
     assert handover_reason([changed("src/auth/d/a.py")], handover) is None
+
+
+@pytest.mark.parametrize(
+    ("pattern", "path"),
+    [
+        ("packages/*/auth", "packages/api/auth/login.py"),
+        ("packages/*/auth", "packages/api/auth"),
+        ("**/secrets", "a/secrets/k"),
+        ("**/secrets", "secrets/k"),
+        ("**/secrets", "secrets"),
+    ],
+)
+def test_a_glob_whose_last_segment_is_literal_covers_the_directory_it_names(
+    pattern: str, path: str
+) -> None:
+    handover = Handover(sensitive_paths=(pattern,))
+
+    assert (
+        handover_reason([changed(path)], handover)
+        == f"it touches sensitive paths: {path}."
+    )
+
+
+@pytest.mark.parametrize(
+    ("pattern", "path"),
+    [
+        ("packages/*/auth", "packages/api/auth/login.py"),
+        ("**/secrets", "a/secrets/k"),
+        ("**/secrets", "secrets/k"),
+    ],
+)
+def test_a_test_path_whose_last_segment_is_literal_leaves_its_files_out_of_the_size(
+    pattern: str, path: str
+) -> None:
+    handover = Handover(max_changed_lines=10, test_paths=(pattern,))
+
+    assert handover_reason([changed(path, additions=11)], handover) is None
+
+
+@pytest.mark.parametrize("pattern", ["vendor/auth/**", "vendor/auth/", "vendor/auth"])
+def test_a_pattern_naming_a_directory_covers_the_directory_path_itself(
+    pattern: str,
+) -> None:
+    handover = Handover(sensitive_paths=(pattern,))
+
+    assert (
+        handover_reason([changed("vendor/auth")], handover)
+        == "it touches sensitive paths: vendor/auth."
+    )
+
+
+@pytest.mark.parametrize(
+    ("pattern", "path"),
+    [
+        ("src/auth/*", "src/auth/d/a.py"),
+        ("src/auth/*", "src/auth"),
+        ("**/*.env", "a.env/k"),
+        ("packages/*/auth", "packages/api/authx/a.py"),
+    ],
+)
+def test_a_pattern_not_naming_a_directory_does_not_reach_under_its_match(
+    pattern: str, path: str
+) -> None:
+    handover = Handover(sensitive_paths=(pattern,))
+
+    assert handover_reason([changed(path)], handover) is None

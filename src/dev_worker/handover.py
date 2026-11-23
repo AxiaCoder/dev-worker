@@ -11,15 +11,19 @@ MAX_NAMED_PATHS = 20
 
 
 def _matches_pattern(path: str, pattern: str) -> bool:
-    """Return whether `path` matches the glob `pattern` in full, case-sensitively, or lies under the directory it names.
+    """Return whether `path` matches the glob `pattern` in full, case-sensitively, or is the directory it names or lies under it.
 
-    A pattern names a directory when it ends in `/` or holds none of `*`, `?` and `[`.
+    A pattern names a directory when it ends in `/`, ends in `/**`, or its last segment
+    holds none of `*`, `?` and `[`.
     """
     candidate = PurePosixPath(path)
     if candidate.full_match(pattern):
         return True
-    names_directory = pattern.endswith("/") or not set(pattern) & set("*?[")
-    return names_directory and candidate.full_match(pattern.rstrip("/") + "/**")
+    directory = pattern.rstrip("/").removesuffix("/**")
+    last = directory.rsplit("/", 1)[-1]
+    if directory == pattern and set(last) & set("*?["):
+        return False
+    return candidate.full_match(directory) or candidate.full_match(f"{directory}/**")
 
 
 def _matches(path: str, patterns: Sequence[str]) -> bool:

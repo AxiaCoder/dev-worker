@@ -1003,3 +1003,56 @@ def test_a_size_bound_that_is_not_a_positive_integer_is_refused(
 def test_an_unknown_handover_key_is_refused(tmp_path: Path) -> None:
     with pytest.raises(InstanceError, match="handover.sensitive_path"):
         load(tmp_path, with_handover("\n  sensitive_path: [a/**]\n"))
+
+
+@pytest.mark.parametrize("written", ["", " ~", " null"])
+def test_a_size_bound_written_without_a_value_is_refused_without_quoting_a_value(
+    tmp_path: Path, written: str
+) -> None:
+    text = with_handover(
+        f"\n  sensitive_paths: [hidden-value/**]\n  max_changed_lines:{written}\n"
+    )
+
+    with pytest.raises(InstanceError, match="handover.max_changed_lines") as caught:
+        load(tmp_path, text)
+
+    assert "hidden-value" not in str(caught.value)
+
+
+def test_a_size_bound_left_out_stays_valid_beside_sensitive_paths(
+    tmp_path: Path,
+) -> None:
+    handover = load(
+        tmp_path, with_handover("\n  sensitive_paths: [src/auth/**]\n")
+    ).handover
+
+    assert handover is not None
+    assert handover.max_changed_lines is None
+
+
+@pytest.mark.parametrize("key", ["sensitive_paths", "test_paths"])
+@pytest.mark.parametrize("pattern", ["src/../.github/**", "./src", "src/./a"])
+def test_a_pattern_with_a_dot_segment_is_refused_without_quoting_it(
+    tmp_path: Path, key: str, pattern: str
+) -> None:
+    bound = "  max_changed_lines: 1\n" if key == "test_paths" else ""
+    text = with_handover(f"\n{bound}  {key}:\n    - {pattern}\n")
+
+    with pytest.raises(InstanceError, match=rf"handover\.{key}\.0") as caught:
+        load(tmp_path, text)
+
+    assert pattern not in str(caught.value)
+
+
+@pytest.mark.parametrize("key", ["sensitive_paths", "test_paths"])
+@pytest.mark.parametrize("pattern", [".github/**", "a..b/c"])
+def test_a_pattern_with_dots_inside_a_segment_is_accepted(
+    tmp_path: Path, key: str, pattern: str
+) -> None:
+    bound = "  max_changed_lines: 1\n" if key == "test_paths" else ""
+    text = with_handover(f"\n{bound}  {key}:\n    - {pattern}\n")
+
+    handover = load(tmp_path, text).handover
+
+    assert handover is not None
+    assert getattr(handover, key) == (pattern,)

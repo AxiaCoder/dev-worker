@@ -200,7 +200,7 @@ class GitIdentity(BaseModel):
 
 
 def _check_path_pattern(value: str) -> str:
-    """Return `value` when it is a glob relative to the repository root; raise `ValueError` when it is blank, starts with `/` or holds a backslash."""
+    """Return `value` when it is a glob relative to the repository root; raise `ValueError` when it is blank, starts with `/`, holds a backslash, or has a `.` or `..` segment."""
     if not value.strip():
         raise ValueError("must not be blank")
     if value.startswith("/") or "\\" in value:
@@ -208,6 +208,8 @@ def _check_path_pattern(value: str) -> str:
             "must be relative to the repository root and use forward slashes,"
             " e.g. src/auth/**"
         )
+    if {".", ".."} & set(value.split("/")):
+        raise ValueError("must not have a . or .. segment, e.g. src/auth/**")
     return value
 
 
@@ -347,12 +349,17 @@ def _repository_problems(repository: Repository) -> list[str]:
 
 
 def _handover_problems(handover: Handover | None, written: bool) -> list[str]:
-    """Return the sentence saying `handover` has no value, declares nothing, or sets only one of `max_changed_lines` and `test_paths`, if so; no value is quoted.
+    """Return the sentence saying `handover` or its `max_changed_lines` has no value, `handover` declares nothing, or sets only one of `max_changed_lines` and `test_paths`, if so; no value is quoted.
 
     `written` tells whether the instance file holds the `handover` key.
     """
     if handover is None:
         return ["handover: written without a value"] if written else []
+    if (
+        "max_changed_lines" in handover.model_fields_set
+        and handover.max_changed_lines is None
+    ):
+        return ["handover.max_changed_lines: written without a value"]
     if handover.max_changed_lines is not None and not handover.test_paths:
         return ["handover.max_changed_lines: needs test_paths, which it does not count"]
     if handover.test_paths and handover.max_changed_lines is None:
@@ -393,8 +400,10 @@ def load_instance(path: Path, header: Header) -> Instance:
     effective `run_timeout_seconds` not above the effective `review_timeout_seconds` plus
     `CI_WAIT_MARGIN_SECONDS` when the header has a review ceiling, names the
     same variable for the agent's and the worker's repository tokens, sets only one
-    of `handover.max_changed_lines` and `handover.test_paths`, or has a `handover` key
-    with no value, or with neither a non-empty `sensitive_paths` nor `max_changed_lines`.
+    of `handover.max_changed_lines` and `handover.test_paths`, writes `handover` or
+    `handover.max_changed_lines` with no value, has a `handover` pattern with a `.` or
+    `..` segment, or a `handover` with neither a non-empty `sensitive_paths` nor
+    `max_changed_lines`.
     The message
     names key paths, lines and columns, and quotes no value written in the file but a
     shared real status name.
