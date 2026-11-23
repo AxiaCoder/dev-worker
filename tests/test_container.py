@@ -924,6 +924,17 @@ def test_stop_section_is_already_writable_and_within_the_bound(
     assert len(section) <= MAX_STOP_CHARS
 
 
+def test_stop_section_keeps_room_to_count_what_follows_an_item_filling_the_bound() -> (
+    None
+):
+    filling = "y" * (MAX_STOP_CHARS - len(stop_section("Reason.", red(""))))
+
+    section = stop_section("Reason.", red(filling, "z"))
+
+    assert len(section) <= MAX_STOP_CHARS
+    assert filling not in section
+
+
 def test_ticket_prompt_without_a_previous_stop_is_unchanged() -> None:
     expected = (
         "Ticket: ABC-1\n"
