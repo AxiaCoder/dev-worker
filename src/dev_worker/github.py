@@ -19,9 +19,12 @@ from dev_worker.repositories import (
     ChangedFile,
     CiState,
     HeadMovedError,
+    OpenThread,
     PullRequest,
+    PullRequestFeedback,
     RepositoryError,
 )
+from dev_worker.text import writable_text
 
 REDACTED = "[token]"
 GH_TIMEOUT_SECONDS = 60.0
@@ -210,6 +213,116 @@ class _PullRequestFile(BaseModel):
 
 _FILES_ANSWER = TypeAdapter(list[list[_PullRequestFile]])
 
+
+class _ThreadComment(BaseModel):
+    """A comment of a review thread, by the standing of its author and its text."""
+
+    authorAssociation: str
+    body: str
+
+
+class _ThreadComments(BaseModel):
+    """The comments of a review thread."""
+
+    nodes: list[_ThreadComment]
+
+
+class _ReviewThread(BaseModel):
+    """A review thread of a pull request; `line` is `None` when it no longer maps to one."""
+
+    isResolved: bool
+    path: str
+    line: int | None = None
+    comments: _ThreadComments
+
+
+class _ReviewThreads(BaseModel):
+    """The review threads of a pull request."""
+
+    nodes: list[_ReviewThread]
+
+
+class _FeedbackCommit(BaseModel):
+    """A commit with its checks; `statusCheckRollup` is `None` when it has none."""
+
+    statusCheckRollup: _Rollup | None = None
+
+
+class _PullRequestCommit(BaseModel):
+    """A commit as a pull request lists it."""
+
+    commit: _FeedbackCommit
+
+
+class _PullRequestCommits(BaseModel):
+    """The commits of a pull request the feedback query asks for."""
+
+    nodes: list[_PullRequestCommit]
+
+
+class _FeedbackPullRequest(BaseModel):
+    """The pull request of the feedback query."""
+
+    commits: _PullRequestCommits
+    reviewThreads: _ReviewThreads
+
+
+class _FeedbackRepository(BaseModel):
+    """The repository of the feedback query; `pullRequest` is `None` when it has no such pull request."""
+
+    pullRequest: _FeedbackPullRequest | None = None
+
+
+class _FeedbackData(BaseModel):
+    """The `data` of the feedback query."""
+
+    repository: _FeedbackRepository
+
+
+class _FeedbackAnswer(BaseModel):
+    """The answer of `gh api graphql` to the feedback query."""
+
+    data: _FeedbackData
+
+
+TRUSTED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+FEEDBACK_CONTEXTS_PAGE_SIZE = 100
+FEEDBACK_THREADS_PAGE_SIZE = 100
+FEEDBACK_COMMENTS_PAGE_SIZE = 50
+FEEDBACK_QUERY = f"""
+query($owner: String!, $name: String!, $number: Int!) {{
+  repository(owner: $owner, name: $name) {{
+    pullRequest(number: $number) {{
+      commits(last: 1) {{
+        nodes {{
+          commit {{
+            statusCheckRollup {{
+              contexts(first: {FEEDBACK_CONTEXTS_PAGE_SIZE}) {{
+                nodes {{
+                  __typename
+                  ... on CheckRun {{ name status conclusion }}
+                  ... on StatusContext {{ context state }}
+                }}
+              }}
+            }}
+          }}
+        }}
+      }}
+      reviewThreads(first: {FEEDBACK_THREADS_PAGE_SIZE}) {{
+        nodes {{
+          isResolved
+          path
+          line
+          comments(first: {FEEDBACK_COMMENTS_PAGE_SIZE}) {{
+            nodes {{ authorAssociation body }}
+          }}
+        }}
+      }}
+    }}
+  }}
+}}
+"""
+
 BASE_HISTORY_DEPTH = 10
 BASE_CONTEXTS_PAGE_SIZE = 100
 BASE_CI_QUERY = f"""
@@ -314,6 +427,25 @@ def _check_state(check: _CheckRun | _StatusContext) -> CiState:
     if check.status != COMPLETED:
         return "running"
     return "passed" if check.conclusion in PASSING_CONCLUSIONS else "failed"
+
+
+def _check_name(check: _NamedCheckRun | _NamedStatusContext) -> str:
+    """Return the name a check is shown under."""
+    return check.name if isinstance(check, _NamedCheckRun) else check.context
+
+
+def _open_threads(threads: Sequence[_ReviewThread]) -> tuple[OpenThread, ...]:
+    """Return the unresolved `threads`, each with only the comments of trusted authors, dropping a thread left with none."""
+    kept: list[OpenThread] = []
+    for thread in threads:
+        comments = tuple(
+            writable_text(comment.body)
+            for comment in thread.comments.nodes
+            if comment.authorAssociation in TRUSTED_ASSOCIATIONS
+        )
+        if comments and not thread.isResolved:
+            kept.append(OpenThread(thread.path, thread.line, comments))
+    return tuple(kept)
 
 
 class GitHubRepository:
@@ -466,6 +598,63 @@ class GitHubRepository:
             for file in page
         )
 
+    def feedback(self, pull_request: PullRequest) -> PullRequestFeedback:
+        """Return the red checks of the latest commit of `pull_request` and its unresolved review threads.
+
+        The first 100 checks and 100 threads are read, and the first 50 comments of each
+        thread. A check is red when `read_ci` would read it as failed; its name appears
+        once, in the order reported. A thread keeps only the comments whose author is in
+        `TRUSTED_ASSOCIATIONS`, and is dropped when none is left.
+
+        Raises `RepositoryError` when the token variable is not set, `gh` fails, its answer
+        cannot be read, or the repository has no such pull request.
+        """
+        number = pull_request.number
+        action = f"reading the feedback of pull request #{number}"
+        owner, _, name = self._repository.name.partition("/")
+        answer = self._run_json(
+            action,
+            [
+                "api",
+                "graphql",
+                "-f",
+                f"query={FEEDBACK_QUERY}",
+                "-f",
+                f"owner={owner}",
+                "-f",
+                f"name={name}",
+                "-F",
+                f"number={number}",
+            ],
+            on_repository=False,
+        )
+        try:
+            found = _FeedbackAnswer.model_validate(answer).data.repository.pullRequest
+        except ValidationError as error:
+            raise self._unreadable(action, error) from None
+        if found is None:
+            raise RepositoryError(
+                f"the answer of gh to {action} cannot be read: it holds no such "
+                "pull request"
+            )
+        rollups = [node.commit.statusCheckRollup for node in found.commits.nodes]
+        checks = [
+            check
+            for rollup in rollups
+            if rollup is not None
+            for check in rollup.contexts.nodes
+        ]
+        return PullRequestFeedback(
+            red_checks=tuple(
+                dict.fromkeys(
+                    _check_name(check)
+                    for check in checks
+                    if _check_state(check) == "failed"
+                )
+            ),
+            threads=_open_threads(found.reviewThreads.nodes),
+        )
+
     def merge(self, pull_request: PullRequest) -> None:
         """Merge `pull_request` as one squashed commit whose subject is `pull_request.title`, which GitHub refuses once its head is not `pull_request.head`.
 
@@ -590,12 +779,7 @@ class GitHubRepository:
         failure = BaseCiFailure(
             branch=branch,
             commit=commit,
-            checks=tuple(
-                dict.fromkeys(
-                    check.name if isinstance(check, _NamedCheckRun) else check.context
-                    for check in failed
-                )
-            ),
+            checks=tuple(dict.fromkeys(_check_name(check) for check in failed)),
         )
         runs = _workflow_runs(failed)
         if runs is None:

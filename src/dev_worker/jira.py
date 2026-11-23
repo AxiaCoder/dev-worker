@@ -23,7 +23,14 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationErro
 
 from dev_worker.header import _describe
 from dev_worker.instance import Tracker
-from dev_worker.tickets import REQUEUE_MARKER, Blocker, Claim, Ticket, TrackerError
+from dev_worker.tickets import (
+    REQUEUE_MARKER,
+    RETURN_MARKER,
+    Blocker,
+    Claim,
+    Ticket,
+    TrackerError,
+)
 
 TICKET_KEY = re.compile(r"[A-Z][A-Z0-9_]*-[0-9]+")
 BLOCKS = "Blocks"
@@ -570,6 +577,23 @@ class JiraTracker:
             text.startswith(REQUEUE_MARKER)
             for _, text in self._comments_since(key, statuses)
         )
+
+    def last_return(self, key: str, statuses: frozenset[str]) -> str | None:
+        """Return the text, `RETURN_MARKER` removed, of the comment with the highest id starting with that marker since the ticket `key` last entered any of the statuses `statuses`; None when there is none.
+
+        The last entry is read as `claims` reads it; every comment counts when there is
+        none. Raises as `claims` does.
+        """
+        latest = max(
+            (
+                (comment.id, text)
+                for comment, text in self._comments_since(key, statuses)
+                if text.startswith(RETURN_MARKER)
+            ),
+            key=lambda found: found[0],
+            default=None,
+        )
+        return None if latest is None else latest[1].removeprefix(RETURN_MARKER)
 
     def entered(self, key: str, statuses: frozenset[str]) -> datetime | None:
         """Return when the ticket `key` last entered any of the statuses `statuses`, timezone-aware; None when it never did.
