@@ -789,9 +789,7 @@ def read_previous_stop(key: str, instance: Instance, tracker: TicketTracker) -> 
     try:
         stopped = tracker.last_return(key, settled)
     except TrackerError as error:
-        return writable_text(
-            stop_section(f"It could not be read from the tracker: {error}", None)
-        )
+        return stop_section(f"It could not be read from the tracker: {error}", None)
     if stopped is None:
         return ""
     repository = make_repository(instance.repository)
@@ -799,13 +797,11 @@ def read_previous_stop(key: str, instance: Instance, tracker: TicketTracker) -> 
         pull_request = repository.find_pull_request(run_branch(instance, key))
         feedback = None if pull_request is None else repository.feedback(pull_request)
     except RepositoryError:
-        return writable_text(
-            stop_section(
-                f"{stopped} The red checks and open review threads could not be read.",
-                None,
-            )
+        return stop_section(
+            f"{stopped} The red checks and open review threads could not be read.",
+            None,
         )
-    return writable_text(stop_section(stopped, feedback))
+    return stop_section(stopped, feedback)
 
 
 def settle_usage_limit(

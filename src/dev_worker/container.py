@@ -33,6 +33,7 @@ from typing import NoReturn
 
 from dev_worker.github import failure_reason
 from dev_worker.repositories import OpenThread, PullRequestFeedback
+from dev_worker.text import writable_text
 from dev_worker.tickets import Ticket
 
 DOCKER_TIMEOUT_SECONDS = 60.0
@@ -87,18 +88,18 @@ def stop_section(stopped: str, feedback: PullRequestFeedback | None) -> str:
     It holds `stopped`, then the red checks and the open review threads of `feedback`, an
     empty group having no heading. Items are added whole and in order; once the next one
     does not fit, a final line counts those left out. `stopped` is cut when it leaves no
-    room for that line.
+    room for that line. The returned text is writable as UTF-8 (see `writable_text`).
     """
     items = [
-        (RED_CHECKS_HEADING, f"- {name}\n")
+        (RED_CHECKS_HEADING, writable_text(f"- {name}\n"))
         for name in (feedback.red_checks if feedback else ())
     ] + [
-        (OPEN_THREADS_HEADING, _thread_item(thread))
+        (OPEN_THREADS_HEADING, writable_text(_thread_item(thread)))
         for thread in (feedback.threads if feedback else ())
     ]
     reserved = len(_left_out(len(items))) if items else 0
     room = MAX_STOP_CHARS - len(STOP_HEADING) - len("\n") - reserved
-    section = f"{STOP_HEADING}{stopped[:room]}\n"
+    section = f"{STOP_HEADING}{writable_text(stopped)[:room]}\n"
     heading = ""
     for rank, (item_heading, item) in enumerate(items, start=1):
         added = item if item_heading == heading else item_heading + item

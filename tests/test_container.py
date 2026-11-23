@@ -3,6 +3,7 @@ import re
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -25,6 +26,7 @@ from dev_worker.container import (
     verdict_schema,
 )
 from dev_worker.repositories import OpenThread, PullRequestFeedback
+from dev_worker.text import writable_text
 from dev_worker.tickets import Ticket
 
 FAKE_DOCKER = Path(__file__).with_name("fake_docker.py")
@@ -889,6 +891,37 @@ def test_stop_section_leaves_out_a_last_item_one_character_too_long() -> None:
 
     assert len(section) == MAX_STOP_CHARS
     assert section.endswith("x\n1 more items left out.\n")
+
+
+def in_thread_comment(text: str) -> PullRequestFeedback:
+    return PullRequestFeedback((), (OpenThread("a.py", 1, (text,)),))
+
+
+def in_thread_path(text: str) -> PullRequestFeedback:
+    return PullRequestFeedback((), (OpenThread(text, 1, ("Fix.",)),))
+
+
+@pytest.mark.parametrize("character", ["\x00", "\ud800"], ids=["nul", "surrogate"])
+@pytest.mark.parametrize(
+    "place",
+    [
+        lambda text: (text, None),
+        lambda text: ("Reason.", red(text)),
+        lambda text: ("Reason.", in_thread_comment(text)),
+        lambda text: ("Reason.", in_thread_path(text)),
+    ],
+    ids=["stopped", "check_name", "thread_comment", "thread_path"],
+)
+def test_stop_section_is_already_writable_and_within_the_bound(
+    character: str,
+    place: Callable[[str], tuple[str, PullRequestFeedback | None]],
+) -> None:
+    stopped, feedback = place(character * (MAX_STOP_CHARS // 2))
+
+    section = stop_section(stopped, feedback)
+
+    assert writable_text(section) == section
+    assert len(section) <= MAX_STOP_CHARS
 
 
 def test_ticket_prompt_without_a_previous_stop_is_unchanged() -> None:

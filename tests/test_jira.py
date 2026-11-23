@@ -1643,6 +1643,35 @@ def test_last_return_reads_an_atlassian_document(
     )
 
 
+def test_last_return_keeps_each_paragraph_of_an_atlassian_document_on_its_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lines = (
+        f"{RETURN_MARKER}The guard review stopped the pull request.",
+        "- src/app.py:12 The token is logged.",
+        "- src/db.py:3 The query is unbounded.",
+    )
+    body = {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": line}]}
+            for line in lines
+        ],
+    }
+    serve_pages(
+        monkeypatch,
+        page([]),
+        page([comment("10", "2026-11-11T10:00:00.000Z", body)]),
+    )
+
+    assert tracker().last_return("ABC-218", frozenset({"Blocked"})) == (
+        "The guard review stopped the pull request.\n"
+        "- src/app.py:12 The token is logged.\n"
+        "- src/db.py:3 The query is unbounded."
+    )
+
+
 def test_last_return_ignores_a_plain_requeue_comment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

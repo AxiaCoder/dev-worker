@@ -581,12 +581,12 @@ class JiraTracker:
     def last_return(self, key: str, statuses: frozenset[str]) -> str | None:
         """Return the text, `RETURN_MARKER` removed, of the comment with the highest id starting with that marker since the ticket `key` last entered any of the statuses `statuses`; None when there is none.
 
-        The last entry is read as `claims` reads it; every comment counts when there is
-        none. Raises as `claims` does.
+        The text keeps the comment's paragraphs, one per line. The last entry is read as
+        `claims` reads it; every comment counts when there is none. Raises as `claims` does.
         """
         latest = max(
             (
-                (comment.id, text)
+                (comment.id, _document_text(comment.body).strip())
                 for comment, text in self._comments_since(key, statuses)
                 if text.startswith(RETURN_MARKER)
             ),
