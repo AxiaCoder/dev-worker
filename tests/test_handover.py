@@ -203,3 +203,77 @@ def test_every_reason_that_applies_is_stated() -> None:
         "it changes at least 3000 files, the most the host lists, so its list of "
         "files may be incomplete."
     )
+
+
+@pytest.mark.parametrize("pattern", ["src/auth", "src/auth/"])
+@pytest.mark.parametrize("path", ["src/auth/a.py", "src/auth/d/a.py"])
+def test_a_pattern_naming_a_directory_covers_everything_under_it(
+    pattern: str, path: str
+) -> None:
+    handover = Handover(sensitive_paths=(pattern,))
+
+    assert (
+        handover_reason([changed(path)], handover)
+        == f"it touches sensitive paths: {path}."
+    )
+
+
+@pytest.mark.parametrize("pattern", ["src/auth", "src/auth/"])
+@pytest.mark.parametrize("path", ["src/authx/a.py", "src/auth.py"])
+def test_a_pattern_naming_a_directory_leaves_a_lookalike_path_alone(
+    pattern: str, path: str
+) -> None:
+    handover = Handover(sensitive_paths=(pattern,))
+
+    assert handover_reason([changed(path)], handover) is None
+
+
+def test_a_pattern_naming_a_file_still_matches_that_file() -> None:
+    handover = Handover(sensitive_paths=("README.md",))
+
+    assert (
+        handover_reason([changed("README.md")], handover)
+        == "it touches sensitive paths: README.md."
+    )
+
+
+@pytest.mark.parametrize("pattern", ["src/auth", "src/auth/"])
+def test_a_file_moved_out_of_a_named_directory_is_caught_by_its_old_path(
+    pattern: str,
+) -> None:
+    handover = Handover(sensitive_paths=(pattern,))
+    moved = changed("docs/login.py", previous_path="src/auth/login.py")
+
+    assert (
+        handover_reason([moved], handover)
+        == "it touches sensitive paths: src/auth/login.py."
+    )
+
+
+@pytest.mark.parametrize("pattern", ["tests", "tests/"])
+@pytest.mark.parametrize("path", ["tests/test_app.py", "tests/d/test_app.py"])
+def test_a_test_path_naming_a_directory_leaves_its_files_out_of_the_size(
+    pattern: str, path: str
+) -> None:
+    handover = Handover(max_changed_lines=10, test_paths=(pattern,))
+
+    assert handover_reason([changed(path, additions=11)], handover) is None
+
+
+@pytest.mark.parametrize("path", [".github/ci.yml", ".github/workflows/ci.yml"])
+def test_a_double_star_glob_still_spans_directories(path: str) -> None:
+    handover = Handover(sensitive_paths=(".github/**",))
+
+    assert handover_reason([changed(path)], handover) is not None
+
+
+def test_a_single_star_glob_still_matches_its_own_level() -> None:
+    handover = Handover(sensitive_paths=("src/auth/*",))
+
+    assert handover_reason([changed("src/auth/a.py")], handover) is not None
+
+
+def test_a_single_star_glob_still_stops_at_a_subdirectory() -> None:
+    handover = Handover(sensitive_paths=("src/auth/*",))
+
+    assert handover_reason([changed("src/auth/d/a.py")], handover) is None
