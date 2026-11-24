@@ -82,9 +82,11 @@ hold_merge_label: hold-merge
 
 # Optional. Each limit may only tighten the header ceiling of the same name; review_max_turns
 # caps the turns of the guard review a pull request gets before its merge, review_timeout_seconds
-# the seconds of the run kept for that review, and max_attempts the runs that may die on a ticket
-# before the worker blocks it. usage_limit_wait_seconds is how long the worker takes no ticket
-# after a run reaches the usage limit of the agent's account without saying when it resets.
+# the seconds of the run kept for that review, and max_attempts the attempts a ticket gets before
+# the worker blocks it, a run that died or a pull request sent back by the guard review or a red
+# CI each using one (3 allows two returns). usage_limit_wait_seconds is how long the worker takes
+# no ticket after a run reaches the usage limit of the agent's account without saying when it
+# resets.
 # run_timeout_seconds must exceed review_timeout_seconds by more than the 180 seconds kept for
 # the agent to wait for the CI.
 limits:

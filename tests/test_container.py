@@ -3,6 +3,7 @@ import re
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import Any
 import pytest
 
 from dev_worker.container import (
+    MAX_STOP_CHARS,
     Container,
     ContainerError,
     ContainerExit,
@@ -19,9 +21,12 @@ from dev_worker.container import (
     outcome_schema,
     review_command,
     review_prompt,
+    stop_section,
     ticket_prompt,
     verdict_schema,
 )
+from dev_worker.repositories import OpenThread, PullRequestFeedback
+from dev_worker.text import writable_text
 from dev_worker.tickets import Ticket
 
 FAKE_DOCKER = Path(__file__).with_name("fake_docker.py")
@@ -770,3 +775,325 @@ def test_ticket_prompt_gives_each_required_field_a_section_after_the_description
         "Acceptance criteria:\nIt logs in.\n"
         "Environment:\nStaging\n"
     )
+
+
+def red(*names: str) -> PullRequestFeedback:
+    return PullRequestFeedback(names, ())
+
+
+def test_stop_section_lists_the_reason_the_red_checks_and_the_open_threads() -> None:
+    feedback = PullRequestFeedback(
+        ("build", "lint"),
+        (
+            OpenThread("src/a.py", 3, ("Fix.\nNow.", "Agreed."), "PRRT_a"),
+            OpenThread("src/b.py", None, ("Why?",), "PRRT_b"),
+        ),
+    )
+
+    assert stop_section("Reason.", feedback) == (
+        "What stopped the previous run:\n"
+        "Reason.\n"
+        "Red checks:\n"
+        "- build\n"
+        "- lint\n"
+        "Open review threads:\n"
+        "- src/a.py:3 (thread PRRT_a)\n"
+        "  Fix.\n"
+        "  Now.\n"
+        "  Agreed.\n"
+        "- src/b.py (thread PRRT_b)\n"
+        "  Why?\n"
+    )
+
+
+@pytest.mark.parametrize("feedback", [None, PullRequestFeedback((), ())])
+def test_stop_section_without_items_has_no_group_heading(
+    feedback: PullRequestFeedback | None,
+) -> None:
+    assert stop_section("Reason.", feedback) == (
+        "What stopped the previous run:\nReason.\n"
+    )
+
+
+def test_stop_section_omits_an_empty_group_of_threads() -> None:
+    assert "Open review threads" not in stop_section("Reason.", red("build"))
+
+
+def test_stop_section_omits_an_empty_group_of_checks() -> None:
+    feedback = PullRequestFeedback((), (OpenThread("a.py", 1, ("Fix.",), "PRRT_a"),))
+
+    assert "Red checks" not in stop_section("Reason.", feedback)
+
+
+@pytest.mark.parametrize("count", [9, 10, 99, 100, 5000])
+def test_stop_section_of_many_items_stays_bound_and_counts_those_left_out(
+    count: int,
+) -> None:
+    names = tuple(f"check-{rank:04}-{'n' * 200}" for rank in range(count))
+
+    section = stop_section("Reason.", red(*names))
+
+    assert len(section) <= MAX_STOP_CHARS
+    kept = section.count("- check-")
+    left_out = re.search(r"(\d+) more items left out\.\n\Z", section)
+    assert (int(left_out.group(1)) if left_out else 0) == count - kept
+
+
+def test_stop_section_cuts_a_huge_reason_alone_to_the_bound() -> None:
+    section = stop_section("x" * (2 * MAX_STOP_CHARS), None)
+
+    assert len(section) == MAX_STOP_CHARS
+    assert section.endswith("x\n")
+
+
+def test_stop_section_cuts_a_huge_reason_and_keeps_room_to_count_the_items() -> None:
+    section = stop_section("x" * (2 * MAX_STOP_CHARS), red("a" * 100, "b" * 100, "c"))
+
+    assert len(section) <= MAX_STOP_CHARS
+    assert section.endswith("x\n3 more items left out.\n")
+
+
+def test_stop_section_leaves_out_a_huge_first_item_and_those_after_it() -> None:
+    section = stop_section("Reason.", red("y" * MAX_STOP_CHARS, "z"))
+
+    assert section == (
+        "What stopped the previous run:\nReason.\n2 more items left out.\n"
+    )
+
+
+def test_stop_section_keeps_the_checks_before_a_huge_check() -> None:
+    assert stop_section("Reason.", red("build", "y" * MAX_STOP_CHARS)) == (
+        "What stopped the previous run:\n"
+        "Reason.\n"
+        "Red checks:\n"
+        "- build\n"
+        "1 more items left out.\n"
+    )
+
+
+def test_stop_section_keeps_the_checks_before_a_huge_thread_and_cuts_it() -> None:
+    feedback = PullRequestFeedback(
+        ("build",), (OpenThread("a.py", 1, ("y" * MAX_STOP_CHARS,), "PRRT_a"),)
+    )
+
+    section = stop_section("Reason.", feedback)
+
+    assert section.startswith(
+        "What stopped the previous run:\n"
+        "Reason.\n"
+        "Red checks:\n"
+        "- build\n"
+        "Open review threads:\n"
+        "- a.py:1 (thread PRRT_a)\n"
+    )
+    assert section.endswith(f"\n{THREAD_CUT_MARK}\n")
+
+
+def test_stop_section_keeps_a_last_item_that_fits_exactly() -> None:
+    name = "a" * (len("1 more items left out.\n") - len("Red checks:\n- \n"))
+
+    section = stop_section("x" * MAX_STOP_CHARS, red(name))
+
+    assert len(section) == MAX_STOP_CHARS
+    assert section.endswith(f"Red checks:\n- {name}\n")
+
+
+def test_stop_section_leaves_out_a_last_item_one_character_too_long() -> None:
+    name = "a" * (len("1 more items left out.\n") - len("Red checks:\n- \n") + 1)
+
+    section = stop_section("x" * MAX_STOP_CHARS, red(name))
+
+    assert len(section) == MAX_STOP_CHARS
+    assert section.endswith("x\n1 more items left out.\n")
+
+
+def in_thread_comment(text: str) -> PullRequestFeedback:
+    return PullRequestFeedback((), (OpenThread("a.py", 1, (text,), "PRRT_a"),))
+
+
+def in_thread_path(text: str) -> PullRequestFeedback:
+    return PullRequestFeedback((), (OpenThread(text, 1, ("Fix.",), "PRRT_a"),))
+
+
+@pytest.mark.parametrize("character", ["\x00", "\ud800"], ids=["nul", "surrogate"])
+@pytest.mark.parametrize(
+    "place",
+    [
+        lambda text: (text, None),
+        lambda text: ("Reason.", red(text)),
+        lambda text: ("Reason.", in_thread_comment(text)),
+        lambda text: ("Reason.", in_thread_path(text)),
+    ],
+    ids=["stopped", "check_name", "thread_comment", "thread_path"],
+)
+def test_stop_section_is_already_writable_and_within_the_bound(
+    character: str,
+    place: Callable[[str], tuple[str, PullRequestFeedback | None]],
+) -> None:
+    stopped, feedback = place(character * (MAX_STOP_CHARS // 2))
+
+    section = stop_section(stopped, feedback)
+
+    assert writable_text(section) == section
+    assert len(section) <= MAX_STOP_CHARS
+
+
+def test_stop_section_keeps_room_to_count_what_follows_an_item_filling_the_bound() -> (
+    None
+):
+    filling = "y" * (MAX_STOP_CHARS - len(stop_section("Reason.", red(""))))
+
+    section = stop_section("Reason.", red(filling, "z"))
+
+    assert len(section) <= MAX_STOP_CHARS
+    assert filling not in section
+
+
+THREAD_ITEM_BOUND = 4_000
+THREAD_CUT_MARK = "[cut at the prompt limit]"
+THREAD_LINE = "- a.py:1 (thread PRRT_a)\n"
+COMMENT_FILLING_THE_ITEM = "y" * (THREAD_ITEM_BOUND - len(THREAD_LINE) - len("  \n"))
+
+
+def thread_item(section: str, line: str = THREAD_LINE) -> str:
+    """Return the item of `section` opening on `line`, up to the next item or the count."""
+    rest = section[section.index(line) :]
+    end = re.search(r"\n(?=- |\d+ more items left out\.\n\Z)", rest)
+    return rest[: end.end()] if end else rest
+
+
+def left_out_count(section: str) -> int:
+    """Return the count on the last line of `section`, 0 without that line."""
+    line = re.search(r"(\d+) more items left out\.\n\Z", section)
+    return int(line.group(1)) if line else 0
+
+
+@pytest.mark.parametrize(
+    "comments",
+    [
+        ("y" * (2 * MAX_STOP_CHARS),),
+        (COMMENT_FILLING_THE_ITEM + "y",),
+        ("y" * 3_000, "z" * 3_000),
+    ],
+    ids=["twice_the_section", "one_over_the_item", "two_comments"],
+)
+def test_stop_section_cuts_a_long_thread_and_keeps_its_id(
+    comments: tuple[str, ...],
+) -> None:
+    feedback = PullRequestFeedback((), (OpenThread("a.py", 1, comments, "PRRT_a"),))
+
+    section = stop_section("Reason.", feedback)
+
+    assert THREAD_LINE in section
+    item = thread_item(section)
+    assert len(item) <= THREAD_ITEM_BOUND
+    assert item.splitlines()[-1] == THREAD_CUT_MARK
+    assert left_out_count(section) == 0
+
+
+@pytest.mark.parametrize("character", ["\x00", "\ud800"], ids=["nul", "surrogate"])
+def test_stop_section_measures_a_thread_after_escaping_it(character: str) -> None:
+    comment = character * (THREAD_ITEM_BOUND - 100)
+    feedback = PullRequestFeedback((), (OpenThread("a.py", 1, (comment,), "PRRT_a"),))
+
+    section = stop_section("Reason.", feedback)
+
+    assert THREAD_LINE in section
+    item = thread_item(section)
+    assert writable_text(section) == section
+    assert len(item) <= THREAD_ITEM_BOUND
+    assert item.splitlines()[-1] == THREAD_CUT_MARK
+
+
+@pytest.mark.parametrize(
+    "comment", ["Fix.", COMMENT_FILLING_THE_ITEM], ids=["short", "fills_the_item"]
+)
+def test_stop_section_leaves_a_thread_within_its_bound_unchanged(comment: str) -> None:
+    feedback = PullRequestFeedback((), (OpenThread("a.py", 1, (comment,), "PRRT_a"),))
+
+    section = stop_section("Reason.", feedback)
+
+    assert section == (
+        "What stopped the previous run:\n"
+        "Reason.\n"
+        "Open review threads:\n"
+        f"{THREAD_LINE}"
+        f"  {comment}\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "comment", ["Fix.", "y" * (2 * MAX_STOP_CHARS)], ids=["short", "huge"]
+)
+def test_stop_section_lists_the_only_thread_after_a_huge_reason(comment: str) -> None:
+    feedback = PullRequestFeedback((), (OpenThread("a.py", 1, (comment,), "PRRT_a"),))
+
+    section = stop_section("x" * (2 * MAX_STOP_CHARS), feedback)
+
+    assert len(section) <= MAX_STOP_CHARS
+    assert THREAD_LINE in section
+    assert left_out_count(section) == 0
+
+
+@pytest.mark.parametrize(
+    "stopped", ["Reason.", "x" * (2 * MAX_STOP_CHARS)], ids=["short", "huge"]
+)
+@pytest.mark.parametrize(
+    "checks",
+    [
+        tuple(f"check-{rank:04}-{'n' * 200}" for rank in range(500)),
+        ("check-huge-" + "n" * (2 * MAX_STOP_CHARS), "check-after"),
+    ],
+    ids=["many_checks", "huge_check"],
+)
+@pytest.mark.parametrize(
+    "comment", ["Fix.", "y" * (2 * MAX_STOP_CHARS)], ids=["short", "huge"]
+)
+def test_stop_section_always_lists_the_first_thread_and_counts_those_left_out(
+    stopped: str, checks: tuple[str, ...], comment: str
+) -> None:
+    feedback = PullRequestFeedback(
+        checks,
+        (
+            OpenThread("a.py", 1, (comment,), "PRRT_a"),
+            OpenThread("b.py", 2, ("Second.",), "PRRT_b"),
+        ),
+    )
+
+    section = stop_section(stopped, feedback)
+
+    assert len(section) <= MAX_STOP_CHARS
+    assert THREAD_LINE in section
+    kept = section.count("- check-") + section.count("(thread PRRT_")
+    assert left_out_count(section) == len(checks) + 2 - kept
+    if "- check-" in section:
+        assert section.rindex("- check-") < section.index("Open review threads:\n")
+
+
+def test_ticket_prompt_without_a_previous_stop_is_unchanged() -> None:
+    expected = (
+        "Ticket: ABC-1\n"
+        "Title: Add a login page\n"
+        "CI deadline: 2026-11-17T10:30:00Z\n"
+        "\n"
+        "Description:\nThe page asks for an email.\nThen a password.\n"
+    )
+
+    assert ticket_prompt(TICKET, DEADLINE) == expected
+    assert ticket_prompt(TICKET, DEADLINE, "") == expected
+
+
+def test_ticket_prompt_closes_on_the_previous_stop_after_a_blank_line() -> None:
+    section = stop_section("Reason.", None)
+
+    assert ticket_prompt(TICKET, DEADLINE, section) == (
+        f"{ticket_prompt(TICKET, DEADLINE)}\n{section}"
+    )
+
+
+def test_agent_command_carries_the_previous_stop_in_its_prompt() -> None:
+    section = stop_section("Reason.", None)
+
+    command = agent_command(TICKET, "Rules", 5, OUTCOMES, DEADLINE, "opus", section)
+
+    assert command[2] == ticket_prompt(TICKET, DEADLINE, section)

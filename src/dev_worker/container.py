@@ -28,9 +28,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from textwrap import indent
 from typing import NoReturn
 
 from dev_worker.github import failure_reason
+from dev_worker.repositories import OpenThread, PullRequestFeedback
+from dev_worker.text import writable_text
 from dev_worker.tickets import Ticket
 
 DOCKER_TIMEOUT_SECONDS = 60.0
@@ -42,6 +45,13 @@ OWNER_LABEL = "dev-worker.instance"
 DOCKER_FAILURE_CODES = (125, 126, 127)
 REVIEWER_AGENT = "atelier:reviewer"
 DEFECT_FIELDS = ("file", "line", "summary")
+MAX_STOP_CHARS = 16_000
+STOP_HEADING = "What stopped the previous run:\n"
+RED_CHECKS_HEADING = "Red checks:\n"
+OPEN_THREADS_HEADING = "Open review threads:\n"
+THREAD_COMMENT_INDENT = "  "
+MAX_THREAD_CHARS = 4_000
+THREAD_CUT_MARK = "[cut at the prompt limit]"
 
 
 class ContainerError(Exception):
@@ -60,15 +70,106 @@ class ContainerExit:
     stderr: str
 
 
-def ticket_prompt(ticket: Ticket, ci_deadline: datetime) -> str:
-    """Return the prompt of a run on `ticket`: its key, title, CI deadline, description and required fields.
+def _thread_item(thread: OpenThread) -> str:
+    """Return the writable list item of `thread`, at most `MAX_THREAD_CHARS` characters.
+
+    The item opens on `- path:line (thread <id>)`, or `- path (thread <id>)` without a
+    line, then holds its comments indented. Measured once escaped (see `writable_text`),
+    an item over the bound has its comments cut and ends on the line `THREAD_CUT_MARK`;
+    a path too long for the bound is cut too, the line and the id always kept.
+    """
+    path = writable_text(thread.path)
+    line = "" if thread.line is None else f":{thread.line}"
+    place_end = writable_text(f"{line} (thread {thread.thread_id})\n")
+    comments = writable_text(
+        "".join(
+            f"{indent(comment, THREAD_COMMENT_INDENT)}\n" for comment in thread.comments
+        )
+    )
+    item = f"- {path}{place_end}{comments}"
+    if len(item) <= MAX_THREAD_CHARS:
+        return item
+    mark = f"{THREAD_CUT_MARK}\n"
+    room = MAX_THREAD_CHARS - len(mark) - len("\n")
+    head = f"- {path[: room - len('- ') - len(place_end)]}{place_end}"
+    kept = f"{head}{comments[: room - len(head)]}".rstrip("\n")
+    return f"{kept}\n{mark}"
+
+
+def _left_out(count: int) -> str:
+    """Return the final line saying `count` items did not fit."""
+    return f"{count} more items left out.\n"
+
+
+def _with_leading_items(
+    section: str, heading: str, items: Sequence[str], held: int, after: int
+) -> tuple[str, int]:
+    """Return `section` with the leading `items` that fit, and how many were added.
+
+    `heading` precedes the first one added. Adding stops at the first item that would
+    not leave `held` characters free under `MAX_STOP_CHARS`, plus the room of the line
+    counting the items not added and the `after` items that follow them.
+    """
+    for rank, item in enumerate(items):
+        added = item if rank else heading + item
+        remaining = len(items) - rank - 1 + after
+        needed = len(_left_out(remaining)) if remaining else 0
+        if len(section) + len(added) + held + needed > MAX_STOP_CHARS:
+            return section, rank
+        section += added
+    return section, len(items)
+
+
+def stop_section(stopped: str, feedback: PullRequestFeedback | None) -> str:
+    """Return the prompt section telling a run what stopped the previous one, at most `MAX_STOP_CHARS` characters.
+
+    It holds `stopped`, then the red checks and the open review threads of `feedback`, an
+    empty group having no heading. The first thread is always listed: its room is held
+    before `stopped` and the checks are placed. Each thread is bounded (see
+    `_thread_item`). Other items are added whole and in order; within a group, once the
+    next one does not fit, it and those after it are left out, and a final line gives
+    their exact count. `stopped` is cut when it leaves no room for the first thread and
+    that line. The returned text is writable as UTF-8 (see `writable_text`).
+    """
+    checks = [
+        writable_text(f"- {name}\n")
+        for name in (feedback.red_checks if feedback else ())
+    ]
+    threads = [
+        _thread_item(thread) for thread in (feedback.threads if feedback else ())
+    ]
+    first_thread = f"{OPEN_THREADS_HEADING}{threads[0]}" if threads else ""
+    later_threads = threads[1:]
+    item_count = len(checks) + len(threads)
+    count_room = len(_left_out(item_count)) if item_count else 0
+    room = (
+        MAX_STOP_CHARS - len(STOP_HEADING) - len("\n") - len(first_thread) - count_room
+    )
+    section = f"{STOP_HEADING}{writable_text(stopped)[:room]}\n"
+    section, listed_checks = _with_leading_items(
+        section, RED_CHECKS_HEADING, checks, len(first_thread), len(later_threads)
+    )
+    left_out_checks = len(checks) - listed_checks
+    section, listed_threads = _with_leading_items(
+        section + first_thread, "", later_threads, 0, left_out_checks
+    )
+    left_out = left_out_checks + len(later_threads) - listed_threads
+    return section + _left_out(left_out) if left_out else section
+
+
+def ticket_prompt(
+    ticket: Ticket, ci_deadline: datetime, previous_stop: str = ""
+) -> str:
+    """Return the prompt of a run on `ticket`: its key, title, CI deadline, description, required fields and what stopped the previous run.
 
     `ci_deadline` is an aware datetime, written in UTC to the second as
     `YYYY-MM-DDTHH:MM:SSZ`. Each required field follows the description as a section of
-    its own, its shown name then its text, in the ticket's order.
+    its own, its shown name then its text, in the ticket's order. `previous_stop`, a
+    `stop_section`, closes the prompt after a blank line; empty, it adds nothing.
     """
     deadline = ci_deadline.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     sections = "".join(f"{name}:\n{text}\n" for name, text in ticket.fields)
+    closing = f"\n{previous_stop}" if previous_stop else ""
     return (
         f"Ticket: {ticket.key}\n"
         f"Title: {ticket.title}\n"
@@ -76,6 +177,7 @@ def ticket_prompt(ticket: Ticket, ci_deadline: datetime) -> str:
         "\n"
         f"Description:\n{ticket.description}\n"
         f"{sections}"
+        f"{closing}"
     )
 
 
@@ -103,10 +205,11 @@ def agent_command(
     outcomes: Sequence[str],
     ci_deadline: datetime,
     model: str,
+    previous_stop: str = "",
 ) -> tuple[str, ...]:
     """Return the command that runs Claude Code headless on `ticket` in the container.
 
-    The prompt carries `ci_deadline` (see `ticket_prompt`). `rules` is appended to its
+    The prompt carries `ci_deadline` and `previous_stop` (see `ticket_prompt`). `rules` is appended to its
     system prompt, `max_turns` caps its turns and `outcomes`
     are the outcomes it may end on (see `outcome_schema`); it loads the plugin mounted at
     `PLUGIN_DIR`, runs on `model`, passed by `--model`, runs in `bypassPermissions` mode, never prompting for a permission, and
@@ -115,7 +218,7 @@ def agent_command(
     return (
         AGENT_PROGRAM,
         "-p",
-        ticket_prompt(ticket, ci_deadline),
+        ticket_prompt(ticket, ci_deadline, previous_stop),
         "--append-system-prompt",
         rules,
         "--plugin-dir",

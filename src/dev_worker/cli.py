@@ -23,11 +23,13 @@ from typing import assert_never
 from pydantic import ValidationError
 
 from dev_worker.container import (
+    MAX_STOP_CHARS,
     WORKDIR,
     Container,
     ContainerError,
     agent_command,
     review_command,
+    stop_section,
 )
 from dev_worker.contract import (
     CONTRACT_VERSION,
@@ -81,6 +83,7 @@ from dev_worker.run_journal import (
 from dev_worker.text import writable_text
 from dev_worker.tickets import (
     REQUEUE_MARKER,
+    RETURN_MARKER,
     Claim,
     Ticket,
     TicketTracker,
@@ -103,10 +106,15 @@ class Benign(str):
 
     The lock is held by a run that is not gone, another run claimed the ticket first,
     the ticket is not ready to be taken, or it was blocked for an empty required field. A `done` run is also left blocked for a
-    `Benign` reason when its pull request is missing, its CI has not passed or has
-    reported no check yet on its head commit, its guard review found a reachable defect,
-    or its head moved before the merge.
+    `Benign` reason when its pull request is missing, its CI has not finished or has
+    reported no check yet on its head commit, or its head moved before the merge. A
+    `done` run whose CI failed or whose guard review found a reachable defect has a
+    `ReturnToAgent` reason.
     """
+
+
+class ReturnToAgent(Benign):
+    """Why the pull request of a `done` run goes back to the agent: its CI failed, or its guard review found a reachable defect."""
 
 
 @dataclass(frozen=True)
@@ -497,8 +505,9 @@ def land_done(
     The open pull request whose head is the run branch (see `run_branch`) is found, its
     CI read once, the ticket read again through `tracker`, then the pull request given
     its guard review (see `review_pull_request`), in the instance directory `directory`
-    within the time the run started at `began` has left, the ticket read once more, and
-    the pull request merged as one squashed commit under its title, tied to the reviewed
+    within the time the run started at `began` has left, the ticket read once more, its
+    open review threads from trusted accounts read, and the pull request merged as one
+    squashed commit under its title, tied to the reviewed
     head commit. The status key is `done` once merged; the one the header of `worker`
     ties the `done` outcome to when the ticket carries the `hold_merge_label` of
     `instance` at either read, the pull request left open, and not reviewed when it
@@ -507,16 +516,19 @@ def land_done(
     the status key is that same `done` outcome's, the pull request left open, neither
     reviewed nor merged, and the body says why. The status key is the one the header ties
     `blocked` to when there is no pull request, its CI has
-    not passed, the review found a reachable defect or gave no verdict, or a step fails,
-    the files of the pull request unreadable included,
+    not passed, the review found a reachable defect or gave no verdict, a review thread
+    is still open, or a step fails,
+    the files or the review threads of the pull request unreadable included,
     the pull request left open and nothing retried. The body is `summary` followed by
     what happened, the defects found listed; after a merge that failed for a reason
     other than a moved head, it says the merge may have happened. The reason the ticket
-    is blocked is `None` unless it goes to the `blocked` status key, and `Benign` when no
-    pull request is open, its CI has not passed or has reported no check yet on the head
-    commit, the review found a reachable defect or the head moved before the merge; any
-    other reason, such as a repository that reports no check and has no CI to report
-    one, is a failure of the worker's own chain. The errors hold why
+    is blocked is `None` unless it goes to the `blocked` status key, `ReturnToAgent` when
+    its CI failed, the review found a reachable defect or a review thread is still
+    open, and `Benign` when no pull
+    request is open, its CI has not finished or has reported no check yet on the head
+    commit, or the head moved before the merge; any other reason, such as a repository
+    that reports no check and has no CI to report one, is a failure of the worker's own
+    chain. The errors hold why
     the review checkout could not be deleted, which neither blocks the ticket nor holds
     the merge back.
     """
@@ -549,12 +561,18 @@ def land_done(
                     "was not merged."
                 )
             )
+        if ci == "failed":
+            return blocked(
+                ReturnToAgent(
+                    f"the CI of the pull request {pull_request.url} failed; it was "
+                    "not merged."
+                )
+            )
         if ci != "passed":
-            state = "failed" if ci == "failed" else "has not finished"
             return blocked(
                 Benign(
-                    f"the CI of the pull request {pull_request.url} {state}; it was "
-                    "not merged."
+                    f"the CI of the pull request {pull_request.url} has not finished; "
+                    "it was not merged."
                 )
             )
         held = instance.hold_merge_label in tracker.read(key).labels
@@ -593,6 +611,20 @@ def land_done(
     if held:
         return outcomes.done, left_open, None, errors
     try:
+        threads = repository.open_threads(pull_request)
+    except RepositoryError as error:
+        return blocked(
+            f"the review threads of the pull request {pull_request.url} cannot be "
+            f"read: {error} It was not merged."
+        )
+    if threads:
+        return blocked(
+            ReturnToAgent(
+                f"review threads still open on the pull request {pull_request.url}: "
+                f"{len(threads)}; it was not merged."
+            )
+        )
+    try:
         repository.merge(pull_request)
     except HeadMovedError as error:
         return blocked(Benign(error))
@@ -628,9 +660,11 @@ def settle_ticket(
     one `land_done` gives, `None` for any other ending; the errors `land_done` gives
     that did not block it come first among the errors.
 
-    A run that reached the usage limit of the agent's account is the one exception: its
-    ticket is moved back to the real status of the `ready` key, as `settle_usage_limit`
-    says, without counting as an attempt.
+    Two endings are exceptions. A `done` run whose reason is `ReturnToAgent` is commented
+    on and moved as `settle_return` says, and the reason returned is the one it gives. A
+    run that reached the usage limit of the agent's account has its ticket moved back to
+    the real status of the `ready` key, as `settle_usage_limit` says, without counting as
+    an attempt.
     """
     if isinstance(ending, UsageLimit):
         return None, settle_usage_limit(key, ending, instance, tracker, directory)
@@ -641,6 +675,11 @@ def settle_ticket(
         status_key, body, blocking, errors = land_done(
             key, ending.message, instance, worker, tracker, directory, began
         )
+        if isinstance(blocking, ReturnToAgent):
+            returned, return_errors = settle_return(
+                key, ending.message, blocking, instance, tracker
+            )
+            return returned, [*errors, *return_errors]
     elif isinstance(ending, Outcome):
         status_key, body = tied[ending.outcome], ending.message
     else:
@@ -667,6 +706,120 @@ def settle_ticket(
             "Its status is unknown and is to be read again in the tracker."
         )
     return blocking, errors
+
+
+def settle_return(
+    key: str,
+    summary: str,
+    reason: ReturnToAgent,
+    instance: Instance,
+    tracker: TicketTracker,
+) -> tuple[Benign, list[str]]:
+    """Send the ticket `key` back to the agent for `reason`, or block it; return the reason it ended on, and why a step failed.
+
+    The attempt is one more than the requeue comments since the ticket last settled.
+    Below the `max_attempts` limit, a comment starting with `RETURN_MARKER` names
+    `reason` and the attempt, in at most `MAX_STOP_CHARS` characters with `reason` cut to
+    fit, then the ticket is moved to the real status of the `ready` key. At the limit, a
+    comment holds `summary` and `reason`, and asks a person to look at the ticket, which
+    is moved to the real status of the `blocked` key, even when that comment fails.
+
+    A ticket is moved to `ready` only once its comment is posted: when the requeue
+    comments cannot be read or that comment fails, it is moved to `blocked`. The reason
+    returned is a `ReturnToAgent` only for a ticket moved to `ready`, a plain `Benign`
+    otherwise. After a tracker failure the sentence says whether the comment may have
+    been posted, or that the status is unknown.
+    """
+    ready = instance.statuses["ready"]
+    blocked = instance.statuses["blocked"]
+    settled = frozenset(instance.statuses.values()) - {
+        ready,
+        instance.statuses["in_progress"],
+    }
+    ceiling = instance.limits["max_attempts"]
+    errors: list[str] = []
+
+    def move(status: str) -> bool:
+        """Move the ticket to `status`; return whether the tracker took the move, the error recorded otherwise."""
+        try:
+            tracker.set_status(key, status)
+        except TrackerError as error:
+            errors.append(
+                f"Ticket {key!r} cannot be moved to {status!r}: {error} "
+                "Its status is unknown and is to be read again in the tracker."
+            )
+            return False
+        return True
+
+    try:
+        attempt = tracker.requeues(key, settled) + 1
+    except TrackerError as error:
+        errors.append(
+            f"The comments of ticket {key!r} cannot be read from the tracker: {error} "
+            "It was not sent back to the agent."
+        )
+        body = f"{summary}\n\nThe ticket is blocked: {reason}"
+    else:
+        if attempt < ceiling:
+            suffix = f" (attempt {attempt} of {ceiling})."
+            room = MAX_STOP_CHARS - len(RETURN_MARKER) - len(suffix)
+            try:
+                tracker.comment(
+                    key,
+                    f"{RETURN_MARKER}{writable_text(reason)[:room]}{suffix}",
+                )
+            except TrackerError as error:
+                errors.append(
+                    f"Ticket {key!r} cannot be commented on: {error} The comment may "
+                    "have been posted. It was not sent back to the agent."
+                )
+                move(blocked)
+                return Benign(reason), errors
+            return (ReturnToAgent(reason) if move(ready) else Benign(reason)), errors
+        body = (
+            f"{summary}\n\nThe ticket is blocked: {reason}\n\nAttempts used, returns "
+            f"and dead runs together: {attempt} (limit {ceiling}). A person needs to "
+            f"look at it, then move it back to {ready!r}."
+        )
+    try:
+        tracker.comment(key, writable_text(body))
+    except TrackerError as error:
+        errors.append(
+            f"Ticket {key!r} cannot be commented on: {error} "
+            "The comment may have been posted."
+        )
+    move(blocked)
+    return Benign(reason), errors
+
+
+def read_previous_stop(key: str, instance: Instance, tracker: TicketTracker) -> str:
+    """Return the prompt section saying what stopped the previous run on the ticket `key`, or an empty string when its pull request was not sent back.
+
+    The reason is the last return comment since the ticket last settled (see
+    `TicketTracker.last_return`), with the red checks and open review threads of the
+    open pull request of the run branch (see `stop_section`). A repository or tracker
+    failure is said in the section and never raised. The section is writable as UTF-8.
+    """
+    settled = frozenset(instance.statuses.values()) - {
+        instance.statuses["ready"],
+        instance.statuses["in_progress"],
+    }
+    try:
+        stopped = tracker.last_return(key, settled)
+    except TrackerError as error:
+        return stop_section(f"It could not be read from the tracker: {error}", None)
+    if stopped is None:
+        return ""
+    repository = make_repository(instance.repository)
+    try:
+        pull_request = repository.find_pull_request(run_branch(instance, key))
+        feedback = None if pull_request is None else repository.feedback(pull_request)
+    except RepositoryError:
+        return stop_section(
+            f"{stopped} The red checks and open review threads could not be read.",
+            None,
+        )
+    return stop_section(stopped, feedback)
 
 
 def settle_usage_limit(
@@ -975,15 +1128,20 @@ def run_under_lock(
         return RunReport(with_errors(failed(task_id, reason), errors), True)
     mandate_began = time.monotonic()
     output, ending, closed = run_in_worktree(
-        handler, mandate, instance, worker, ticket, directory, began
+        handler, mandate, instance, worker, ticket, directory, began, tracker
     )
     blocking, errors = settle_ticket(
         ticket_key, ending, instance, worker, tracker, directory, began
     )
     if blocking is not None:
+        landing = (
+            "went back to the agent"
+            if isinstance(blocking, ReturnToAgent)
+            else "is blocked"
+        )
         output = failed(
             task_id,
-            f"The run ended on 'done' but its ticket is blocked: {blocking}",
+            f"The run ended on 'done' but its ticket {landing}: {blocking}",
             *output.errors,
         )
     output = with_errors(output, errors)
@@ -1172,7 +1330,8 @@ def review_pull_request(
     to that commit (see `run_review`). The review checkout is deleted afterwards,
     whatever happened (see `Workspace.close_review`); a deletion that fails is returned
     apart, never as a reason, and added to an exception raised meanwhile as a note. The
-    reason lists the defects the review found, `Benign`, or says why it gave no verdict.
+    reason lists the defects the review found, `ReturnToAgent`, or says why it gave no
+    verdict.
     """
     try:
         plugin = make_plugin(directory).prepare(worker.header.plugin)
@@ -1249,7 +1408,7 @@ def run_review(
     `review_environment` gives. The time left is `run_timeout_seconds` minus the seconds
     elapsed since `began`, the `time.monotonic()` reading taken when the run started;
     none left, the container is not started. The verdict is read from what the container
-    wrote (see `read_verdict`): no defect gives None; defects give a `Benign` reason
+    wrote (see `read_verdict`): no defect gives None; defects give a `ReturnToAgent` reason
     listing each as `file:line summary`; a container that cannot be run, reaches the ceiling or gives
     no valid verdict gives the reason it gave none.
     """
@@ -1284,7 +1443,7 @@ def run_review(
     findings = "\n".join(
         f"- {defect.file}:{defect.line} {defect.summary}" for defect in verdict
     )
-    return Benign(
+    return ReturnToAgent(
         f"the guard review of the pull request {url} found reachable defects; it "
         f"was not merged.\n{findings}"
     )
@@ -1298,13 +1457,15 @@ def run_container(
     began: float,
     worker: WorkerFile,
     ticket: Ticket,
+    previous_stop: str = "",
 ) -> Outcome | UsageLimit | str:
     """Run the container of `instance` on `worktree` for the time left in the run; return the outcome it ended on, or why there is none.
 
     `directory` is the instance directory of `instance`, `plugin` the plugin checkout
     the container mounts read only. The container runs Claude Code headless on `ticket`
     (see `agent_command`), with the body of `worker` appended to its system prompt, the
-    `max_turns` limit of `instance` and the outcomes of the header of `worker`; it
+    `max_turns` limit of `instance`, the outcomes of the header of `worker` and
+    `previous_stop`, the section saying what stopped the previous run, if any; it
     receives the variables `container_environment` gives, and is not started when one
     is missing.
     `began` is the `time.monotonic()` reading taken when the run started; the
@@ -1346,6 +1507,7 @@ def run_container(
         outcomes,
         ci_deadline,
         instance.agent.model,
+        previous_stop,
     )
     try:
         exited = make_container(instance.container.image, directory).run(
@@ -1375,6 +1537,7 @@ def run_in_worktree(
     ticket: Ticket,
     directory: Path,
     began: float,
+    tracker: TicketTracker,
 ) -> tuple[MandateOutput, Outcome | UsageLimit | str, bool]:
     """Run `handler` once the plugin is prepared, the mirror in `directory` refreshed and a fresh worktree opened.
 
@@ -1398,7 +1561,8 @@ def run_in_worktree(
     Before `handler`, one disposable container is run from the image of `instance`
     with only the worktree and, read only, the plugin checkout mounted; it runs Claude
     Code headless on `ticket`, following the body of `worker` (see `run_container`),
-    and is gone once it ends or
+    its prompt saying what stopped the previous run as read through `tracker` (see
+    `read_previous_stop`), and is gone once it ends or
     is removed when the run reaches its `run_timeout_seconds` limit, counted from
     `began`, the `time.monotonic()` reading taken when the run started (see
     `run_container`); a container that cannot be run, that reaches that limit, that
@@ -1422,8 +1586,16 @@ def run_in_worktree(
         reason = f"The worktree cannot be prepared: {error}"
         return failed(mandate.task_id, reason), reason, True
     try:
+        previous_stop = read_previous_stop(ticket_key, instance, tracker)
         ending = run_container(
-            instance, directory, workspace.worktree, checkout, began, worker, ticket
+            instance,
+            directory,
+            workspace.worktree,
+            checkout,
+            began,
+            worker,
+            ticket,
+            previous_stop,
         )
         if isinstance(ending, str):
             output = failed(mandate.task_id, ending)
@@ -1705,8 +1877,9 @@ def requeue_dead_ticket(
     else:
         status = blocked
         body = (
-            f"The runs that took this ticket died {attempt} times without settling "
-            f"it. A person needs to look at it, then move it back to {ready!r}."
+            "Its last run died without settling it. Attempts used, returns and dead "
+            f"runs together: {attempt} (limit {ceiling}). A person needs to look at "
+            f"it, then move it back to {ready!r}."
         )
     try:
         tracker.comment(key, body)

@@ -23,7 +23,14 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationErro
 
 from dev_worker.header import _describe
 from dev_worker.instance import Tracker
-from dev_worker.tickets import REQUEUE_MARKER, Blocker, Claim, Ticket, TrackerError
+from dev_worker.tickets import (
+    REQUEUE_MARKER,
+    RETURN_MARKER,
+    Blocker,
+    Claim,
+    Ticket,
+    TrackerError,
+)
 
 TICKET_KEY = re.compile(r"[A-Z][A-Z0-9_]*-[0-9]+")
 BLOCKS = "Blocks"
@@ -141,11 +148,12 @@ class _ChangelogPage(_Page):
 
 
 class _Comment(BaseModel):
-    """A comment; its body is text or an Atlassian document."""
+    """A comment; its body is text or an Atlassian document, its author kept as written, whatever its shape."""
 
     id: int
     created: AwareDatetime
     body: object = None
+    author: object = None
 
 
 class _CommentPage(_Page):
@@ -158,6 +166,18 @@ class _QueryPage(_Page):
     """A page of `twg jira workitem query`."""
 
     data: _Issues
+
+
+class _Account(BaseModel):
+    """The account of the token, as `twg whoami` names it."""
+
+    accountId: Annotated[str, Field(min_length=1)]
+
+
+class _WhoamiAnswer(BaseModel):
+    """The answer of `twg whoami`."""
+
+    data: _Account
 
 
 _UNREADABLE = object()
@@ -180,6 +200,12 @@ def _validate[M: BaseModel](model: type[M], answer: object, action: str) -> M:
         raise TrackerError(
             f"the answer of twg to {action} cannot be read: {description}"
         ) from None
+
+
+def _author_account(author: object) -> str | None:
+    """Return the `accountId` string of a comment's author; None for any other shape."""
+    account = author.get("accountId") if isinstance(author, dict) else None
+    return account if isinstance(account, str) else None
 
 
 def _plain_text(body: object) -> str:
@@ -570,6 +596,40 @@ class JiraTracker:
             text.startswith(REQUEUE_MARKER)
             for _, text in self._comments_since(key, statuses)
         )
+
+    def last_return(self, key: str, statuses: frozenset[str]) -> str | None:
+        """Return the text, `RETURN_MARKER` removed, of the comment by the token's account with the highest id starting with that marker since the ticket `key` last entered any of the statuses `statuses`; None when there is none.
+
+        Only comments posted by the tracker account of the token count; one without a
+        readable author does not. The text keeps the comment's paragraphs, one per line.
+        The last entry is read as `claims` reads it; every comment counts when there is
+        none. The account is read only when a comment carries the marker. Raises as
+        `claims` does, and `TrackerError` when `twg whoami` fails or names no account.
+        """
+        marked = [
+            comment
+            for comment, text in self._comments_since(key, statuses)
+            if text.startswith(RETURN_MARKER)
+        ]
+        if not marked:
+            return None
+        account = self._account()
+        latest = max(
+            (
+                (comment.id, _document_text(comment.body).strip())
+                for comment in marked
+                if _author_account(comment.author) == account
+            ),
+            key=lambda found: found[0],
+            default=None,
+        )
+        return None if latest is None else latest[1].removeprefix(RETURN_MARKER)
+
+    def _account(self) -> str:
+        """Return the account id of the token; raise `TrackerError` when `twg whoami` fails or names none."""
+        action = "reading the account of the token"
+        answer = self._run(action, ["whoami"])
+        return _validate(_WhoamiAnswer, answer, action).data.accountId
 
     def entered(self, key: str, statuses: frozenset[str]) -> datetime | None:
         """Return when the ticket `key` last entered any of the statuses `statuses`, timezone-aware; None when it never did.

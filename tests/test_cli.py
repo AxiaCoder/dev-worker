@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import re
 import runpy
 import shutil
 import subprocess
@@ -19,6 +20,8 @@ import pytest
 
 from dev_worker import cli, run_journal
 from dev_worker.container import (
+    MAX_STOP_CHARS,
+    STOP_HEADING,
     Container,
     ContainerError,
     ContainerExit,
@@ -37,11 +40,20 @@ from dev_worker.repositories import (
     ChangedFile,
     CiState,
     HeadMovedError,
+    OpenThread,
     PullRequest,
+    PullRequestFeedback,
     RepositoryError,
 )
 from dev_worker.text import writable_text
-from dev_worker.tickets import REQUEUE_MARKER, Blocker, Claim, Ticket, TrackerError
+from dev_worker.tickets import (
+    REQUEUE_MARKER,
+    RETURN_MARKER,
+    Blocker,
+    Claim,
+    Ticket,
+    TrackerError,
+)
 from dev_worker.workspace import Workspace, WorkspaceError
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -122,6 +134,14 @@ class ReadyTracker:
         """Return the claim 1 alone."""
         return (Claim(1, "task-1", CLAIM_EPOCH),)
 
+    def requeues(self, key: str, statuses: frozenset[str]) -> int:
+        """Return 0: the ticket was never requeued."""
+        return 0
+
+    def last_return(self, key: str, statuses: frozenset[str]) -> str | None:
+        """Return None: the ticket never came back."""
+        return None
+
     def comment(self, key: str, body: str) -> None:
         """Change nothing."""
 
@@ -153,6 +173,8 @@ class ReachableRepository:
         self.ci: CiState = "passed"
         self.base_failure: BaseCiFailure | None = None
         self.files: tuple[ChangedFile, ...] = ()
+        self.feedback_answer = PullRequestFeedback((), ())
+        self.open_threads_answer: tuple[OpenThread, ...] = ()
         self.errors: dict[str, RepositoryError] = {}
         self.calls: list[tuple[str, object]] = []
 
@@ -183,6 +205,16 @@ class ReachableRepository:
         """Record the call; return `files`."""
         self._step("changed_files", pull_request)
         return self.files
+
+    def feedback(self, pull_request: PullRequest) -> PullRequestFeedback:
+        """Record the call; return `feedback_answer`."""
+        self._step("feedback", pull_request)
+        return self.feedback_answer
+
+    def open_threads(self, pull_request: PullRequest) -> tuple[OpenThread, ...]:
+        """Record the call; return `open_threads_answer`."""
+        self._step("open_threads", pull_request)
+        return self.open_threads_answer
 
     def merge(self, pull_request: PullRequest) -> None:
         """Record the call."""
@@ -514,7 +546,9 @@ class StubTracker:
     status of the ticket later reads answer. `reads` records each key read, `moves` each
     status change asked, `posted` the task_id of each claim, `comments` each comment
     posted, as (key, body), and `trackers` each instance tracker it was made for. A
-    comment raises `comment_error` when one is set.
+    comment raises `comment_error` when one is set. `requeue_count` and `returned` answer
+    `requeues` and `last_return`, which raise `requeue_error` and `return_error` when set
+    and record the statuses they were asked about in `asked_statuses`.
     """
 
     def __init__(
@@ -529,6 +563,11 @@ class StubTracker:
         self.posted: list[str] = []
         self.comments: list[tuple[str, str]] = []
         self.comment_error: TrackerError | None = None
+        self.requeue_count = 0
+        self.requeue_error: TrackerError | None = None
+        self.returned: str | None = None
+        self.return_error: TrackerError | None = None
+        self.asked_statuses: list[frozenset[str]] = []
 
     def make(self, tracker: Tracker) -> "StubTracker":
         """Record `tracker` and return this stub, in place of `cli.make_tracker`."""
@@ -552,6 +591,20 @@ class StubTracker:
         return tuple(
             Claim(rank, task, CLAIM_EPOCH) for rank, task in enumerate(self.posted, 1)
         )
+
+    def requeues(self, key: str, statuses: frozenset[str]) -> int:
+        """Record `statuses`, then return `requeue_count` or raise `requeue_error`."""
+        self.asked_statuses.append(statuses)
+        if self.requeue_error is not None:
+            raise self.requeue_error
+        return self.requeue_count
+
+    def last_return(self, key: str, statuses: frozenset[str]) -> str | None:
+        """Record `statuses`, then return `returned` or raise `return_error`."""
+        self.asked_statuses.append(statuses)
+        if self.return_error is not None:
+            raise self.return_error
+        return self.returned
 
     def comment(self, key: str, body: str) -> None:
         """Record the comment, then raise `comment_error` when set."""
@@ -5821,6 +5874,7 @@ def test_done_merges_the_pull_request_once_the_container_is_gone_then_comments_a
     assert reachable_repository.calls == [
         ("find_pull_request", "agent/DEMO-1"),
         ("read_ci", PULL),
+        ("open_threads", PULL),
         ("merge", PULL),
     ]
     assert stub.comments == [("DEMO-1", MERGED_BODY)]
@@ -5895,26 +5949,21 @@ def test_done_without_a_pull_request_comments_why_moves_the_ticket_to_blocked_an
     assert stub.moves == [IN_PROGRESS, BLOCKED]
 
 
-@pytest.mark.parametrize(
-    ("ci", "state"), [("failed", "failed"), ("running", "has not finished")]
-)
-def test_done_whose_ci_has_not_passed_is_not_merged_moves_the_ticket_to_blocked_and_fails(
+def test_done_whose_ci_has_not_finished_is_not_merged_moves_the_ticket_to_blocked_and_fails(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
     reachable_repository: ReachableRepository,
-    ci: CiState,
-    state: str,
 ) -> None:
     stub = serve(monkeypatch, demo_ticket())
-    reachable_repository.ci = ci
+    reachable_repository.ci = "running"
 
     answer = run_mandate(
         monkeypatch, capsysbinary, encode(valid_input()), instance=instance
     )
 
     assert_blocked_run_fails(
-        answer, instance, f"the CI of the pull request {PULL.url} {state}"
+        answer, instance, f"the CI of the pull request {PULL.url} has not finished"
     )
     assert [name for name, _ in reachable_repository.calls] == [
         "find_pull_request",
@@ -5925,11 +5974,34 @@ def test_done_whose_ci_has_not_passed_is_not_merged_moves_the_ticket_to_blocked_
             "DEMO-1",
             (
                 f"{SUMMARY}\n\nThe ticket is blocked: the CI of the pull request "
-                f"{PULL.url} {state}; it was not merged."
+                f"{PULL.url} has not finished; it was not merged."
             ),
         )
     ]
     assert stub.moves == [IN_PROGRESS, BLOCKED]
+
+
+def test_done_whose_ci_failed_is_not_merged_and_goes_back_to_the_agent(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    reachable_repository.ci = "failed"
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    reason = f"the CI of the pull request {PULL.url} failed; it was not merged."
+    assert_blocked_run_fails(answer, instance, f"went back to the agent: {reason}")
+    assert [name for name, _ in reachable_repository.calls] == [
+        "find_pull_request",
+        "read_ci",
+    ]
+    assert stub.comments == [("DEMO-1", f"{RETURN_MARKER}{reason} (attempt 1 of 3).")]
+    assert stub.moves == [IN_PROGRESS, ("DEMO-1", "To Do")]
 
 
 def test_done_whose_ci_has_reported_no_check_yet_is_not_merged_and_moves_the_ticket_to_blocked(
@@ -5984,7 +6056,7 @@ def test_done_whose_ci_has_reported_no_check_yet_is_not_merged_and_moves_the_tic
         (
             "merge",
             HeadMovedError("the head of pull request #7 has moved; it was not merged"),
-            ["find_pull_request", "read_ci", "merge"],
+            ["find_pull_request", "read_ci", "open_threads", "merge"],
         ),
     ],
 )
@@ -6033,6 +6105,7 @@ def test_done_whose_merge_fails_says_it_may_have_been_merged_moves_the_ticket_to
     assert [name for name, _ in reachable_repository.calls] == [
         "find_pull_request",
         "read_ci",
+        "open_threads",
         "merge",
     ]
     assert stub.comments == [
@@ -6660,7 +6733,7 @@ def test_review_max_turns_of_the_instance_caps_the_review(
     assert container.commands[-1] == review_command(BASE_COMMIT, PULL.head, 12, "opus")
 
 
-def test_done_whose_review_finds_defects_is_not_merged_and_lists_them_in_the_comment(
+def test_done_whose_review_finds_defects_is_not_merged_and_goes_back_to_the_agent_listing_them(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
     instance: Path,
@@ -6684,12 +6757,10 @@ def test_done_whose_review_finds_defects_is_not_merged_and_lists_them_in_the_com
         "- src/app.py:12 The token is logged.\n"
         "- src/db.py:3 The query is concatenated."
     )
-    assert_blocked_run_fails(answer, instance, reason)
+    assert_blocked_run_fails(answer, instance, f"went back to the agent: {reason}")
     assert "merge" not in [name for name, _ in reachable_repository.calls]
-    assert stub.comments == [
-        ("DEMO-1", f"{SUMMARY}\n\nThe ticket is blocked: {reason}")
-    ]
-    assert stub.moves == [IN_PROGRESS, BLOCKED]
+    assert stub.comments == [("DEMO-1", f"{RETURN_MARKER}{reason} (attempt 1 of 3).")]
+    assert stub.moves == [IN_PROGRESS, ("DEMO-1", "To Do")]
     assert workspace.calls[-1] == ("close_review",)
 
 
@@ -7444,7 +7515,7 @@ def hold_merge_during_the_review(setup: Wake) -> None:
         (end_blocked, "The run ended on the outcome 'blocked': Unclear."),
         (merge, None),
         (hold_merge, None),
-        (fail_ci, "The run ended on 'done' but its ticket is blocked"),
+        (fail_ci, "The run ended on 'done' but its ticket went back to the agent"),
     ],
 )
 def test_wake_that_yields_or_settles_its_ticket_succeeds(
@@ -8047,7 +8118,8 @@ def test_wake_blocks_a_ticket_whose_runs_died_as_many_times_as_the_ceiling(
         (
             "DEMO-1",
             (
-                "The runs that took this ticket died 3 times without settling it. "
+                "Its last run died without settling it. Attempts used, returns and "
+                "dead runs together: 3 (limit 3). "
                 "A person needs to look at it, then move it back to 'To Do'."
             ),
         )
@@ -8066,7 +8138,10 @@ def test_wake_blocks_at_the_attempt_limit_of_the_instance(
 
     wake(capsysbinary, instance)
 
-    assert stub.comments[0][1].startswith("The runs that took this ticket died 1 ")
+    assert stub.comments[0][1].startswith(
+        "Its last run died without settling it. Attempts used, returns and dead "
+        "runs together: 1 (limit 1). "
+    )
     assert stub.moves == [("DEMO-1", "Blocked")]
 
 
@@ -9059,6 +9134,7 @@ def test_done_with_a_handover_and_clean_files_is_reviewed_then_merged(
         ("find_pull_request", "agent/DEMO-1"),
         ("read_ci", PULL),
         ("changed_files", PULL),
+        ("open_threads", PULL),
         ("merge", PULL),
     ]
     assert container.readonly == [False, True]
@@ -9136,6 +9212,465 @@ def test_done_without_a_handover_never_reads_the_files_even_when_they_would_matc
     assert [name for name, _ in reachable_repository.calls] == [
         "find_pull_request",
         "read_ci",
+        "open_threads",
         "merge",
     ]
     assert stub.moves == [IN_PROGRESS, MERGED]
+
+
+READY = ("DEMO-1", "To Do")
+CI_REASON = f"the CI of the pull request {PULL.url} failed; it was not merged."
+STOPPED = "the CI failed (attempt 1 of 3)."
+BROKEN = TrackerError("the tracker is down")
+
+
+def run_red_ci(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    stub: StubTracker,
+    repository: ReachableRepository,
+) -> dict[str, object]:
+    """Run the mandate on `stub` with a pull request whose CI failed; return the answer."""
+    repository.ci = "failed"
+    return run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+
+@pytest.mark.parametrize("earlier", [0, 1])
+def test_a_return_below_the_ceiling_counts_the_earlier_requeues_and_goes_back_to_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    reachable_repository: ReachableRepository,
+    earlier: int,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    stub.requeue_count = earlier
+
+    answer = run_red_ci(monkeypatch, capsysbinary, instance, stub, reachable_repository)
+
+    assert_failed(answer, "task-1", f"went back to the agent: {CI_REASON}")
+    assert stub.comments == [
+        ("DEMO-1", f"{RETURN_MARKER}{CI_REASON} (attempt {earlier + 1} of 3).")
+    ]
+    assert stub.moves == [IN_PROGRESS, READY]
+
+
+@pytest.mark.parametrize("earlier", [2, 5])
+def test_a_return_at_the_ceiling_blocks_the_ticket_and_asks_a_person(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    reachable_repository: ReachableRepository,
+    earlier: int,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    stub.requeue_count = earlier
+
+    answer = run_red_ci(monkeypatch, capsysbinary, instance, stub, reachable_repository)
+
+    assert_failed(answer, "task-1", f"its ticket is blocked: {CI_REASON}")
+    assert stub.comments == [
+        (
+            "DEMO-1",
+            (
+                f"{SUMMARY}\n\nThe ticket is blocked: {CI_REASON}\n\nAttempts used, "
+                f"returns and dead runs together: {earlier + 1} (limit 3). "
+                "A person needs to look at it, then move it back to 'To Do'."
+            ),
+        )
+    ]
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
+
+
+def unread_threads(count: int) -> tuple[OpenThread, ...]:
+    """Return `count` open threads of trusted authors."""
+    return tuple(
+        OpenThread("src/app.py", line, ("Fix.",), f"PRRT_{line}")
+        for line in range(1, count + 1)
+    )
+
+
+@pytest.mark.parametrize("count", [2, 5])
+def test_done_with_open_threads_is_not_merged_and_goes_back_to_the_agent_naming_them(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    reachable_repository: ReachableRepository,
+    count: int,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    reachable_repository.open_threads_answer = unread_threads(count)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_blocked_run_fails(answer, instance, "went back to the agent")
+    assert [name for name, _ in reachable_repository.calls] == [
+        "find_pull_request",
+        "read_ci",
+        "open_threads",
+    ]
+    assert stub.moves == [IN_PROGRESS, READY]
+    [(_, body)] = stub.comments
+    assert body.startswith(RETURN_MARKER)
+    assert PULL.url in body
+    assert re.search(rf"\b{count}\b", body.replace(PULL.url, ""))
+    assert "(attempt 1 of 3)" in body
+
+
+def test_done_with_open_threads_at_the_ceiling_is_blocked_and_not_merged(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    stub.requeue_count = 2
+    reachable_repository.open_threads_answer = unread_threads(2)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_blocked_run_fails(answer, instance, "its ticket is blocked")
+    assert "merge" not in [name for name, _ in reachable_repository.calls]
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
+    assert "A person needs to look at it" in stub.comments[0][1]
+
+
+def test_done_whose_threads_cannot_be_read_is_blocked_without_a_return_nor_a_merge(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    reachable_repository.errors["open_threads"] = RepositoryError("HTTP 502")
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_blocked_run_fails(answer, instance, "HTTP 502")
+    assert [name for name, _ in reachable_repository.calls] == [
+        "find_pull_request",
+        "read_ci",
+        "open_threads",
+    ]
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
+    [(_, body)] = stub.comments
+    assert not body.startswith(RETURN_MARKER)
+    assert "thread" in body
+    assert "HTTP 502" in body
+
+
+def test_done_reads_the_threads_after_the_review_and_before_the_merge(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    runs_seen: list[list[bool]] = []
+    read = reachable_repository.open_threads
+
+    def spy(pull_request: PullRequest) -> tuple[OpenThread, ...]:
+        runs_seen.append(list(container.readonly))
+        return read(pull_request)
+
+    monkeypatch.setattr(reachable_repository, "open_threads", spy)
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert runs_seen == [[False, True]]
+    assert [name for name, _ in reachable_repository.calls][-2:] == [
+        "open_threads",
+        "merge",
+    ]
+    assert stub.moves == [IN_PROGRESS, MERGED]
+
+
+def test_done_held_during_the_review_does_not_read_the_threads(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    reachable_repository.open_threads_answer = unread_threads(1)
+    run = container.run
+
+    def label_during_review(*arguments: Any, readonly: bool = False) -> ContainerExit:
+        if readonly:
+            stub.answer = replace(demo_ticket("In Progress"), labels=("hold-merge",))
+        return run(*arguments, readonly=readonly)
+
+    monkeypatch.setattr(container, "run", label_during_review)
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert [name for name, _ in reachable_repository.calls] == [
+        "find_pull_request",
+        "read_ci",
+    ]
+    assert stub.moves == [IN_PROGRESS, IN_REVIEW]
+
+
+def test_a_return_counts_requeues_since_the_ticket_last_settled(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+
+    run_red_ci(monkeypatch, capsysbinary, instance, stub, reachable_repository)
+
+    asked = stub.asked_statuses[-1]
+    assert "Blocked" in asked
+    assert not asked & {"To Do", "In Progress"}
+
+
+def test_a_return_whose_requeues_cannot_be_read_is_blocked_and_never_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    stub.requeue_error = BROKEN
+
+    answer = run_red_ci(monkeypatch, capsysbinary, instance, stub, reachable_repository)
+
+    assert_failed(answer, "task-1", "It was not sent back to the agent.")
+    assert_failed(answer, "task-1", f"its ticket is blocked: {CI_REASON}")
+    assert stub.comments == [
+        ("DEMO-1", f"{SUMMARY}\n\nThe ticket is blocked: {CI_REASON}")
+    ]
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
+
+
+def test_a_return_whose_comment_fails_is_blocked_and_never_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    stub.comment_error = BROKEN
+
+    answer = run_red_ci(monkeypatch, capsysbinary, instance, stub, reachable_repository)
+
+    assert_failed(answer, "task-1", "The comment may have been posted.")
+    assert_failed(answer, "task-1", "It was not sent back to the agent.")
+    assert_failed(answer, "task-1", f"its ticket is blocked: {CI_REASON}")
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
+
+
+def test_a_return_whose_move_to_ready_fails_says_its_status_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    moves = stub.set_status
+
+    def refuse_ready(key: str, status: str) -> None:
+        stub.move_error = BROKEN if status == "To Do" else None
+        moves(key, status)
+
+    monkeypatch.setattr(stub, "set_status", refuse_ready)
+
+    answer = run_red_ci(monkeypatch, capsysbinary, instance, stub, reachable_repository)
+
+    assert_failed(answer, "task-1", "Its status is unknown")
+    assert_failed(answer, "task-1", f"its ticket is blocked: {CI_REASON}")
+    assert stub.moves == [IN_PROGRESS, READY]
+
+
+def test_a_return_at_the_ceiling_whose_comment_fails_is_still_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    stub.requeue_count = 2
+    stub.comment_error = BROKEN
+
+    answer = run_red_ci(monkeypatch, capsysbinary, instance, stub, reachable_repository)
+
+    assert_failed(answer, "task-1", "The comment may have been posted.")
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
+
+
+def test_a_return_comment_cuts_a_huge_reason_and_keeps_the_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    container.verdict = review_verdict(
+        {"file": "src/app.py", "line": 12, "summary": "x" * (2 * MAX_STOP_CHARS)}
+    )
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    body = stub.comments[0][1]
+    assert body.startswith(RETURN_MARKER)
+    assert body.endswith("x (attempt 1 of 3).")
+    assert len(body) == MAX_STOP_CHARS
+    assert stub.moves == [IN_PROGRESS, READY]
+
+
+def pull_request_gone(repository: ReachableRepository, box: FakeContainer) -> None:
+    repository.pull = None
+
+
+def ci_running(repository: ReachableRepository, box: FakeContainer) -> None:
+    repository.ci = "running"
+
+
+def ci_unreported(repository: ReachableRepository, box: FakeContainer) -> None:
+    repository.ci = "unreported"
+
+
+def head_moved(repository: ReachableRepository, box: FakeContainer) -> None:
+    repository.errors["read_ci"] = HeadMovedError("the head has moved")
+
+
+def no_verdict(repository: ReachableRepository, box: FakeContainer) -> None:
+    box.verdict = ContainerExit(0, "not a verdict", "")
+
+
+@pytest.mark.parametrize(
+    "stop", [pull_request_gone, ci_running, ci_unreported, head_moved, no_verdict]
+)
+def test_a_stop_that_is_neither_a_red_ci_nor_a_defect_stays_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    reachable_repository: ReachableRepository,
+    container: FakeContainer,
+    stop: Callable[[ReachableRepository, FakeContainer], None],
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    stop(reachable_repository, container)
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
+    assert not [body for _, body in stub.comments if body.startswith(REQUEUE_MARKER)]
+
+
+def prompt_of(container: FakeContainer) -> str:
+    """Return the prompt of the first container run."""
+    return container.commands[0][2]
+
+
+def test_a_ticket_that_never_came_back_has_no_stop_section_and_no_feedback_read(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+    reachable_repository: ReachableRepository,
+) -> None:
+    serve(monkeypatch, demo_ticket())
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert STOP_HEADING not in prompt_of(container)
+    assert "feedback" not in [name for name, _ in reachable_repository.calls]
+
+
+def test_the_next_run_prompt_holds_the_reason_the_red_checks_and_the_open_threads(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    stub.returned = "- src/app.py:12 The token is logged."
+    reachable_repository.feedback_answer = PullRequestFeedback(
+        ("build",), (OpenThread("src/db.py", 3, ("Escape it.",), "PRRT_db"),)
+    )
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert prompt_of(container).endswith(
+        "\n\nWhat stopped the previous run:\n"
+        "- src/app.py:12 The token is logged.\n"
+        "Red checks:\n- build\n"
+        "Open review threads:\n- src/db.py:3 (thread PRRT_db)\n  Escape it.\n"
+    )
+    assert ("find_pull_request", "agent/DEMO-1") in reachable_repository.calls
+    assert ("feedback", PULL) in reachable_repository.calls
+    assert not stub.asked_statuses[0] & {"To Do", "In Progress"}
+
+
+def test_a_returned_ticket_without_a_pull_request_keeps_its_reason_alone(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    stub.returned = STOPPED
+    reachable_repository.pull = None
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert prompt_of(container).endswith(
+        f"\n\nWhat stopped the previous run:\n{STOPPED}\n"
+    )
+    assert "feedback" not in [name for name, _ in reachable_repository.calls]
+
+
+@pytest.mark.parametrize("failing", ["find_pull_request", "feedback"])
+def test_a_repository_failure_is_said_in_the_stop_section(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+    reachable_repository: ReachableRepository,
+    failing: str,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    stub.returned = STOPPED
+    reachable_repository.errors[failing] = RepositoryError("gh broke")
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert prompt_of(container).endswith(
+        f"\n\nWhat stopped the previous run:\n{STOPPED} "
+        "The red checks and open review threads could not be read.\n"
+    )
+
+
+def test_a_tracker_failure_is_said_in_the_stop_section(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    stub.return_error = BROKEN
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert prompt_of(container).endswith(
+        "\n\nWhat stopped the previous run:\n"
+        "It could not be read from the tracker: the tracker is down\n"
+    )
+    assert "feedback" not in [name for name, _ in reachable_repository.calls]

@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Protocol
 
 REQUEUE_MARKER = "dev-worker returns this ticket to the queue: "
+RETURN_MARKER = f"{REQUEUE_MARKER}its pull request was stopped: "
 
 
 class TrackerError(Exception):
@@ -104,6 +105,15 @@ class TicketTracker(Protocol):
 
         A ticket that never entered any of `statuses` by a change of status counts all of them.
         Raises `TrackerError` when they cannot be read.
+        """
+        ...
+
+    def last_return(self, key: str, statuses: frozenset[str]) -> str | None:
+        """Return the text, `RETURN_MARKER` removed, of the latest comment starting with that marker posted on the ticket `key` since it last entered any of the real statuses `statuses`; None when there is none.
+
+        Only comments posted by the tracker's own account count.
+        A ticket that never entered any of `statuses` by a change of status looks at all its comments.
+        Raises `TrackerError` when they or the tracker's account cannot be read.
         """
         ...
 

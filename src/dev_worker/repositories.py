@@ -56,6 +56,24 @@ class ChangedFile:
     deletions: int
 
 
+@dataclass(frozen=True)
+class OpenThread:
+    """An unresolved review thread: the file it is on, its line or `None` when it has none, the text of its comments from trusted authors, oldest first, and its forge id."""
+
+    path: str
+    line: int | None
+    comments: tuple[str, ...]
+    thread_id: str
+
+
+@dataclass(frozen=True)
+class PullRequestFeedback:
+    """What a pull request still has against it: the names of its red checks and its open review threads."""
+
+    red_checks: tuple[str, ...]
+    threads: tuple[OpenThread, ...]
+
+
 class CodeRepository(Protocol):
     """A code repository: finds the pull request of a branch, reads its CI and merges it."""
 
@@ -93,6 +111,23 @@ class CodeRepository(Protocol):
         """Return the files `pull_request` changes, as many as the host lists.
 
         Raises `RepositoryError` when they cannot be read.
+        """
+        ...
+
+    def feedback(self, pull_request: PullRequest) -> PullRequestFeedback:
+        """Return the red checks of the latest commit of `pull_request` and its unresolved review threads.
+
+        A thread holds only the comments of authors trusted on the repository; a thread
+        left with none is not returned. Raises `RepositoryError` when they cannot be read.
+        """
+        ...
+
+    def open_threads(self, pull_request: PullRequest) -> tuple[OpenThread, ...]:
+        """Return every unresolved review thread of `pull_request`, with no limit on their number or on their comments.
+
+        A thread holds only the comments of authors trusted on the repository; a thread
+        left with none is not returned. Raises `RepositoryError` when they cannot all be
+        read.
         """
         ...
 

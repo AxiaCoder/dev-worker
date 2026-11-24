@@ -19,9 +19,12 @@ from dev_worker.repositories import (
     ChangedFile,
     CiState,
     HeadMovedError,
+    OpenThread,
     PullRequest,
+    PullRequestFeedback,
     RepositoryError,
 )
+from dev_worker.text import writable_text
 
 REDACTED = "[token]"
 GH_TIMEOUT_SECONDS = 60.0
@@ -210,6 +213,190 @@ class _PullRequestFile(BaseModel):
 
 _FILES_ANSWER = TypeAdapter(list[list[_PullRequestFile]])
 
+
+class _ThreadComment(BaseModel):
+    """A comment of a review thread, by the standing of its author and its text."""
+
+    authorAssociation: str
+    body: str
+
+
+class _PageInfo(BaseModel):
+    """Where a page of a GraphQL connection ends; `endCursor` is `None` on an empty page."""
+
+    hasNextPage: bool
+    endCursor: str | None = None
+
+
+class _ThreadComments(BaseModel):
+    """One page of the comments of a review thread."""
+
+    nodes: list[_ThreadComment]
+    pageInfo: _PageInfo
+
+
+class _ReviewThread(BaseModel):
+    """A review thread of a pull request; `line` is `None` when it no longer maps to one."""
+
+    id: str
+    isResolved: bool
+    path: str
+    line: int | None = None
+    comments: _ThreadComments
+
+
+class _ReviewThreads(BaseModel):
+    """One page of the review threads of a pull request."""
+
+    nodes: list[_ReviewThread]
+    pageInfo: _PageInfo
+
+
+class _ThreadsPullRequest(BaseModel):
+    """The pull request of the review threads query."""
+
+    reviewThreads: _ReviewThreads
+
+
+class _ThreadsRepository(BaseModel):
+    """The repository of the review threads query."""
+
+    pullRequest: _ThreadsPullRequest
+
+
+class _ThreadsData(BaseModel):
+    """The `data` of the review threads query."""
+
+    repository: _ThreadsRepository
+
+
+class _ThreadsAnswer(BaseModel):
+    """The answer of `gh api graphql` to the review threads query."""
+
+    data: _ThreadsData
+
+
+class _CommentsNode(BaseModel):
+    """The review thread of the further comments query."""
+
+    comments: _ThreadComments
+
+
+class _CommentsData(BaseModel):
+    """The `data` of the further comments query."""
+
+    node: _CommentsNode
+
+
+class _CommentsAnswer(BaseModel):
+    """The answer of `gh api graphql` to the further comments query."""
+
+    data: _CommentsData
+
+
+class _FeedbackCommit(BaseModel):
+    """A commit with its checks; `statusCheckRollup` is `None` when it has none."""
+
+    statusCheckRollup: _Rollup | None = None
+
+
+class _PullRequestCommit(BaseModel):
+    """A commit as a pull request lists it."""
+
+    commit: _FeedbackCommit
+
+
+class _PullRequestCommits(BaseModel):
+    """The commits of a pull request the feedback query asks for."""
+
+    nodes: list[_PullRequestCommit]
+
+
+class _FeedbackPullRequest(BaseModel):
+    """The pull request of the feedback query."""
+
+    commits: _PullRequestCommits
+
+
+class _FeedbackRepository(BaseModel):
+    """The repository of the feedback query; `pullRequest` is `None` when it has no such pull request."""
+
+    pullRequest: _FeedbackPullRequest | None = None
+
+
+class _FeedbackData(BaseModel):
+    """The `data` of the feedback query."""
+
+    repository: _FeedbackRepository
+
+
+class _FeedbackAnswer(BaseModel):
+    """The answer of `gh api graphql` to the feedback query."""
+
+    data: _FeedbackData
+
+
+TRUSTED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+FEEDBACK_CONTEXTS_PAGE_SIZE = 100
+THREADS_PAGE_SIZE = 100
+THREAD_COMMENTS_PAGE_SIZE = 50
+FEEDBACK_QUERY = f"""
+query($owner: String!, $name: String!, $number: Int!) {{
+  repository(owner: $owner, name: $name) {{
+    pullRequest(number: $number) {{
+      commits(last: 1) {{
+        nodes {{
+          commit {{
+            statusCheckRollup {{
+              contexts(first: {FEEDBACK_CONTEXTS_PAGE_SIZE}) {{
+                nodes {{
+                  __typename
+                  ... on CheckRun {{ name status conclusion }}
+                  ... on StatusContext {{ context state }}
+                }}
+              }}
+            }}
+          }}
+        }}
+      }}
+    }}
+  }}
+}}
+"""
+THREADS_QUERY = f"""
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {{
+  repository(owner: $owner, name: $name) {{
+    pullRequest(number: $number) {{
+      reviewThreads(first: {THREADS_PAGE_SIZE}, after: $cursor) {{
+        pageInfo {{ hasNextPage endCursor }}
+        nodes {{
+          id
+          isResolved
+          path
+          line
+          comments(first: {THREAD_COMMENTS_PAGE_SIZE}) {{
+            pageInfo {{ hasNextPage endCursor }}
+            nodes {{ authorAssociation body }}
+          }}
+        }}
+      }}
+    }}
+  }}
+}}
+"""
+THREAD_COMMENTS_QUERY = f"""
+query($id: ID!, $cursor: String) {{
+  node(id: $id) {{
+    ... on PullRequestReviewThread {{
+      comments(first: {THREAD_COMMENTS_PAGE_SIZE}, after: $cursor) {{
+        pageInfo {{ hasNextPage endCursor }}
+        nodes {{ authorAssociation body }}
+      }}
+    }}
+  }}
+}}
+"""
+
 BASE_HISTORY_DEPTH = 10
 BASE_CONTEXTS_PAGE_SIZE = 100
 BASE_CI_QUERY = f"""
@@ -314,6 +501,43 @@ def _check_state(check: _CheckRun | _StatusContext) -> CiState:
     if check.status != COMPLETED:
         return "running"
     return "passed" if check.conclusion in PASSING_CONCLUSIONS else "failed"
+
+
+def _check_name(check: _NamedCheckRun | _NamedStatusContext) -> str:
+    """Return the name a check is shown under."""
+    return check.name if isinstance(check, _NamedCheckRun) else check.context
+
+
+def _open_threads(threads: Sequence[_ReviewThread]) -> tuple[OpenThread, ...]:
+    """Return the unresolved `threads`, each with only the comments of trusted authors, dropping a thread left with none."""
+    kept: list[OpenThread] = []
+    for thread in threads:
+        comments = tuple(
+            writable_text(comment.body)
+            for comment in thread.comments.nodes
+            if comment.authorAssociation in TRUSTED_ASSOCIATIONS
+        )
+        if comments and not thread.isResolved:
+            kept.append(OpenThread(thread.path, thread.line, comments, thread.id))
+    return tuple(kept)
+
+
+def _next_cursor(page: _PageInfo, seen: set[str], action: str) -> str | None:
+    """Return the cursor of the page after `page`, added to `seen`, or `None` on the last page.
+
+    Raises `RepositoryError` when a next page is announced with a cursor that is absent,
+    empty or already in `seen`.
+    """
+    if not page.hasNextPage:
+        return None
+    cursor = page.endCursor
+    if not cursor or cursor in seen:
+        raise RepositoryError(
+            f"the answer of gh to {action} cannot be read: it announces a next page "
+            "without a new cursor"
+        )
+    seen.add(cursor)
+    return cursor
 
 
 class GitHubRepository:
@@ -466,6 +690,141 @@ class GitHubRepository:
             for file in page
         )
 
+    def feedback(self, pull_request: PullRequest) -> PullRequestFeedback:
+        """Return the red checks of the latest commit of `pull_request` and its unresolved review threads.
+
+        Only the first 100 checks are read; the threads are those of `open_threads`, with
+        no such limit. A check is red when `read_ci` would read it as failed; its name
+        appears once, in the order reported.
+
+        Raises `RepositoryError` when the token variable is not set, `gh` fails, its answer
+        cannot be read, or the repository has no such pull request.
+        """
+        number = pull_request.number
+        action = f"reading the feedback of pull request #{number}"
+        owner, _, name = self._repository.name.partition("/")
+        answer = self._run_json(
+            action,
+            [
+                "api",
+                "graphql",
+                "-f",
+                f"query={FEEDBACK_QUERY}",
+                "-f",
+                f"owner={owner}",
+                "-f",
+                f"name={name}",
+                "-F",
+                f"number={number}",
+            ],
+            on_repository=False,
+        )
+        try:
+            found = _FeedbackAnswer.model_validate(answer).data.repository.pullRequest
+        except ValidationError as error:
+            raise self._unreadable(action, error) from None
+        if found is None:
+            raise RepositoryError(
+                f"the answer of gh to {action} cannot be read: it holds no such "
+                "pull request"
+            )
+        rollups = [node.commit.statusCheckRollup for node in found.commits.nodes]
+        checks = [
+            check
+            for rollup in rollups
+            if rollup is not None
+            for check in rollup.contexts.nodes
+        ]
+        return PullRequestFeedback(
+            red_checks=tuple(
+                dict.fromkeys(
+                    _check_name(check)
+                    for check in checks
+                    if _check_state(check) == "failed"
+                )
+            ),
+            threads=self.open_threads(pull_request),
+        )
+
+    def open_threads(self, pull_request: PullRequest) -> tuple[OpenThread, ...]:
+        """Return the unresolved review threads of `pull_request`, every page of threads and of comments read.
+
+        A thread keeps only the comments whose author is in `TRUSTED_ASSOCIATIONS`, oldest
+        first, and is dropped when none is left.
+
+        Raises `RepositoryError` when the token variable is not set, `gh` fails, its answer
+        cannot be read, the repository has no such pull request, or a next page is
+        announced without a new cursor.
+        """
+        number = pull_request.number
+        action = f"reading the review threads of pull request #{number}"
+        owner, _, name = self._repository.name.partition("/")
+        threads: list[_ReviewThread] = []
+        seen: set[str] = set()
+        cursor: str | None = None
+        while True:
+            arguments = [
+                "api",
+                "graphql",
+                "-f",
+                f"query={THREADS_QUERY}",
+                "-f",
+                f"owner={owner}",
+                "-f",
+                f"name={name}",
+                "-F",
+                f"number={number}",
+            ]
+            if cursor is not None:
+                arguments += ["-f", f"cursor={cursor}"]
+            answer = self._run_json(action, arguments, on_repository=False)
+            try:
+                page = _ThreadsAnswer.model_validate(
+                    answer
+                ).data.repository.pullRequest.reviewThreads
+            except ValidationError as error:
+                raise self._unreadable(action, error) from None
+            threads.extend(page.nodes)
+            cursor = _next_cursor(page.pageInfo, seen, action)
+            if cursor is None:
+                break
+        for thread in threads:
+            thread.comments.nodes.extend(self._further_comments(thread, action))
+        return _open_threads(threads)
+
+    def _further_comments(
+        self, thread: _ReviewThread, action: str
+    ) -> list[_ThreadComment]:
+        """Return the comments of `thread` past its first page, every page read.
+
+        Raises `RepositoryError` as `open_threads`, doing `action`, does.
+        """
+        comments: list[_ThreadComment] = []
+        seen: set[str] = set()
+        cursor = _next_cursor(thread.comments.pageInfo, seen, action)
+        while cursor is not None:
+            answer = self._run_json(
+                action,
+                [
+                    "api",
+                    "graphql",
+                    "-f",
+                    f"query={THREAD_COMMENTS_QUERY}",
+                    "-f",
+                    f"id={thread.id}",
+                    "-f",
+                    f"cursor={cursor}",
+                ],
+                on_repository=False,
+            )
+            try:
+                page = _CommentsAnswer.model_validate(answer).data.node.comments
+            except ValidationError as error:
+                raise self._unreadable(action, error) from None
+            comments.extend(page.nodes)
+            cursor = _next_cursor(page.pageInfo, seen, action)
+        return comments
+
     def merge(self, pull_request: PullRequest) -> None:
         """Merge `pull_request` as one squashed commit whose subject is `pull_request.title`, which GitHub refuses once its head is not `pull_request.head`.
 
@@ -590,12 +949,7 @@ class GitHubRepository:
         failure = BaseCiFailure(
             branch=branch,
             commit=commit,
-            checks=tuple(
-                dict.fromkeys(
-                    check.name if isinstance(check, _NamedCheckRun) else check.context
-                    for check in failed
-                )
-            ),
+            checks=tuple(dict.fromkeys(_check_name(check) for check in failed)),
         )
         runs = _workflow_runs(failed)
         if runs is None:
@@ -687,7 +1041,9 @@ class GitHubRepository:
         """
         answer = _parse_json(self._run(action, arguments, on_repository=on_repository))
         if answer is _UNREADABLE:
-            raise RepositoryError(f"the answer of gh to {action} is not JSON")
+            raise RepositoryError(
+                f"the answer of gh to {action} is not JSON and cannot be read"
+            )
         return answer
 
     def _run(
