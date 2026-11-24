@@ -50,6 +50,8 @@ STOP_HEADING = "What stopped the previous run:\n"
 RED_CHECKS_HEADING = "Red checks:\n"
 OPEN_THREADS_HEADING = "Open review threads:\n"
 THREAD_COMMENT_INDENT = "  "
+MAX_THREAD_CHARS = 4_000
+THREAD_CUT_MARK = "[cut at the prompt limit]"
 
 
 class ContainerError(Exception):
@@ -69,12 +71,29 @@ class ContainerExit:
 
 
 def _thread_item(thread: OpenThread) -> str:
-    """Return the list item of `thread`: `- path:line (thread <id>)`, or `- path (thread <id>)` without a line, then its comments indented."""
-    place = thread.path if thread.line is None else f"{thread.path}:{thread.line}"
-    comments = "".join(
-        f"{indent(comment, THREAD_COMMENT_INDENT)}\n" for comment in thread.comments
+    """Return the writable list item of `thread`, at most `MAX_THREAD_CHARS` characters.
+
+    The item opens on `- path:line (thread <id>)`, or `- path (thread <id>)` without a
+    line, then holds its comments indented. Measured once escaped (see `writable_text`),
+    an item over the bound has its comments cut and ends on the line `THREAD_CUT_MARK`;
+    a path too long for the bound is cut too, the line and the id always kept.
+    """
+    path = writable_text(thread.path)
+    line = "" if thread.line is None else f":{thread.line}"
+    place_end = writable_text(f"{line} (thread {thread.thread_id})\n")
+    comments = writable_text(
+        "".join(
+            f"{indent(comment, THREAD_COMMENT_INDENT)}\n" for comment in thread.comments
+        )
     )
-    return f"- {place} (thread {thread.thread_id})\n{comments}"
+    item = f"- {path}{place_end}{comments}"
+    if len(item) <= MAX_THREAD_CHARS:
+        return item
+    mark = f"{THREAD_CUT_MARK}\n"
+    room = MAX_THREAD_CHARS - len(mark) - len("\n")
+    head = f"- {path[: room - len('- ') - len(place_end)]}{place_end}"
+    kept = f"{head}{comments[: room - len(head)]}".rstrip("\n")
+    return f"{kept}\n{mark}"
 
 
 def _left_out(count: int) -> str:
@@ -82,34 +101,60 @@ def _left_out(count: int) -> str:
     return f"{count} more items left out.\n"
 
 
+def _with_leading_items(
+    section: str, heading: str, items: Sequence[str], held: int, after: int
+) -> tuple[str, int]:
+    """Return `section` with the leading `items` that fit, and how many were added.
+
+    `heading` precedes the first one added. Adding stops at the first item that would
+    not leave `held` characters free under `MAX_STOP_CHARS`, plus the room of the line
+    counting the items not added and the `after` items that follow them.
+    """
+    for rank, item in enumerate(items):
+        added = item if rank else heading + item
+        remaining = len(items) - rank - 1 + after
+        needed = len(_left_out(remaining)) if remaining else 0
+        if len(section) + len(added) + held + needed > MAX_STOP_CHARS:
+            return section, rank
+        section += added
+    return section, len(items)
+
+
 def stop_section(stopped: str, feedback: PullRequestFeedback | None) -> str:
     """Return the prompt section telling a run what stopped the previous one, at most `MAX_STOP_CHARS` characters.
 
     It holds `stopped`, then the red checks and the open review threads of `feedback`, an
-    empty group having no heading. Items are added whole and in order; once the next one
-    does not fit, a final line counts those left out. `stopped` is cut when it leaves no
-    room for that line. The returned text is writable as UTF-8 (see `writable_text`).
+    empty group having no heading. The first thread is always listed: its room is held
+    before `stopped` and the checks are placed. Each thread is bounded (see
+    `_thread_item`). Other items are added whole and in order; within a group, once the
+    next one does not fit, it and those after it are left out, and a final line gives
+    their exact count. `stopped` is cut when it leaves no room for the first thread and
+    that line. The returned text is writable as UTF-8 (see `writable_text`).
     """
-    items = [
-        (RED_CHECKS_HEADING, writable_text(f"- {name}\n"))
+    checks = [
+        writable_text(f"- {name}\n")
         for name in (feedback.red_checks if feedback else ())
-    ] + [
-        (OPEN_THREADS_HEADING, writable_text(_thread_item(thread)))
-        for thread in (feedback.threads if feedback else ())
     ]
-    reserved = len(_left_out(len(items))) if items else 0
-    room = MAX_STOP_CHARS - len(STOP_HEADING) - len("\n") - reserved
+    threads = [
+        _thread_item(thread) for thread in (feedback.threads if feedback else ())
+    ]
+    first_thread = f"{OPEN_THREADS_HEADING}{threads[0]}" if threads else ""
+    later_threads = threads[1:]
+    item_count = len(checks) + len(threads)
+    count_room = len(_left_out(item_count)) if item_count else 0
+    room = (
+        MAX_STOP_CHARS - len(STOP_HEADING) - len("\n") - len(first_thread) - count_room
+    )
     section = f"{STOP_HEADING}{writable_text(stopped)[:room]}\n"
-    heading = ""
-    for rank, (item_heading, item) in enumerate(items, start=1):
-        added = item if item_heading == heading else item_heading + item
-        remaining = len(items) - rank
-        needed = len(_left_out(remaining)) if remaining else 0
-        if len(section) + len(added) + needed > MAX_STOP_CHARS:
-            return section + _left_out(remaining + 1)
-        section += added
-        heading = item_heading
-    return section
+    section, listed_checks = _with_leading_items(
+        section, RED_CHECKS_HEADING, checks, len(first_thread), len(later_threads)
+    )
+    left_out_checks = len(checks) - listed_checks
+    section, listed_threads = _with_leading_items(
+        section + first_thread, "", later_threads, 0, left_out_checks
+    )
+    left_out = left_out_checks + len(later_threads) - listed_threads
+    return section + _left_out(left_out) if left_out else section
 
 
 def ticket_prompt(
