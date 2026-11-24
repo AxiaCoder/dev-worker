@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import re
 import runpy
 import shutil
 import subprocess
@@ -173,6 +174,7 @@ class ReachableRepository:
         self.base_failure: BaseCiFailure | None = None
         self.files: tuple[ChangedFile, ...] = ()
         self.feedback_answer = PullRequestFeedback((), ())
+        self.open_threads_answer: tuple[OpenThread, ...] = ()
         self.errors: dict[str, RepositoryError] = {}
         self.calls: list[tuple[str, object]] = []
 
@@ -208,6 +210,11 @@ class ReachableRepository:
         """Record the call; return `feedback_answer`."""
         self._step("feedback", pull_request)
         return self.feedback_answer
+
+    def open_threads(self, pull_request: PullRequest) -> tuple[OpenThread, ...]:
+        """Record the call; return `open_threads_answer`."""
+        self._step("open_threads", pull_request)
+        return self.open_threads_answer
 
     def merge(self, pull_request: PullRequest) -> None:
         """Record the call."""
@@ -5867,6 +5874,7 @@ def test_done_merges_the_pull_request_once_the_container_is_gone_then_comments_a
     assert reachable_repository.calls == [
         ("find_pull_request", "agent/DEMO-1"),
         ("read_ci", PULL),
+        ("open_threads", PULL),
         ("merge", PULL),
     ]
     assert stub.comments == [("DEMO-1", MERGED_BODY)]
@@ -6048,7 +6056,7 @@ def test_done_whose_ci_has_reported_no_check_yet_is_not_merged_and_moves_the_tic
         (
             "merge",
             HeadMovedError("the head of pull request #7 has moved; it was not merged"),
-            ["find_pull_request", "read_ci", "merge"],
+            ["find_pull_request", "read_ci", "open_threads", "merge"],
         ),
     ],
 )
@@ -6097,6 +6105,7 @@ def test_done_whose_merge_fails_says_it_may_have_been_merged_moves_the_ticket_to
     assert [name for name, _ in reachable_repository.calls] == [
         "find_pull_request",
         "read_ci",
+        "open_threads",
         "merge",
     ]
     assert stub.comments == [
@@ -9125,6 +9134,7 @@ def test_done_with_a_handover_and_clean_files_is_reviewed_then_merged(
         ("find_pull_request", "agent/DEMO-1"),
         ("read_ci", PULL),
         ("changed_files", PULL),
+        ("open_threads", PULL),
         ("merge", PULL),
     ]
     assert container.readonly == [False, True]
@@ -9202,6 +9212,7 @@ def test_done_without_a_handover_never_reads_the_files_even_when_they_would_matc
     assert [name for name, _ in reachable_repository.calls] == [
         "find_pull_request",
         "read_ci",
+        "open_threads",
         "merge",
     ]
     assert stub.moves == [IN_PROGRESS, MERGED]
@@ -9272,6 +9283,143 @@ def test_a_return_at_the_ceiling_blocks_the_ticket_and_asks_a_person(
         )
     ]
     assert stub.moves == [IN_PROGRESS, BLOCKED]
+
+
+def unread_threads(count: int) -> tuple[OpenThread, ...]:
+    """Return `count` open threads of trusted authors."""
+    return tuple(
+        OpenThread("src/app.py", line, ("Fix.",), f"PRRT_{line}")
+        for line in range(1, count + 1)
+    )
+
+
+@pytest.mark.parametrize("count", [2, 5])
+def test_done_with_open_threads_is_not_merged_and_goes_back_to_the_agent_naming_them(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    reachable_repository: ReachableRepository,
+    count: int,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    reachable_repository.open_threads_answer = unread_threads(count)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_blocked_run_fails(answer, instance, "went back to the agent")
+    assert [name for name, _ in reachable_repository.calls] == [
+        "find_pull_request",
+        "read_ci",
+        "open_threads",
+    ]
+    assert stub.moves == [IN_PROGRESS, READY]
+    [(_, body)] = stub.comments
+    assert body.startswith(RETURN_MARKER)
+    assert PULL.url in body
+    assert re.search(rf"\b{count}\b", body.replace(PULL.url, ""))
+    assert "(attempt 1 of 3)" in body
+
+
+def test_done_with_open_threads_at_the_ceiling_is_blocked_and_not_merged(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    stub.requeue_count = 2
+    reachable_repository.open_threads_answer = unread_threads(2)
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_blocked_run_fails(answer, instance, "its ticket is blocked")
+    assert "merge" not in [name for name, _ in reachable_repository.calls]
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
+    assert "A person needs to look at it" in stub.comments[0][1]
+
+
+def test_done_whose_threads_cannot_be_read_is_blocked_without_a_return_nor_a_merge(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    reachable_repository.errors["open_threads"] = RepositoryError("HTTP 502")
+
+    answer = run_mandate(
+        monkeypatch, capsysbinary, encode(valid_input()), instance=instance
+    )
+
+    assert_blocked_run_fails(answer, instance, "HTTP 502")
+    assert [name for name, _ in reachable_repository.calls] == [
+        "find_pull_request",
+        "read_ci",
+        "open_threads",
+    ]
+    assert stub.moves == [IN_PROGRESS, BLOCKED]
+    [(_, body)] = stub.comments
+    assert not body.startswith(RETURN_MARKER)
+    assert "thread" in body
+    assert "HTTP 502" in body
+
+
+def test_done_reads_the_threads_after_the_review_and_before_the_merge(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    runs_seen: list[list[bool]] = []
+    read = reachable_repository.open_threads
+
+    def spy(pull_request: PullRequest) -> tuple[OpenThread, ...]:
+        runs_seen.append(list(container.readonly))
+        return read(pull_request)
+
+    monkeypatch.setattr(reachable_repository, "open_threads", spy)
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert runs_seen == [[False, True]]
+    assert [name for name, _ in reachable_repository.calls][-2:] == [
+        "open_threads",
+        "merge",
+    ]
+    assert stub.moves == [IN_PROGRESS, MERGED]
+
+
+def test_done_held_during_the_review_does_not_read_the_threads(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    instance: Path,
+    container: FakeContainer,
+    reachable_repository: ReachableRepository,
+) -> None:
+    stub = serve(monkeypatch, demo_ticket())
+    reachable_repository.open_threads_answer = unread_threads(1)
+    run = container.run
+
+    def label_during_review(*arguments: Any, readonly: bool = False) -> ContainerExit:
+        if readonly:
+            stub.answer = replace(demo_ticket("In Progress"), labels=("hold-merge",))
+        return run(*arguments, readonly=readonly)
+
+    monkeypatch.setattr(container, "run", label_during_review)
+
+    run_mandate(monkeypatch, capsysbinary, encode(valid_input()), instance=instance)
+
+    assert [name for name, _ in reachable_repository.calls] == [
+        "find_pull_request",
+        "read_ci",
+    ]
+    assert stub.moves == [IN_PROGRESS, IN_REVIEW]
 
 
 def test_a_return_counts_requeues_since_the_ticket_last_settled(

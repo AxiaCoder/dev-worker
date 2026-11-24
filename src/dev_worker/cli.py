@@ -505,8 +505,9 @@ def land_done(
     The open pull request whose head is the run branch (see `run_branch`) is found, its
     CI read once, the ticket read again through `tracker`, then the pull request given
     its guard review (see `review_pull_request`), in the instance directory `directory`
-    within the time the run started at `began` has left, the ticket read once more, and
-    the pull request merged as one squashed commit under its title, tied to the reviewed
+    within the time the run started at `began` has left, the ticket read once more, its
+    open review threads from trusted accounts read, and the pull request merged as one
+    squashed commit under its title, tied to the reviewed
     head commit. The status key is `done` once merged; the one the header of `worker`
     ties the `done` outcome to when the ticket carries the `hold_merge_label` of
     `instance` at either read, the pull request left open, and not reviewed when it
@@ -515,13 +516,15 @@ def land_done(
     the status key is that same `done` outcome's, the pull request left open, neither
     reviewed nor merged, and the body says why. The status key is the one the header ties
     `blocked` to when there is no pull request, its CI has
-    not passed, the review found a reachable defect or gave no verdict, or a step fails,
-    the files of the pull request unreadable included,
+    not passed, the review found a reachable defect or gave no verdict, a review thread
+    is still open, or a step fails,
+    the files or the review threads of the pull request unreadable included,
     the pull request left open and nothing retried. The body is `summary` followed by
     what happened, the defects found listed; after a merge that failed for a reason
     other than a moved head, it says the merge may have happened. The reason the ticket
     is blocked is `None` unless it goes to the `blocked` status key, `ReturnToAgent` when
-    its CI failed or the review found a reachable defect, and `Benign` when no pull
+    its CI failed, the review found a reachable defect or a review thread is still
+    open, and `Benign` when no pull
     request is open, its CI has not finished or has reported no check yet on the head
     commit, or the head moved before the merge; any other reason, such as a repository
     that reports no check and has no CI to report one, is a failure of the worker's own
@@ -607,6 +610,20 @@ def land_done(
         return blocked(str(error))
     if held:
         return outcomes.done, left_open, None, errors
+    try:
+        threads = repository.open_threads(pull_request)
+    except RepositoryError as error:
+        return blocked(
+            f"the review threads of the pull request {pull_request.url} cannot be "
+            f"read: {error} It was not merged."
+        )
+    if threads:
+        return blocked(
+            ReturnToAgent(
+                f"review threads still open on the pull request {pull_request.url}: "
+                f"{len(threads)}; it was not merged."
+            )
+        )
     try:
         repository.merge(pull_request)
     except HeadMovedError as error:

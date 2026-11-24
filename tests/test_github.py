@@ -1485,20 +1485,45 @@ def said(association: str, body: str) -> dict[str, str]:
     return {"authorAssociation": association, "body": body}
 
 
+def page_info(next_cursor: str | None = None, more: bool = False) -> dict[str, Any]:
+    """Return a GraphQL `pageInfo`, with a next page when `more` is true."""
+    return {"hasNextPage": more, "endCursor": next_cursor}
+
+
 def review_thread(
     *comments: dict[str, str],
     resolved: bool = False,
     path: str = "src/app.py",
     line: int | None = 12,
     thread_id: str = "PRRT_1",
+    comments_info: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "id": thread_id,
         "isResolved": resolved,
         "path": path,
         "line": line,
-        "comments": {"nodes": list(comments)},
+        "comments": {
+            "nodes": list(comments),
+            "pageInfo": comments_info or page_info(),
+        },
     }
+
+
+def threads_page(
+    *threads: dict[str, Any], info: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Return the answer of `gh` to one page of the review threads."""
+    connection = {"nodes": list(threads), "pageInfo": info or page_info()}
+    return {"data": {"repository": {"pullRequest": {"reviewThreads": connection}}}}
+
+
+def comments_page(
+    *comments: dict[str, str], info: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Return the answer of `gh` to a further page of the comments of a thread."""
+    connection = {"nodes": list(comments), "pageInfo": info or page_info()}
+    return {"data": {"node": {"comments": connection}}}
 
 
 def feedback_answer(
@@ -1511,7 +1536,10 @@ def feedback_answer(
             "repository": {
                 "pullRequest": {
                     "commits": {"nodes": [{"commit": commit}]},
-                    "reviewThreads": {"nodes": list(threads)},
+                    "reviewThreads": {
+                        "nodes": list(threads),
+                        "pageInfo": page_info(),
+                    },
                 }
             }
         }
@@ -1707,3 +1735,345 @@ def test_feedback_whose_gh_call_fails_raises(
 
     with pytest.raises(RepositoryError, match="reading the feedback"):
         repository().feedback(PULL)
+
+
+def query_of(argv: list[str]) -> str:
+    """Return the GraphQL query among the arguments `argv` of a call."""
+    return next(a for a in argv if a.startswith("query="))
+
+
+def filler_threads() -> tuple[dict[str, Any], ...]:
+    """Return 100 threads that give nothing to read: external, or resolved."""
+    return tuple(
+        review_thread(said("NONE", "x"), thread_id=f"PRRT_{index}")
+        if index % 2
+        else review_thread(said("OWNER", "x"), resolved=True, thread_id=f"PRRT_{index}")
+        for index in range(100)
+    )
+
+
+def test_open_threads_of_a_pull_request_without_thread_is_empty(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, threads_page())
+
+    assert repository().open_threads(PULL) == ()
+
+
+def test_open_threads_keeps_trusted_comments_of_unresolved_threads_only(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    threads = (
+        review_thread(
+            said("MEMBER", "Keep."), said("NONE", "Drop."), thread_id="PRRT_mixed"
+        ),
+        review_thread(said("NONE", "Drop."), thread_id="PRRT_external"),
+        review_thread(said("OWNER", "Settled."), resolved=True, thread_id="PRRT_done"),
+    )
+    answer(monkeypatch, threads_page(*threads))
+
+    assert repository().open_threads(PULL) == (
+        OpenThread("src/app.py", 12, ("Keep.",), "PRRT_mixed"),
+    )
+
+
+def test_open_threads_asks_for_pages_of_threads_and_of_comments(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, threads_page())
+
+    repository().open_threads(PULL)
+
+    argv = called(record)["argv"]
+    assert argv[:2] == ["api", "graphql"]
+    assert {"owner=octo", "name=widgets", "number=42"} <= set(argv)
+    query = query_of(argv)
+    assert "reviewThreads(first: 100, after: $cursor)" in query
+    assert "comments(first: 50" in query
+    assert query.count("pageInfo") == 2
+    assert query.count("hasNextPage") == 2
+    assert query.count("endCursor") == 2
+
+
+def test_open_threads_reads_the_101st_thread_past_100_that_give_nothing_to_read(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = answer_in_turn(
+        monkeypatch,
+        record,
+        threads_page(*filler_threads(), info=page_info("THREADS_1", more=True)),
+        threads_page(review_thread(said("OWNER", "Late."), thread_id="PRRT_late")),
+    )
+
+    assert repository().open_threads(PULL) == (
+        OpenThread("src/app.py", 12, ("Late.",), "PRRT_late"),
+    )
+
+    first, second = every_call(calls)
+    assert not any("THREADS_1" in argument for argument in first)
+    assert "cursor=THREADS_1" in second
+
+
+def test_open_threads_reads_the_51st_comment_of_a_thread_past_50_external_ones(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    external = [said("NONE", f"noise {index}") for index in range(50)]
+    calls = answer_in_turn(
+        monkeypatch,
+        record,
+        threads_page(
+            review_thread(
+                *external,
+                thread_id="PRRT_long",
+                comments_info=page_info("COMMENTS_1", more=True),
+            )
+        ),
+        comments_page(said("OWNER", "Late.")),
+    )
+
+    assert repository().open_threads(PULL) == (
+        OpenThread("src/app.py", 12, ("Late.",), "PRRT_long"),
+    )
+
+    further = every_call(calls)[1]
+    assert "cursor=COMMENTS_1" in further
+    assert any(argument.endswith("=PRRT_long") for argument in further)
+    query = query_of(further)
+    assert "node(id:" in query
+    assert "... on PullRequestReviewThread" in query
+    assert "comments(first: 50, after: $cursor)" in query
+
+
+def test_open_threads_keeps_the_trusted_comments_of_every_page_in_order(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer_in_turn(
+        monkeypatch,
+        record,
+        threads_page(
+            review_thread(
+                said("OWNER", "First."),
+                comments_info=page_info("COMMENTS_1", more=True),
+            )
+        ),
+        comments_page(
+            said("NONE", "Drop."),
+            said("MEMBER", "Second."),
+            info=page_info("COMMENTS_2", more=True),
+        ),
+        comments_page(said("COLLABORATOR", "Third.")),
+    )
+
+    assert repository().open_threads(PULL)[0].comments == (
+        "First.",
+        "Second.",
+        "Third.",
+    )
+
+
+def test_open_threads_drops_a_thread_whose_every_page_of_comments_is_external(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer_in_turn(
+        monkeypatch,
+        record,
+        threads_page(
+            review_thread(
+                said("NONE", "One."),
+                comments_info=page_info("COMMENTS_1", more=True),
+            )
+        ),
+        comments_page(said("NONE", "Two.")),
+    )
+
+    assert repository().open_threads(PULL) == ()
+
+
+@pytest.mark.parametrize("no_cursor", [None, ""], ids=["null", "empty"])
+def test_open_threads_with_a_next_page_of_threads_and_no_cursor_raises(
+    record: Path, monkeypatch: pytest.MonkeyPatch, no_cursor: str | None
+) -> None:
+    answer(monkeypatch, threads_page(info=page_info(no_cursor, more=True)))
+
+    with pytest.raises(RepositoryError):
+        repository().open_threads(PULL)
+
+
+def test_open_threads_whose_thread_cursor_comes_back_raises(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repeated = threads_page(info=page_info("THREADS_1", more=True))
+    answer_in_turn(monkeypatch, record, repeated, repeated)
+
+    with pytest.raises(RepositoryError):
+        repository().open_threads(PULL)
+
+
+@pytest.mark.parametrize("no_cursor", [None, ""], ids=["null", "empty"])
+def test_open_threads_with_a_next_page_of_comments_and_no_cursor_raises(
+    record: Path, monkeypatch: pytest.MonkeyPatch, no_cursor: str | None
+) -> None:
+    thread = review_thread(
+        said("OWNER", "Fix."), comments_info=page_info(no_cursor, more=True)
+    )
+    answer(monkeypatch, threads_page(thread))
+
+    with pytest.raises(RepositoryError):
+        repository().open_threads(PULL)
+
+
+def test_open_threads_whose_comment_cursor_comes_back_raises(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    info = page_info("COMMENTS_1", more=True)
+    answer_in_turn(
+        monkeypatch,
+        record,
+        threads_page(review_thread(said("OWNER", "Fix."), comments_info=info)),
+        comments_page(said("OWNER", "Again."), info=info),
+    )
+
+    with pytest.raises(RepositoryError):
+        repository().open_threads(PULL)
+
+
+def test_open_threads_whose_further_comment_page_loses_its_cursor_raises(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer_in_turn(
+        monkeypatch,
+        record,
+        threads_page(
+            review_thread(
+                said("OWNER", "Fix."),
+                comments_info=page_info("COMMENTS_1", more=True),
+            )
+        ),
+        comments_page(said("OWNER", "Again."), info=page_info(None, more=True)),
+    )
+
+    with pytest.raises(RepositoryError):
+        repository().open_threads(PULL)
+
+
+def test_open_threads_without_page_info_on_the_threads_raises(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    found = threads_page()
+    del found["data"]["repository"]["pullRequest"]["reviewThreads"]["pageInfo"]
+    answer(monkeypatch, found)
+
+    with pytest.raises(RepositoryError, match="cannot be read"):
+        repository().open_threads(PULL)
+
+
+def test_open_threads_without_page_info_on_the_comments_raises(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    thread = review_thread(said("OWNER", "Fix."))
+    del thread["comments"]["pageInfo"]
+    answer(monkeypatch, threads_page(thread))
+
+    with pytest.raises(RepositoryError, match="cannot be read"):
+        repository().open_threads(PULL)
+
+
+def test_open_threads_without_page_info_on_further_comments_raises(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    further = comments_page(said("OWNER", "Late."))
+    del further["data"]["node"]["comments"]["pageInfo"]
+    answer_in_turn(
+        monkeypatch,
+        record,
+        threads_page(
+            review_thread(
+                said("OWNER", "Fix."),
+                comments_info=page_info("COMMENTS_1", more=True),
+            )
+        ),
+        further,
+    )
+
+    with pytest.raises(RepositoryError, match="cannot be read"):
+        repository().open_threads(PULL)
+
+
+@pytest.mark.parametrize(
+    "unreadable",
+    [
+        {"data": {"repository": {"pullRequest": None}}},
+        {"data": {"repository": None}},
+        {"data": None},
+        [],
+        "not json",
+    ],
+    ids=["no-pull-request", "no-repository", "no-data", "wrong-shape", "not-json"],
+)
+def test_open_threads_that_cannot_be_read_raises(
+    record: Path, monkeypatch: pytest.MonkeyPatch, unreadable: object
+) -> None:
+    answer(monkeypatch, unreadable)
+
+    with pytest.raises(RepositoryError, match="cannot be read"):
+        repository().open_threads(PULL)
+
+
+@pytest.mark.parametrize(
+    "unreadable",
+    [{"data": {"node": None}}, {"data": {"node": {}}}, {"data": None}, []],
+    ids=["no-node", "no-comments", "no-data", "wrong-shape"],
+)
+def test_open_threads_whose_further_comments_cannot_be_read_raises(
+    record: Path, monkeypatch: pytest.MonkeyPatch, unreadable: object
+) -> None:
+    answer_in_turn(
+        monkeypatch,
+        record,
+        threads_page(
+            review_thread(
+                said("OWNER", "Fix."),
+                comments_info=page_info("COMMENTS_1", more=True),
+            )
+        ),
+        unreadable,
+    )
+
+    with pytest.raises(RepositoryError, match="cannot be read"):
+        repository().open_threads(PULL)
+
+
+@pytest.mark.parametrize(
+    "earlier",
+    [
+        (),
+        (threads_page(info=page_info("THREADS_1", more=True)),),
+        (
+            threads_page(
+                review_thread(
+                    said("OWNER", "Fix."),
+                    comments_info=page_info("COMMENTS_1", more=True),
+                )
+            ),
+        ),
+    ],
+    ids=["first-page", "next-thread-page", "next-comment-page"],
+)
+def test_open_threads_whose_gh_call_fails_raises(
+    record: Path, monkeypatch: pytest.MonkeyPatch, earlier: tuple[object, ...]
+) -> None:
+    answer_in_turn(monkeypatch, record, *earlier, GhFailure("HTTP 502"))
+
+    with pytest.raises(RepositoryError, match="HTTP 502"):
+        repository().open_threads(PULL)
+
+
+def test_feedback_gives_the_threads_of_open_threads(
+    record: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    answer(monkeypatch, feedback_answer())
+    read = repository()
+    threads = (OpenThread("src/late.py", 3, ("Late.",), "PRRT_late"),)
+    monkeypatch.setattr(read, "open_threads", lambda pull_request: threads)
+
+    assert read.feedback(PULL).threads == threads

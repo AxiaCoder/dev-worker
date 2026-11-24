@@ -122,6 +122,15 @@ class CodeRepository(Protocol):
         """
         ...
 
+    def open_threads(self, pull_request: PullRequest) -> tuple[OpenThread, ...]:
+        """Return every unresolved review thread of `pull_request`, with no limit on their number or on their comments.
+
+        A thread holds only the comments of authors trusted on the repository; a thread
+        left with none is not returned. Raises `RepositoryError` when they cannot all be
+        read.
+        """
+        ...
+
     def merge(self, pull_request: PullRequest) -> None:
         """Merge `pull_request` as a single squashed commit titled `pull_request.title`, only while its head is still `pull_request.head`.
 
